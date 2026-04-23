@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.20"]
+build-backend = "hatchling.build"
+
+[project]
+name = "runpod-lifecycle"
+version = "0.1.0"
+description = "Reusable async RunPod lifecycle management package."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "runpod>=1.6.0",
+  "paramiko>=3.0.0",
+  "requests>=2.31.0",
+  "httpx>=0.25.0",
+  "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7",
+  "pytest-asyncio>=0.23",
+  "pytest-mock>=3",
+]
+
+[project.scripts]
+runpod-lifecycle = "runpod_lifecycle.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/runpod_lifecycle"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
