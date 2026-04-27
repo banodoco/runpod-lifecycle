@@ -67,6 +67,8 @@ asyncio.run(main())
 
 If `storage_name` is unset and `storage_volumes` is empty, `launch()` creates a volumeless pod by passing `network_volume_id=None`. That is intentional new behavior in this package.
 
+For direct file transport or other low-level SSH work, `Pod.open_ssh_client()` returns a connected `paramiko`-compatible client. Callers are responsible for closing the returned client when they are done with it.
+
 ## Config Reference
 
 | field | env var | default | description |

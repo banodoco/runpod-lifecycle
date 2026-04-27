@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "runpod-lifecycle"
-version = "0.1.0"
+version = "0.1.1"
 description = "Reusable async RunPod lifecycle management package."
 readme = "README.md"
 requires-python = ">=3.10"

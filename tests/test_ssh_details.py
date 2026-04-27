@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
+from unittest.mock import MagicMock
 from types import SimpleNamespace
 
 import pytest
 
 from runpod_lifecycle.api import get_pod_ssh_details
+from runpod_lifecycle.config import RunPodConfig
+from runpod_lifecycle.pod import Pod
 
 
 class FakeResponse:
@@ -83,3 +86,21 @@ def test_get_pod_ssh_details_returns_none_and_logs_warning(
 
     assert details is None
     assert "Could not get SSH details for pod pod-123" in caplog.text
+
+
+def test_open_ssh_client_returns_connected_raw_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = RunPodConfig(api_key="api-key")
+    pod = Pod("pod-123", "worker", config)
+    raw_client = MagicMock()
+    wrapper = SimpleNamespace(client=raw_client, connect=MagicMock())
+
+    monkeypatch.setattr(
+        "runpod_lifecycle.pod.api.get_pod_ssh_details",
+        lambda pod_id, api_key: {"ip": "1.2.3.4", "port": 2201, "password": "secret"},
+    )
+    monkeypatch.setattr(pod, "_build_ssh_client", lambda ssh_details: wrapper)
+
+    result = pod.open_ssh_client()
+
+    assert result is raw_client
+    wrapper.connect.assert_called_once_with()

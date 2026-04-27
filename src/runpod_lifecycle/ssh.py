@@ -96,17 +96,33 @@ class SSHClient:
         _, stdout, stderr = self.client.exec_command(command, timeout=timeout)
         channel = stdout.channel
 
+        out_chunks: list[bytes] = []
+        err_chunks: list[bytes] = []
         start_time = time.time()
         while not channel.exit_status_ready():
+            while channel.recv_ready():
+                out_chunks.append(channel.recv(65536))
+            while channel.recv_stderr_ready():
+                err_chunks.append(channel.recv_stderr(65536))
             elapsed = time.time() - start_time
             if elapsed > timeout:
                 channel.close()
-                return -1, "", f"Command timed out after {timeout} seconds"
+                out = b"".join(out_chunks).decode(errors="replace")
+                err = b"".join(err_chunks).decode(errors="replace")
+                if err:
+                    err = f"{err}\nCommand timed out after {timeout} seconds"
+                else:
+                    err = f"Command timed out after {timeout} seconds"
+                return -1, out, err
             time.sleep(0.1)
 
         exit_status = channel.recv_exit_status()
-        out = stdout.read().decode()
-        err = stderr.read().decode()
+        while channel.recv_ready():
+            out_chunks.append(channel.recv(65536))
+        while channel.recv_stderr_ready():
+            err_chunks.append(channel.recv_stderr(65536))
+        out = b"".join(out_chunks).decode(errors="replace")
+        err = b"".join(err_chunks).decode(errors="replace")
         return exit_status, out, err
 
     def disconnect(self) -> None:

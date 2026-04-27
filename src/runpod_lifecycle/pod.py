@@ -52,7 +52,7 @@ class Pod:
 
             status = await self.status()
             desired_status = status.get("desired_status") if status else None
-            ports = status.get("ports", []) if status else []
+            ports = (status.get("ports") or []) if status else []
 
             if current_state is None:
                 current_state = PodState.PROVISIONING
@@ -142,9 +142,22 @@ class Pod:
 
         return evaluate_storage_health(parsed, api_total_gb, min_free_gb, max_percent_used)
 
+    def open_ssh_client(self) -> Any:
+        """Open and return the underlying connected paramiko SSH client."""
+        ssh_details = self._ensure_ssh_details_sync()
+        ssh_client = self._build_ssh_client(ssh_details)
+        ssh_client.connect()
+        raw_client = getattr(ssh_client, "client", None)
+        if raw_client is None:
+            raise SSHError(f"SSH client for pod {self.id} did not expose a raw client")
+        return raw_client
+
     async def _ensure_ssh_details(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._ensure_ssh_details_sync)
+
+    def _ensure_ssh_details_sync(self) -> dict[str, Any]:
         if self._ssh_details is None:
-            self._ssh_details = await asyncio.to_thread(api.get_pod_ssh_details, self.id, self.config.api_key)
+            self._ssh_details = api.get_pod_ssh_details(self.id, self.config.api_key)
 
         if not self._ssh_details:
             raise SSHError(f"Could not get SSH details for pod {self.id}")
