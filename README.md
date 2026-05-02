@@ -8,6 +8,13 @@
 pip install -e .[dev]
 ```
 
+From another project, install directly from GitHub instead of relying on a
+sibling checkout:
+
+```bash
+pip install "runpod-lifecycle @ git+https://github.com/banodoco/runpod-lifecycle.git@v0.1.1"
+```
+
 ## Environment Variables
 
 `RunPodConfig.from_env()` reads these variables:

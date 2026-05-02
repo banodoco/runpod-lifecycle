@@ -13,3 +13,4 @@ build/
 .coverage
 htmlcov/
 .DS_Store
+this.env
