@@ -57,8 +57,8 @@ class RunPodConfig:
     worker_image: str = DEFAULT_WORKER_IMAGE
     template_id: str = DEFAULT_TEMPLATE_ID
     volume_mount_path: str = DEFAULT_VOLUME_MOUNT_PATH
-    disk_size_gb: int = 20
-    container_disk_gb: int = 50
+    disk_size_gb: int = 200
+    container_disk_gb: int = 200
     min_vcpu_count: int = 8
     min_memory_gb: int = 32
     ram_tiers_enabled: bool = True
@@ -82,8 +82,8 @@ class RunPodConfig:
             "worker_image": os.getenv("RUNPOD_WORKER_IMAGE", DEFAULT_WORKER_IMAGE),
             "template_id": os.getenv("RUNPOD_TEMPLATE_ID", DEFAULT_TEMPLATE_ID),
             "volume_mount_path": os.getenv("RUNPOD_VOLUME_MOUNT_PATH", DEFAULT_VOLUME_MOUNT_PATH),
-            "disk_size_gb": _parse_int(os.getenv("RUNPOD_DISK_SIZE_GB"), 20),
-            "container_disk_gb": _parse_int(os.getenv("RUNPOD_CONTAINER_DISK_GB"), 50),
+            "disk_size_gb": _parse_int(os.getenv("RUNPOD_DISK_SIZE_GB"), 200),
+            "container_disk_gb": _parse_int(os.getenv("RUNPOD_CONTAINER_DISK_GB"), 200),
             "min_vcpu_count": _parse_int(os.getenv("RUNPOD_MIN_VCPU_COUNT"), 8),
             "min_memory_gb": _parse_int(os.getenv("RUNPOD_MIN_MEMORY_GB"), 32),
             "ram_tiers_enabled": _parse_bool(

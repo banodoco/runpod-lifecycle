@@ -60,6 +60,18 @@ def test_storage_volumes_are_comma_split(monkeypatch: pytest.MonkeyPatch) -> Non
     assert config.storage_volumes == ("one", "two", "three")
 
 
+def test_from_env_defaults_to_dual_stack_disk_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("RUNPOD_API_KEY", "api-key")
+    monkeypatch.delenv("RUNPOD_DISK_SIZE_GB", raising=False)
+    monkeypatch.delenv("RUNPOD_CONTAINER_DISK_GB", raising=False)
+
+    config = RunPodConfig.from_env()
+
+    assert config.disk_size_gb == 200
+    assert config.container_disk_gb == 200
+
+
 def test_missing_api_key_raises_value_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
