@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import logging
 from typing import Any
 
@@ -142,7 +144,12 @@ def create_pod(
     if pod_env:
         params["env"] = pod_env
 
-    pod = sdk.create_pod(**params)
+    sdk_stdout = io.StringIO()
+    with contextlib.redirect_stdout(sdk_stdout):
+        pod = sdk.create_pod(**params)
+    leaked_stdout = sdk_stdout.getvalue().strip()
+    if leaked_stdout:
+        logger.debug("RunPod SDK create_pod wrote %d bytes to stdout; suppressed to avoid leaking pod env", len(leaked_stdout))
 
     pod_data = pod
     if isinstance(pod, dict) and "data" in pod:

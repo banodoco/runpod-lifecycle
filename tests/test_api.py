@@ -3,6 +3,22 @@ from __future__ import annotations
 from runpod_lifecycle import api
 
 
+def test_create_pod_suppresses_sdk_stdout_with_env_values(runpod_sdk_mock, capsys) -> None:
+    runpod_sdk_mock.create_pod.side_effect = lambda **_kwargs: print(
+        "raw_response: {'env': ['SUPABASE_SERVICE_ROLE_KEY=secret']}"
+    ) or {"id": "pod-1"}
+
+    pod = api.create_pod(
+        api_key="api-key",
+        gpu_type_id="gpu-1",
+        image_name="image",
+        env_vars={"SUPABASE_SERVICE_ROLE_KEY": "secret"},
+    )
+
+    assert pod["id"] == "pod-1"
+    assert "secret" not in capsys.readouterr().out
+
+
 def test_get_pod_status_handles_explicit_none_runtime(runpod_sdk_mock) -> None:
     """Regression: SDK returns runtime: None for pods that haven't booted; .get('runtime', {}) returned None."""
     runpod_sdk_mock.get_pod.return_value = {
