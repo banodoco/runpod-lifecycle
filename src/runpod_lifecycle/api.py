@@ -171,12 +171,18 @@ def create_pod(
 def _normalize_pod_status(runpod_id: str, status: dict[str, Any]) -> dict[str, Any]:
     runtime = status.get("runtime") if isinstance(status, dict) else None
     runtime = runtime if isinstance(runtime, dict) else {}
+    ports = runtime.get("ports", [])
+    ports = ports if isinstance(ports, list) else []
+    ip = runtime.get("ip") or next(
+        (port.get("ip") for port in ports if isinstance(port, dict) and port.get("ip")),
+        None,
+    )
     return {
         "runpod_id": runpod_id,
         "desired_status": status.get("desiredStatus"),
         "actual_status": status.get("actualStatus"),
-        "ip": runtime.get("ip"),
-        "ports": runtime.get("ports", []),
+        "ip": ip,
+        "ports": ports,
         "ssh_password": runtime.get("sshPassword"),
         "created_at": status.get("createdAt"),
         "last_status_change": status.get("lastStatusChange"),
@@ -192,12 +198,10 @@ def _get_pod_status_graphql(runpod_id: str, api_key: str) -> dict[str, Any] | No
           pod(input: {podId: $podId}) {
             id
             desiredStatus
-            actualStatus
             createdAt
             lastStatusChange
             costPerHr
             runtime {
-              ip
               sshPassword
               uptimeInSeconds
               ports {
@@ -215,9 +219,7 @@ def _get_pod_status_graphql(runpod_id: str, api_key: str) -> dict[str, Any] | No
           pod(input: {podId: $podId}) {
             id
             desiredStatus
-            actualStatus
             runtime {
-              ip
               ports {
                 ip
                 publicPort

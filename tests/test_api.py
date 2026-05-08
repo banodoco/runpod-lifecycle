@@ -225,6 +225,40 @@ def test_get_pod_status_retries_with_minimal_graphql_query_on_http_error(
     assert status["ports"] == [{"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"}]
 
 
+def test_get_pod_status_graphql_uses_schema_safe_fields_and_derives_ip(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    calls: list[dict] = []
+
+    def _post(*_args, **kwargs):
+        calls.append(kwargs["json"])
+        return FakeResponse(
+            200,
+            {
+                "data": {
+                    "pod": {
+                        "id": "p1",
+                        "desiredStatus": "RUNNING",
+                        "runtime": {
+                            "ports": [{"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"}],
+                        },
+                    }
+                }
+            },
+        )
+
+    runpod_sdk_mock.get_pod.side_effect = RuntimeError("sdk unavailable")
+    monkeypatch.setattr("runpod_lifecycle.api.httpx", SimpleNamespace(post=_post))
+
+    status = api.get_pod_status("p1", "test")
+
+    assert status is not None
+    assert status["ip"] == "1.2.3.4"
+    assert "actualStatus" not in calls[0]["query"]
+    assert "runtime {\n              ip" not in calls[0]["query"]
+
+
 def test_get_pod_status_normalizes_keys(runpod_sdk_mock) -> None:
     runpod_sdk_mock.get_pod.return_value = {
         "id": "p1",
