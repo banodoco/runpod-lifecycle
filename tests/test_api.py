@@ -1,6 +1,19 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+
 from runpod_lifecycle import api
+
+
+class FakeResponse:
+    def __init__(self, status_code: int, payload: dict):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self) -> dict:
+        return self._payload
 
 
 def test_create_pod_suppresses_sdk_stdout_with_env_values(runpod_sdk_mock, capsys) -> None:
@@ -48,9 +61,168 @@ def test_get_pod_status_handles_missing_runtime_key(runpod_sdk_mock) -> None:
     assert status["ip"] is None
 
 
-def test_get_pod_status_returns_none_when_sdk_returns_falsy(runpod_sdk_mock) -> None:
+def test_get_pod_status_returns_none_when_sdk_and_graphql_return_no_pod(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
     runpod_sdk_mock.get_pod.return_value = None
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(post=lambda *args, **kwargs: FakeResponse(200, {"data": {"pod": None}})),
+    )
     assert api.get_pod_status("p1", "test") is None
+
+
+def test_get_pod_status_falls_back_to_graphql_when_sdk_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    runpod_sdk_mock.get_pod.side_effect = RuntimeError("sdk unavailable")
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(
+            post=lambda *args, **kwargs: FakeResponse(
+                200,
+                {
+                    "data": {
+                        "pod": {
+                            "id": "p1",
+                            "desiredStatus": "RUNNING",
+                            "actualStatus": "RUNNING",
+                            "runtime": {
+                                "ip": "1.2.3.4",
+                                "ports": [
+                                    {"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"},
+                                    {"privatePort": 8888, "publicPort": 88881, "ip": "1.2.3.4"},
+                                ],
+                                "uptimeInSeconds": 42,
+                            },
+                        }
+                    }
+                },
+            )
+        ),
+    )
+
+    status = api.get_pod_status("p1", "test")
+
+    assert status is not None
+    assert status["desired_status"] == "RUNNING"
+    assert status["actual_status"] == "RUNNING"
+    assert status["ip"] == "1.2.3.4"
+    assert status["ports"] == [
+        {"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"},
+        {"privatePort": 8888, "publicPort": 88881, "ip": "1.2.3.4"},
+    ]
+    assert status["uptime_seconds"] == 42
+
+
+def test_get_pod_status_falls_back_to_graphql_when_sdk_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    runpod_sdk_mock.get_pod.return_value = None
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(
+            post=lambda *args, **kwargs: FakeResponse(
+                200,
+                {
+                    "data": {
+                        "pod": {
+                            "id": "p1",
+                            "desiredStatus": "PROVISIONING",
+                            "actualStatus": None,
+                            "runtime": None,
+                        }
+                    }
+                },
+            )
+        ),
+    )
+
+    status = api.get_pod_status("p1", "test")
+
+    assert status is not None
+    assert status["desired_status"] == "PROVISIONING"
+    assert status["actual_status"] is None
+    assert status["ports"] == []
+
+
+def test_get_pod_status_retries_with_minimal_graphql_query_on_schema_error(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    responses = iter(
+        [
+            FakeResponse(200, {"errors": [{"message": "Cannot query field sshPassword"}]}),
+            FakeResponse(
+                200,
+                {
+                    "data": {
+                        "pod": {
+                            "id": "p1",
+                            "desiredStatus": "RUNNING",
+                            "actualStatus": "RUNNING",
+                            "runtime": {
+                                "ip": "1.2.3.4",
+                                "ports": [{"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"}],
+                            },
+                        }
+                    }
+                },
+            ),
+        ]
+    )
+    runpod_sdk_mock.get_pod.side_effect = RuntimeError("sdk unavailable")
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(post=lambda *args, **kwargs: next(responses)),
+    )
+
+    status = api.get_pod_status("p1", "test")
+
+    assert status is not None
+    assert status["desired_status"] == "RUNNING"
+    assert status["ports"] == [{"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"}]
+
+
+def test_get_pod_status_retries_with_minimal_graphql_query_on_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    responses = iter(
+        [
+            FakeResponse(400, {"errors": [{"message": "Cannot query field sshPassword"}]}),
+            FakeResponse(
+                200,
+                {
+                    "data": {
+                        "pod": {
+                            "id": "p1",
+                            "desiredStatus": "RUNNING",
+                            "actualStatus": "RUNNING",
+                            "runtime": {
+                                "ip": "1.2.3.4",
+                                "ports": [{"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"}],
+                            },
+                        }
+                    }
+                },
+            ),
+        ]
+    )
+    runpod_sdk_mock.get_pod.side_effect = RuntimeError("sdk unavailable")
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(post=lambda *args, **kwargs: next(responses)),
+    )
+
+    status = api.get_pod_status("p1", "test")
+
+    assert status is not None
+    assert status["desired_status"] == "RUNNING"
+    assert status["ports"] == [{"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"}]
 
 
 def test_get_pod_status_normalizes_keys(runpod_sdk_mock) -> None:

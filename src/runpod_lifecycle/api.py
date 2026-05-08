@@ -168,19 +168,7 @@ def create_pod(
     }
 
 
-def get_pod_status(runpod_id: str, api_key: str) -> dict[str, Any] | None:
-    """Return normalized pod status details using snake_case keys."""
-    sdk = _get_runpod()
-    sdk.api_key = api_key
-
-    try:
-        status = sdk.get_pod(runpod_id)
-        if not status:
-            return None
-    except Exception as exc:
-        logger.error("Error getting pod status for %s: %s", runpod_id, exc)
-        return None
-
+def _normalize_pod_status(runpod_id: str, status: dict[str, Any]) -> dict[str, Any]:
     runtime = status.get("runtime") if isinstance(status, dict) else None
     runtime = runtime if isinstance(runtime, dict) else {}
     return {
@@ -195,6 +183,96 @@ def get_pod_status(runpod_id: str, api_key: str) -> dict[str, Any] | None:
         "uptime_seconds": runtime.get("uptimeInSeconds", 0),
         "cost_per_hr": status.get("costPerHr"),
     }
+
+
+def _get_pod_status_graphql(runpod_id: str, api_key: str) -> dict[str, Any] | None:
+    queries = [
+        """
+        query PodStatus($podId: String!) {
+          pod(input: {podId: $podId}) {
+            id
+            desiredStatus
+            actualStatus
+            createdAt
+            lastStatusChange
+            costPerHr
+            runtime {
+              ip
+              sshPassword
+              uptimeInSeconds
+              ports {
+                ip
+                publicPort
+                privatePort
+                type
+              }
+            }
+          }
+        }
+        """,
+        """
+        query PodStatus($podId: String!) {
+          pod(input: {podId: $podId}) {
+            id
+            desiredStatus
+            actualStatus
+            runtime {
+              ip
+              ports {
+                ip
+                publicPort
+                privatePort
+                type
+              }
+            }
+          }
+        }
+        """,
+    ]
+    for query in queries:
+        try:
+            response = httpx.post(
+                GRAPHQL_URL,
+                json={"query": query, "variables": {"podId": runpod_id}},
+                headers=_auth_headers(api_key),
+                timeout=30,
+            )
+            if response.status_code != 200:
+                logger.warning(
+                    "GraphQL pod status lookup query failed for %s: %s",
+                    runpod_id,
+                    response.status_code,
+                )
+                continue
+
+            body = response.json()
+            if body.get("errors"):
+                continue
+
+            pod = body.get("data", {}).get("pod")
+            return _normalize_pod_status(runpod_id, pod) if isinstance(pod, dict) else None
+        except Exception as exc:
+            logger.warning("GraphQL pod status lookup failed for %s: %s", runpod_id, exc)
+            return None
+
+    logger.warning("GraphQL pod status lookup returned only errors for %s", runpod_id)
+    return None
+
+
+def get_pod_status(runpod_id: str, api_key: str) -> dict[str, Any] | None:
+    """Return normalized pod status details using snake_case keys."""
+    try:
+        sdk = _get_runpod()
+        sdk.api_key = api_key
+        status = sdk.get_pod(runpod_id)
+        if isinstance(status, dict) and status:
+            return _normalize_pod_status(runpod_id, status)
+        if status:
+            logger.warning("RunPod SDK returned unexpected pod status for %s: %r", runpod_id, status)
+    except Exception as exc:
+        logger.warning("RunPod SDK pod status lookup failed for %s: %s", runpod_id, exc)
+
+    return _get_pod_status_graphql(runpod_id, api_key)
 
 
 def get_pod_ssh_details(pod_id: str, api_key: str) -> dict[str, Any] | None:
