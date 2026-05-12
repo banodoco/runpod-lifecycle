@@ -683,7 +683,7 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
         with _prebuilt_phase("install_vibecomfy", workdir=_BUILDER_VIBECOMFY_DIR):
             install_body = _vibecomfy_install_builder_shell(
                 _BUILDER_VIBECOMFY_DIR,
-                python_path=f"python{contract.python_version}",
+                python_path=f"{_BUILDER_VENV_PATH}/bin/python",
                 attention_profile=contract.attention_profile,
             )
             script = (

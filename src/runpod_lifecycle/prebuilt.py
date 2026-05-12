@@ -334,7 +334,8 @@ def _probe_node_schema_verify(ssh, contract: PrebuiltEnvContract) -> str | None:
     cmd = (
         f"cd {_quote(contract.runtime_vibecomfy_path)} && "
         f"UV_PROJECT_ENVIRONMENT={_quote(contract.runtime_venv_path)} "
-        "python -m vibecomfy.cli nodes verify --lockfile custom_nodes.lock"
+        f"{_quote(contract.runtime_venv_path + '/bin/python')} "
+        "-m vibecomfy.cli nodes verify --lockfile custom_nodes.lock"
     )
     exit_code, _stdout, stderr = _ssh_execute(ssh, "bash -lc " + _quote(cmd), timeout=300, check=False)
     if exit_code != 0:
