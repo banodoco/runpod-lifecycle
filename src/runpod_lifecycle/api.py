@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover - exercised indirectly before deps insta
 logger = logging.getLogger("runpod_lifecycle.api")
 
 GRAPHQL_URL = "https://api.runpod.io/graphql"
-NETWORK_VOLUMES_URL = "https://api.runpod.io/v1/networkvolumes"
+NETWORK_VOLUMES_URL = "https://rest.runpod.io/v1/networkvolumes"
 
 
 def _get_runpod() -> Any:

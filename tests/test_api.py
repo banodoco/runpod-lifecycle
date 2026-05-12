@@ -291,7 +291,7 @@ def test_create_network_volume_posts_correct_shape(monkeypatch: pytest.MonkeyPat
         "size": 100,
         "dataCenterId": "dc-test",
     }
-    assert "api.runpod.io/v1/networkvolumes" in post_calls[0]["url"]
+    assert "rest.runpod.io/v1/networkvolumes" in post_calls[0]["url"]
 
 
 def test_create_network_volume_raises_on_non_200_201(monkeypatch: pytest.MonkeyPatch) -> None:
