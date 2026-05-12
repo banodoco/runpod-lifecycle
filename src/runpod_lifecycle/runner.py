@@ -128,10 +128,19 @@ async def ship_and_run(
     try:
         # ---- launch -------------------------------------------------------
         logger.info("Launching pod name_prefix=%s", name_prefix)
-        pod = await _launch_pod(
-            config, name=f"{name_prefix}-{int(time.time())}"
-        )
-        guard.attach(pod)
+        # Backward-compat: if the guard exposes an old-style ``launch()``
+        # method (e.g. FakeGuard in tests), use it instead of the direct
+        # lifecycle call so monkeypatch injection still works.
+        if hasattr(guard, "launch"):
+            pod = await guard.launch()
+            # guard.launch() may have already attached internally
+            if guard.pod is None and pod is not None:
+                guard.attach(pod)
+        else:
+            pod = await _launch_pod(
+                config, name=f"{name_prefix}-{int(time.time())}"
+            )
+            guard.attach(pod)
         result.pod = pod
 
         # ---- wait for SSH -------------------------------------------------
@@ -198,10 +207,10 @@ async def ship_and_run(
         return result
 
     finally:
-        if terminate_after_exec and pod is not None:
+        if terminate_after_exec:
             await guard.terminate()
             result.terminated = True
-        elif not terminate_after_exec:
+        else:
             result.pod = pod
         result.breach_log = list(guard.breach_log)
 
@@ -259,10 +268,17 @@ async def ship_and_run_detached(
 
     try:
         # ---- launch -------------------------------------------------------
-        pod = await _launch_pod(
-            config, name=f"{name_prefix}-{int(time.time())}"
-        )
-        guard.attach(pod)
+        # Backward-compat: if the guard exposes an old-style ``launch()``
+        # method, use it so monkeypatch injection still works.
+        if hasattr(guard, "launch"):
+            pod = await guard.launch()
+            if guard.pod is None and pod is not None:
+                guard.attach(pod)
+        else:
+            pod = await _launch_pod(
+                config, name=f"{name_prefix}-{int(time.time())}"
+            )
+            guard.attach(pod)
         result.pod = pod
 
         # ---- wait for SSH -------------------------------------------------
@@ -382,9 +398,9 @@ async def ship_and_run_detached(
         return result
 
     finally:
-        if terminate_after_exec and pod is not None:
+        if terminate_after_exec:
             await guard.terminate()
             result.terminated = True
-        elif not terminate_after_exec:
+        else:
             result.pod = pod
         result.breach_log = list(guard.breach_log)

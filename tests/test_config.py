@@ -80,6 +80,16 @@ def test_missing_api_key_raises_value_error(monkeypatch: pytest.MonkeyPatch) -> 
         RunPodConfig.from_env()
 
 
+def test_ports_field_defaults_to_none() -> None:
+    config = RunPodConfig(api_key="test")
+    assert config.ports is None
+
+
+def test_ports_field_accepts_custom_value() -> None:
+    config = RunPodConfig(api_key="test", ports="8675/http,22/tcp")
+    assert config.ports == "8675/http,22/tcp"
+
+
 def test_merge_returns_new_instance_with_overrides() -> None:
     original = RunPodConfig(api_key="api-key", name_prefix="pod", min_memory_gb=32)
 

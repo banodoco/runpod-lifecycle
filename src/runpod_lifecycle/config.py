@@ -71,6 +71,7 @@ class RunPodConfig:
     ssh_private_key_path: str | None = None
     env_vars: dict[str, str] = field(default_factory=dict)
     name_prefix: str = "pod"
+    ports: str | None = None
 
     @classmethod
     def from_env(cls, **overrides: Any) -> "RunPodConfig":

@@ -111,6 +111,7 @@ def create_pod(
     min_vcpu_count: int = 8,
     min_memory_in_gb: int = 32,
     template_id: str | None = None,
+    ports: str | None = None,
 ) -> dict[str, Any]:
     """Create a RunPod pod and return provision metadata immediately."""
     sdk = _get_runpod()
@@ -126,7 +127,7 @@ def create_pod(
         "container_disk_in_gb": container_disk_in_gb,
         "min_vcpu_count": min_vcpu_count,
         "min_memory_in_gb": min_memory_in_gb,
-        "ports": "22/tcp,8888/http",
+        "ports": ports or "22/tcp,8888/http",
         "network_volume_id": network_volume_id,
     }
 

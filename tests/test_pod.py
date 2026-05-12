@@ -139,6 +139,82 @@ def test_wait_ready_raises_launch_failure_on_failed_status(
         asyncio.run(pod.wait_ready(timeout=1))
 
 
+# ---------------------------------------------------------------------------
+# Pod composable surface: create_storage, list_storages, get_storage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_storage_find_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pod.get_storage returns the volume dict when a name match is found."""
+    # Mock Pod.list_storages to return a known set
+    mock_volumes = [
+        {"id": "vol-abc", "name": "my-storage", "size": 50},
+        {"id": "vol-def", "name": "other-storage", "size": 100},
+    ]
+
+    async def fake_list_storages() -> list[dict]:
+        return mock_volumes
+
+    monkeypatch.setattr("runpod_lifecycle.pod.Pod.list_storages", fake_list_storages)
+
+    result = await Pod.get_storage("my-storage")
+    assert result is not None
+    assert result["id"] == "vol-abc"
+    assert result["name"] == "my-storage"
+
+
+@pytest.mark.asyncio
+async def test_get_storage_find_by_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pod.get_storage returns the volume dict when an id match is found."""
+    mock_volumes = [
+        {"id": "vol-abc", "name": "my-storage", "size": 50},
+    ]
+
+    async def fake_list_storages() -> list[dict]:
+        return mock_volumes
+
+    monkeypatch.setattr("runpod_lifecycle.pod.Pod.list_storages", fake_list_storages)
+
+    result = await Pod.get_storage("vol-abc")
+    assert result is not None
+    assert result["id"] == "vol-abc"
+
+
+@pytest.mark.asyncio
+async def test_get_storage_returns_none_when_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pod.get_storage returns None when no volume matches."""
+    async def fake_list_storages() -> list[dict]:
+        return []
+
+    monkeypatch.setattr("runpod_lifecycle.pod.Pod.list_storages", fake_list_storages)
+
+    result = await Pod.get_storage("nonexistent")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_create_storage_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pod.create_storage delegates to api.create_network_volume."""
+    called_with: list[tuple] = []
+
+    async def fake_to_thread(fn, *args):
+        called_with.append(args)
+        return {"id": "vol-new", "name": args[1], "size": args[2]}
+
+    monkeypatch.setattr("runpod_lifecycle.pod.asyncio.to_thread", fake_to_thread)
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key-override")
+
+    result = await Pod.create_storage("new-volume", 200, "dc-west")
+
+    assert result["id"] == "vol-new"
+    assert len(called_with) == 1
+    # args to api.create_network_volume: (api_key, name, size_gb, datacenter_id)
+    assert called_with[0][1] == "new-volume"
+    assert called_with[0][2] == 200
+    assert called_with[0][3] == "dc-west"
+
+
 def test_wait_ready_raises_timeout(base_config, monkeypatch: pytest.MonkeyPatch) -> None:
     pod = Pod("pod-1", "worker", base_config)
 

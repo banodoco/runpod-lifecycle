@@ -8,9 +8,10 @@ from runpod_lifecycle import api
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, payload: dict):
+    def __init__(self, status_code: int, payload: dict, text: str = ""):
         self.status_code = status_code
         self._payload = payload
+        self.text = text or str(payload)
 
     def json(self) -> dict:
         return self._payload
@@ -257,6 +258,75 @@ def test_get_pod_status_graphql_uses_schema_safe_fields_and_derives_ip(
     assert status["ip"] == "1.2.3.4"
     assert "actualStatus" not in calls[0]["query"]
     assert "runtime {\n              ip" not in calls[0]["query"]
+
+
+# ---------------------------------------------------------------------------
+# create_network_volume
+# ---------------------------------------------------------------------------
+
+
+def test_create_network_volume_posts_correct_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """create_network_volume POSTs the correct payload to NETWORK_VOLUMES_URL."""
+    post_calls: list[dict] = []
+
+    def fake_post(url, *, json, headers, timeout):
+        post_calls.append({"url": url, "json": json})
+        # Return a valid volume dict
+        return FakeResponse(201, {
+            "id": "vol-created-1",
+            "name": "my-volume",
+            "size": 100,
+            "dataCenterId": "dc-test",
+        })
+
+    monkeypatch.setattr("runpod_lifecycle.api.httpx", SimpleNamespace(post=fake_post))
+
+    result = api.create_network_volume("fake-key", "my-volume", 100, "dc-test")
+
+    assert result["id"] == "vol-created-1"
+    assert result["name"] == "my-volume"
+    assert len(post_calls) == 1
+    assert post_calls[0]["json"] == {
+        "name": "my-volume",
+        "size": 100,
+        "dataCenterId": "dc-test",
+    }
+    assert "api.runpod.io/v1/networkvolumes" in post_calls[0]["url"]
+
+
+def test_create_network_volume_raises_on_non_200_201(monkeypatch: pytest.MonkeyPatch) -> None:
+    """create_network_volume raises RuntimeError on non-200/201 response."""
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(post=lambda *args, **kwargs: FakeResponse(400, {"error": "bad request"})),
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to create network volume"):
+        api.create_network_volume("fake-key", "bad-vol", 100, "dc-test")
+
+
+def test_create_pod_uses_prior_default_ports_when_none(runpod_sdk_mock) -> None:
+    runpod_sdk_mock.create_pod.return_value = {"id": "pod-default-ports"}
+    api.create_pod(
+        api_key="api-key",
+        gpu_type_id="gpu-1",
+        image_name="image",
+    )
+    kwargs = runpod_sdk_mock.create_pod.call_args.kwargs
+    assert kwargs["ports"] == "22/tcp,8888/http"
+
+
+def test_create_pod_passes_custom_ports_through(runpod_sdk_mock) -> None:
+    runpod_sdk_mock.create_pod.return_value = {"id": "pod-custom-ports"}
+    api.create_pod(
+        api_key="api-key",
+        gpu_type_id="gpu-1",
+        image_name="image",
+        ports="8675/http,22/tcp",
+    )
+    kwargs = runpod_sdk_mock.create_pod.call_args.kwargs
+    assert kwargs["ports"] == "8675/http,22/tcp"
+    assert "8675/http" in kwargs["ports"]
 
 
 def test_get_pod_status_normalizes_keys(runpod_sdk_mock) -> None:

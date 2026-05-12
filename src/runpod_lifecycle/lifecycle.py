@@ -134,6 +134,7 @@ async def launch(
                     min_vcpu_count=config.min_vcpu_count,
                     min_memory_in_gb=ram_tier,
                     template_id=config.template_id,
+                    ports=config.ports,
                 )
             except Exception as exc:
                 last_error = exc
