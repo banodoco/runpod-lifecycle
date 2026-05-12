@@ -12,8 +12,26 @@ from .discovery import (
 )
 from .errors import LaunchFailure, NotReadyTimeout, RunPodError, SSHError, TerminateError
 from .events import EventHooks, PodEvent, PodState
-from .guard import PodGuard, install_signal_handlers
+from .guard import (
+    PodGuard,
+    StalePodCleanupResult,
+    install_signal_handlers,
+    prune_pods_by_prefix,
+)
 from .api import create_network_volume
+from .prebuilt import (
+    PrebuiltEnvContract,
+    PrebuiltManifest,
+    acquire_build_lock,
+    compute_lockfile_hash,
+    compute_pyproject_hash,
+    lock_path,
+    manifest_path,
+    read_manifest,
+    staging_path,
+    verify_extracted_env,
+    write_manifest,
+)
 from .lifecycle import find_gpu_type, get_network_volumes, launch
 from .pod import Pod
 from .probe import probe
@@ -52,6 +70,8 @@ __all__ = [
     "cost_summary",
     "PodSummary",
     "install_signal_handlers",
+    "prune_pods_by_prefix",
+    "StalePodCleanupResult",
     "should_skip",
     "upload_dir",
     "_build_upload_tarball",
@@ -63,4 +83,15 @@ __all__ = [
     "NotReadyTimeout",
     "SSHError",
     "TerminateError",
+    "PrebuiltEnvContract",
+    "PrebuiltManifest",
+    "acquire_build_lock",
+    "compute_lockfile_hash",
+    "compute_pyproject_hash",
+    "lock_path",
+    "manifest_path",
+    "read_manifest",
+    "staging_path",
+    "verify_extracted_env",
+    "write_manifest",
 ]
