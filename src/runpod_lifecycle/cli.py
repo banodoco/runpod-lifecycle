@@ -424,23 +424,23 @@ _MANIFEST_SCHEMA_VERSION = 1
 
 
 @contextlib.contextmanager
-def _prebuilt_phase(name: str, **fields: Any):
+def _prebuilt_phase(phase_name: str, **fields: Any):
     """Lightweight phase logger for the prebuilt CLI (no reigh-worker import)."""
     started = time.monotonic()
     extra = " ".join(f"{k}={v}" for k, v in fields.items())
-    print(f"phase_start name={name} {extra}".rstrip(), flush=True)
+    print(f"phase_start name={phase_name} {extra}".rstrip(), flush=True)
     try:
         yield
     except Exception as exc:
         elapsed = round(time.monotonic() - started, 1)
         print(
-            f"phase_fail name={name} elapsed_sec={elapsed} error={type(exc).__name__}: {exc}",
+            f"phase_fail name={phase_name} elapsed_sec={elapsed} error={type(exc).__name__}: {exc}",
             flush=True,
         )
         raise
     else:
         elapsed = round(time.monotonic() - started, 1)
-        print(f"phase_done name={name} elapsed_sec={elapsed}", flush=True)
+        print(f"phase_done name={phase_name} elapsed_sec={elapsed}", flush=True)
 
 
 def _builder_timestamp_label() -> str:

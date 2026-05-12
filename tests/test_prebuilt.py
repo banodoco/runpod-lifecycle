@@ -122,6 +122,15 @@ def test_prebuilt_build_dry_run_does_not_require_runpod_api_key(monkeypatch, cap
     assert payload["volume_name"] == args.volume_name
 
 
+def test_prebuilt_phase_accepts_name_field(capsys):
+    with cli._prebuilt_phase("provision_builder_pod", name="pod-name"):
+        pass
+
+    out = capsys.readouterr().out
+    assert "phase_start name=provision_builder_pod name=pod-name" in out
+    assert "phase_done name=provision_builder_pod" in out
+
+
 # --------------------------------------------------------------------------- #
 # Manifest round-trip via simulated SSH
 # --------------------------------------------------------------------------- #
