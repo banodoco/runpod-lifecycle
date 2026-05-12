@@ -501,6 +501,7 @@ def _vibecomfy_install_builder_shell(
     workdir: str, *, python_path: str, attention_profile: str
 ) -> str:
     """Render the post-clone VibeComfy install body the builder pod will execute."""
+    venv_path = python_path.rsplit("/bin/python", 1)[0]
     py = _quote(python_path)
     sage_block = ""
     if attention_profile == "sage":
@@ -516,6 +517,7 @@ def _vibecomfy_install_builder_shell(
             "PY\n"
         )
     return (
+        f"uv venv --python 3.11 {_quote(venv_path)}\n"
         f"uv pip install --python {py} -e {_quote(workdir)}\n"
         f"uv pip install --python {py} "
         "'comfyui@git+https://github.com/peteromallet/ComfyUI.git@fix/latentupscale-model-mmap-residency' "
@@ -683,7 +685,7 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
         with _prebuilt_phase("install_vibecomfy", workdir=_BUILDER_VIBECOMFY_DIR):
             install_body = _vibecomfy_install_builder_shell(
                 _BUILDER_VIBECOMFY_DIR,
-                python_path=f"{_BUILDER_VENV_PATH}/bin/python",
+                python_path=f"{_BUILDER_VIBECOMFY_DIR}/.venv/bin/python",
                 attention_profile=contract.attention_profile,
             )
             script = (

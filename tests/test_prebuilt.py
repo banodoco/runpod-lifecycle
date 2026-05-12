@@ -131,6 +131,17 @@ def test_prebuilt_phase_accepts_name_field(capsys):
     assert "phase_done name=provision_builder_pod" in out
 
 
+def test_vibecomfy_builder_install_uses_separate_python311_venv():
+    body = cli._vibecomfy_install_builder_shell(
+        "/opt/build/vibecomfy",
+        python_path="/opt/build/vibecomfy/.venv/bin/python",
+        attention_profile="portable",
+    )
+
+    assert "uv venv --python 3.11 /opt/build/vibecomfy/.venv" in body
+    assert "uv pip install --python /opt/build/vibecomfy/.venv/bin/python -e /opt/build/vibecomfy" in body
+
+
 # --------------------------------------------------------------------------- #
 # Manifest round-trip via simulated SSH
 # --------------------------------------------------------------------------- #
