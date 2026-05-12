@@ -507,7 +507,7 @@ def _vibecomfy_install_builder_shell(
         sage_block = (
             "rm -rf /tmp/sageattention\n"
             "git clone --depth 1 https://github.com/thu-ml/SageAttention.git /tmp/sageattention\n"
-            f"{py} -m pip install --no-build-isolation /tmp/sageattention\n"
+            f"uv pip install --python {py} --no-build-isolation /tmp/sageattention\n"
             f"{py} - <<'PY'\n"
             "import sageattention\n"
             "if not callable(getattr(sageattention, 'sageattn', None)):\n"
@@ -516,8 +516,8 @@ def _vibecomfy_install_builder_shell(
             "PY\n"
         )
     return (
-        f"{py} -m pip install -e {_quote(workdir)}\n"
-        f"{py} -m pip install "
+        f"uv pip install --python {py} -e {_quote(workdir)}\n"
+        f"uv pip install --python {py} "
         "'comfyui@git+https://github.com/peteromallet/ComfyUI.git@fix/latentupscale-model-mmap-residency' "
         "'comfy-script[default]'\n"
         f"{sage_block}"
