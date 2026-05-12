@@ -12,8 +12,20 @@ from .discovery import (
 )
 from .errors import LaunchFailure, NotReadyTimeout, RunPodError, SSHError, TerminateError
 from .events import EventHooks, PodEvent, PodState
+from .guard import PodGuard, install_signal_handlers
+from .api import create_network_volume
 from .lifecycle import find_gpu_type, get_network_volumes, launch
 from .pod import Pod
+from .runner import ShipAndRunResult, ship_and_run, ship_and_run_detached
+from .shipping import (
+    UploadHeartbeat,
+    _build_upload_tarball,
+    _preflight_upload_disk,
+    _upload_remote_script,
+    download_artifact_archive,
+    should_skip,
+    upload_dir,
+)
 
 __all__ = [
     "RunPodConfig",
@@ -21,9 +33,15 @@ __all__ = [
     "PodState",
     "PodEvent",
     "EventHooks",
+    "PodGuard",
+    "UploadHeartbeat",
+    "ShipAndRunResult",
+    "ship_and_run",
+    "ship_and_run_detached",
     "launch",
     "find_gpu_type",
     "get_network_volumes",
+    "create_network_volume",
     "list_pods",
     "find_pods",
     "find_orphans",
@@ -31,6 +49,13 @@ __all__ = [
     "terminate",
     "cost_summary",
     "PodSummary",
+    "install_signal_handlers",
+    "should_skip",
+    "upload_dir",
+    "_build_upload_tarball",
+    "_preflight_upload_disk",
+    "_upload_remote_script",
+    "download_artifact_archive",
     "RunPodError",
     "LaunchFailure",
     "NotReadyTimeout",

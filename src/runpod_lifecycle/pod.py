@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 from . import api
@@ -151,6 +152,114 @@ class Pod:
         if raw_client is None:
             raise SSHError(f"SSH client for pod {self.id} did not expose a raw client")
         return raw_client
+
+    # ------------------------------------------------------------------
+    # Composable surface methods (Sprint 4)
+    # ------------------------------------------------------------------
+
+    async def upload_path(
+        self,
+        local: Path,
+        remote: str,
+        exclude: set[str] | None = None,
+        mode: str = "sftp_walk",
+    ) -> None:
+        """Upload *local* directory tree to *remote* on the pod.
+
+        Delegates to shipping primitives based on *mode*:
+        ``"sftp_walk"`` (default) or ``"tarball"``.
+        """
+        from .shipping import _build_upload_tarball, _upload_remote_script, _upload_tarball, upload_dir
+
+        exclude_set = exclude or set()
+        if mode == "tarball":
+            await _upload_tarball(
+                self,
+                exclude_set,
+                local_root=local,
+                remote_root=remote,
+            )
+        else:
+            client = self.open_ssh_client()
+            try:
+                sftp = client.open_sftp()
+                try:
+                    upload_dir(sftp, local, remote, exclude_set, local_root=local)
+                finally:
+                    sftp.close()
+            finally:
+                client.close()
+
+    async def download_archive(
+        self,
+        remote_root: str,
+        local: Path,
+        *,
+        artifact_paths: list[str] | None = None,
+    ) -> Path | None:
+        """Download artifact directories from the pod into *local*.
+
+        Thin facade around :func:`shipping.download_artifact_archive`.
+        """
+        from .shipping import download_artifact_archive
+
+        return await download_artifact_archive(
+            self,
+            remote_root=remote_root,
+            artifact_paths=artifact_paths or ["out", "output"],
+            local_artifact_root=local,
+        )
+
+    @staticmethod
+    async def create_storage(
+        name: str,
+        size_gb: int,
+        datacenter_id: str,
+    ) -> dict[str, Any]:
+        """Create a RunPod network volume.
+
+        Thin facade calling :func:`api.create_network_volume`.
+        Requires the ``RUNPOD_API_KEY`` env var to be set (read from
+        config when called via a bound Pod, or passed explicitly via
+        the static method).
+        """
+        import os as _os
+
+        runpod_api_key = _os.environ["RUNPOD_API_KEY"]
+        return await asyncio.to_thread(
+            api.create_network_volume,
+            runpod_api_key,
+            name,
+            size_gb,
+            datacenter_id,
+        )
+
+    @staticmethod
+    async def list_storages() -> list[dict[str, Any]]:
+        """Return all RunPod network volumes for the account.
+
+        Thin facade calling :func:`api.get_network_volumes`.
+        """
+        import os as _os
+
+        runpod_api_key = _os.environ["RUNPOD_API_KEY"]
+        return await asyncio.to_thread(api.get_network_volumes, runpod_api_key)
+
+    @staticmethod
+    async def get_storage(name_or_id: str) -> dict[str, Any] | None:
+        """Look up a RunPod network volume by name or ID.
+
+        Returns the volume dict on match, ``None`` if not found.
+        """
+        volumes = await Pod.list_storages()
+        for vol in volumes:
+            if vol.get("id") == name_or_id or vol.get("name") == name_or_id:
+                return vol
+        return None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     async def _ensure_ssh_details(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._ensure_ssh_details_sync)

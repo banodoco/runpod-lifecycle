@@ -1,4 +1,4 @@
-"""Command-line interface for runpod-lifecycle: list, status, terminate, find-orphans, gpu-types."""
+"""Command-line interface for runpod-lifecycle: launch, exec, ship, fetch, run, volumes, and legacy list/status/terminate/find-orphans/gpu-types."""
 
 from __future__ import annotations
 
@@ -8,11 +8,16 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 
-from . import api, discovery
+from . import api, config as cfg, discovery
+from .config import RunPodConfig
+from .guard import PodGuard, install_signal_handlers
+from .lifecycle import launch as _launch
+from .pod import Pod
 
 
 def _resolve_api_key(args: argparse.Namespace) -> str:
@@ -21,6 +26,25 @@ def _resolve_api_key(args: argparse.Namespace) -> str:
         print("error: RUNPOD_API_KEY not set (use --api-key or .env)", file=sys.stderr)
         sys.exit(2)
     return key
+
+
+def _resolve_config(args: argparse.Namespace) -> RunPodConfig:
+    api_key = _resolve_api_key(args)
+    return RunPodConfig(
+        api_key=api_key,
+        gpu_type=getattr(args, "gpu_type", None)
+        or os.getenv("RUNPOD_GPU_TYPE", cfg.DEFAULT_GPU_TYPE),
+        worker_image=getattr(args, "image", None)
+        or os.getenv("RUNPOD_WORKER_IMAGE", cfg.DEFAULT_WORKER_IMAGE),
+        container_disk_gb=getattr(args, "container_disk_gb", None)
+        or int(os.getenv("RUNPOD_CONTAINER_DISK_GB", "200")),
+        name_prefix=getattr(args, "name_prefix", None)
+        or os.getenv("RUNPOD_NAME_PREFIX", "pod"),
+        disk_size_gb=getattr(args, "disk_size_gb", None)
+        or int(os.getenv("RUNPOD_DISK_SIZE_GB", "200")),
+        storage_name=getattr(args, "storage_name", None)
+        or os.getenv("RUNPOD_STORAGE_NAME"),
+    )
 
 
 def _parse_duration(text: str) -> int:
@@ -60,6 +84,11 @@ def _print_cost(summaries: list[discovery.PodSummary]) -> None:
         f"\nTotal: ${cost['total_per_hr']:.3f}/hr  "
         f"(daily ${cost['daily']:.2f}, monthly ${cost['monthly']:.2f})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Async handlers for each subcommand
+# ---------------------------------------------------------------------------
 
 
 async def _cmd_list(args: argparse.Namespace) -> int:
@@ -143,10 +172,171 @@ async def _cmd_gpu_types(args: argparse.Namespace) -> int:
     return 0
 
 
+# -- Sprint 4 verbs --------------------------------------------------------
+
+
+async def _cmd_launch(args: argparse.Namespace) -> int:
+    """Launch a new RunPod pod. With --detach, prints details and exits 0."""
+    config = _resolve_config(args)
+    name = getattr(args, "name", None)
+    pod = await _launch(config, name=name)
+    await pod.wait_ready(timeout=getattr(args, "timeout", 600))
+
+    ssh_details = await pod._ensure_ssh_details()
+    info = {
+        "pod_id": pod.id,
+        "name": pod.name,
+        "ssh": f"root@{ssh_details['ip']} -p {ssh_details['port']}",
+        "gpu_type": config.gpu_type,
+    }
+    print(json.dumps(info, indent=2))
+
+    if not getattr(args, "detach", False):
+        print(f"\nPod {pod.id} is running. Press Ctrl-C to terminate.")
+        try:
+            while True:
+                await asyncio.sleep(10)
+        except KeyboardInterrupt:
+            print("\nTerminating pod...")
+            await pod.terminate()
+            print(f"terminated {pod.id}")
+    return 0
+
+
+async def _cmd_exec(args: argparse.Namespace) -> int:
+    """Execute a command on an existing pod via SSH."""
+    config = _resolve_config(args)
+    pod = await discovery.get_pod(args.pod_id, config)
+    await pod.wait_ready(timeout=60)
+    # REMAINDER captures the raw command tokens after '--'; join them back
+    remote_cmd = " ".join(args.exec_cmd) if args.exec_cmd else ""
+    if not remote_cmd:
+        print("error: no command provided", file=sys.stderr)
+        return 2
+    code, stdout, stderr = await pod.exec_ssh(remote_cmd, timeout=getattr(args, "timeout", 600))
+    if stdout:
+        print(stdout, end="")
+    if stderr:
+        print(stderr, end="", file=sys.stderr)
+    return code
+
+
+async def _cmd_ship(args: argparse.Namespace) -> int:
+    """Upload a local directory tree to a pod."""
+    config = _resolve_config(args)
+    pod = await discovery.get_pod(args.pod_id, config)
+    await pod.wait_ready(timeout=60)
+    exclude = set(getattr(args, "exclude", "").split(",")) if getattr(args, "exclude", None) else set()
+    mode = getattr(args, "upload_mode", "sftp_walk") or "sftp_walk"
+    await pod.upload_path(Path(args.local).resolve(), args.remote, exclude=exclude, mode=mode)
+    print(f"shipped {args.local} -> {args.pod_id}:{args.remote}")
+    return 0
+
+
+async def _cmd_fetch(args: argparse.Namespace) -> int:
+    """Download artifact directories from a pod."""
+    config = _resolve_config(args)
+    pod = await discovery.get_pod(args.pod_id, config)
+    await pod.wait_ready(timeout=60)
+    local = Path(args.local).resolve()
+    result = await pod.download_archive(args.remote, local)
+    if result:
+        print(f"fetched artifacts -> {result}")
+    else:
+        print("no artifacts found", file=sys.stderr)
+        return 1
+    return 0
+
+
+async def _cmd_run(args: argparse.Namespace) -> int:
+    """Ship a script and run it on a pod (sync composite)."""
+    from .runner import ship_and_run
+
+    config = _resolve_config(args)
+    script_path = Path(args.script).resolve()
+    if not script_path.exists():
+        print(f"error: script not found: {args.script}", file=sys.stderr)
+        return 1
+    remote_script = script_path.read_text()
+    local_root = script_path.parent
+    remote_root = getattr(args, "remote_root", "/workspace")
+
+    result = await ship_and_run(
+        config,
+        remote_script,
+        local_root=local_root,
+        remote_root=remote_root,
+        exclude=set(),
+        upload_mode=getattr(args, "upload_mode", "sftp_walk") or "sftp_walk",
+        timeout=getattr(args, "timeout", 600),
+        name_prefix=getattr(args, "name_prefix", None) or config.name_prefix,
+        terminate_after_exec=not getattr(args, "keep_pod", False),
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
+
+
+async def _cmd_volumes_ls(args: argparse.Namespace) -> int:
+    """List all RunPod network volumes."""
+    volumes = await Pod.list_storages()
+    if args.json:
+        print(json.dumps(volumes, default=str, indent=2))
+    else:
+        if not volumes:
+            print("(no volumes)")
+            return 0
+        headers = ["ID", "NAME", "SIZE", "DATACENTER"]
+        rows: list[list[str]] = []
+        for v in volumes:
+            rows.append([
+                v.get("id", "-"),
+                v.get("name", "-"),
+                f"{v.get('size', '-')} GB",
+                v.get("dataCenterId", "-"),
+            ])
+        width_id = max(len("ID"), max(len(r[0]) for r in rows))
+        width_name = max(len("NAME"), max(len(r[1]) for r in rows))
+        width_size = max(len("SIZE"), max(len(r[2]) for r in rows))
+        width_dc = max(len("DATACENTER"), max(len(r[3]) for r in rows))
+        fmt = f"{{:<{width_id}}}  {{:<{width_name}}}  {{:<{width_size}}}  {{:<{width_dc}}}"
+        print(fmt.format(*headers))
+        print(fmt.format(*["-" * w for w in [width_id, width_name, width_size, width_dc]]))
+        for r in rows:
+            print(fmt.format(*r))
+    return 0
+
+
+async def _cmd_volume_create(args: argparse.Namespace) -> int:
+    """Create a RunPod network volume."""
+    if not args.datacenter:
+        print("error: --datacenter is required", file=sys.stderr)
+        return 2
+    try:
+        vol = await Pod.create_storage(args.name, args.size_gb, args.datacenter)
+        print(json.dumps(vol, default=str, indent=2))
+        return 0
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="runpod-lifecycle", description="RunPod pod lifecycle CLI.")
+    parser = argparse.ArgumentParser(
+        prog="runpod-lifecycle",
+        description="RunPod pod lifecycle CLI.",
+    )
     parser.add_argument("--api-key", help="Override RUNPOD_API_KEY env var.")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # --- legacy verbs (unchanged from v0.1) ---------------------------------
 
     p_list = sub.add_parser("list", help="List all pods on the account.")
     p_list.add_argument("--name-prefix", help="Filter to pods whose name starts with PREFIX.")
@@ -159,10 +349,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_term.add_argument("pod_id")
     p_term.add_argument("--yes", "-y", action="store_true", help="Skip confirmation.")
 
-    p_orph = sub.add_parser("find-orphans", help="Find pods on the account not in the supplied known-ids list.")
+    p_orph = sub.add_parser(
+        "find-orphans",
+        help="Find pods on the account not in the supplied known-ids list.",
+    )
     p_orph.add_argument("--known-ids-file", help="File with one pod id per line. Empty if omitted.")
-    p_orph.add_argument("--older-than", type=_parse_duration, default=None,
-                        help="Only orphans with uptime >= this duration (e.g. 1h, 30m, 90s).")
+    p_orph.add_argument(
+        "--older-than",
+        type=_parse_duration,
+        default=None,
+        help="Only orphans with uptime >= this duration (e.g. 1h, 30m, 90s).",
+    )
     p_orph.add_argument("--name-prefix", help="Filter pods to those whose name starts with PREFIX.")
     p_orph.add_argument("--terminate", action="store_true", help="After listing, terminate each orphan.")
     p_orph.add_argument("--yes", "-y", action="store_true", help="Skip terminate confirmation.")
@@ -170,22 +367,93 @@ def build_parser() -> argparse.ArgumentParser:
     p_gpu = sub.add_parser("gpu-types", help="List available GPU types from RunPod.")
     p_gpu.add_argument("--json", action="store_true")
 
+    # --- Sprint 4 verbs -----------------------------------------------------
+
+    p_launch = sub.add_parser("launch", help="Launch a new RunPod pod.")
+    p_launch.add_argument("--detach", action="store_true", help="Launch and exit; keep pod running.")
+    p_launch.add_argument("--name", help="Pod name (default: auto-generated).")
+    p_launch.add_argument("--gpu-type", help="GPU type (default: RTX 4090).")
+    p_launch.add_argument("--image", help="Docker image (default: pytorch devel).")
+    p_launch.add_argument("--container-disk-gb", type=int, default=200, help="Container disk size GB.")
+    p_launch.add_argument("--disk-size-gb", type=int, default=200, help="Pod disk size GB.")
+    p_launch.add_argument("--name-prefix", help="Prefix for auto-generated pod name.")
+    p_launch.add_argument("--storage-name", help="Network volume name to attach.")
+    p_launch.add_argument("--timeout", type=int, default=600, help="Seconds to wait for pod readiness.")
+    p_launch.add_argument("--datacenter-id", help="Datacenter ID (e.g. US-TX-1).")
+
+    p_exec = sub.add_parser("exec", help="Execute a command on an existing pod via SSH.")
+    p_exec.add_argument("pod_id")
+    p_exec.add_argument("exec_cmd", nargs=argparse.REMAINDER, help="Command to execute.")
+    p_exec.add_argument("--timeout", type=int, default=600, help="Command timeout in seconds.")
+    p_exec.add_argument("--gpu-type", help="GPU type (for config; usually optional for exec).")
+
+    p_ship = sub.add_parser("ship", help="Upload a local directory to a pod.")
+    p_ship.add_argument("pod_id")
+    p_ship.add_argument("--local", required=True, help="Local directory to upload.")
+    p_ship.add_argument("--remote", required=True, help="Remote destination path on pod.")
+    p_ship.add_argument("--exclude", help="Comma-separated list of patterns to exclude.")
+    p_ship.add_argument("--upload-mode", choices=["sftp_walk", "tarball"], default="sftp_walk")
+
+    p_fetch = sub.add_parser("fetch", help="Download artifact directories from a pod.")
+    p_fetch.add_argument("pod_id")
+    p_fetch.add_argument("--remote", required=True, help="Remote root path on pod (e.g. /workspace).")
+    p_fetch.add_argument("--local", required=True, help="Local destination directory.")
+
+    p_run = sub.add_parser("run", help="Ship a script file and run it on a pod (sync composite).")
+    p_run.add_argument("pod_id")
+    p_run.add_argument("--script", required=True, help="Path to the shell script to run.")
+    p_run.add_argument("--remote-root", default="/workspace", help="Remote working directory.")
+    p_run.add_argument("--upload-mode", choices=["sftp_walk", "tarball"], default="sftp_walk")
+    p_run.add_argument("--timeout", type=int, default=600, help="Command timeout in seconds.")
+    p_run.add_argument("--name-prefix", help="Name prefix for the pod.")
+    p_run.add_argument("--keep-pod", action="store_true", help="Leave pod alive after script completes.")
+    p_run.add_argument("--gpu-type", help="GPU type override.")
+    p_run.add_argument("--image", help="Docker image override.")
+
+    p_vols_ls = sub.add_parser("volumes", help="RunPod network volume operations.")
+    vol_sub = p_vols_ls.add_subparsers(dest="volumes_cmd", required=True)
+
+    p_vol_ls = vol_sub.add_parser("ls", help="List all network volumes.")
+    p_vol_ls.add_argument("--json", action="store_true")
+
+    p_vol_create = vol_sub.add_parser("create", help="Create a network volume.")
+    p_vol_create.add_argument("name")
+    p_vol_create.add_argument("size_gb", type=int)
+    p_vol_create.add_argument("--datacenter", required=True, help="Datacenter ID (e.g. US-TX-1).")
+
     return parser
 
 
-_HANDLERS = {
+_HANDLERS: dict[str, Any] = {
     "list": _cmd_list,
     "status": _cmd_status,
     "terminate": _cmd_terminate,
     "find-orphans": _cmd_find_orphans,
     "gpu-types": _cmd_gpu_types,
+    # Sprint 4
+    "launch": _cmd_launch,
+    "exec": _cmd_exec,
+    "ship": _cmd_ship,
+    "fetch": _cmd_fetch,
+    "run": _cmd_run,
+    "volumes": None,  # dispatched via volumes_cmd below
+}
+
+_VOLUMES_HANDLERS: dict[str, Any] = {
+    "ls": _cmd_volumes_ls,
+    "create": _cmd_volume_create,
 }
 
 
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = build_parser().parse_args(argv)
-    handler = _HANDLERS[args.cmd]
+
+    if args.cmd == "volumes":
+        handler = _VOLUMES_HANDLERS[args.volumes_cmd]
+    else:
+        handler = _HANDLERS[args.cmd]
+
     try:
         return asyncio.run(handler(args))
     except KeyboardInterrupt:

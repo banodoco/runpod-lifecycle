@@ -348,8 +348,44 @@ def terminate_pod(pod_id: str, api_key: str) -> None:
     sdk.terminate_pod(pod_id)
 
 
+def create_network_volume(
+    api_key: str,
+    name: str,
+    size_gb: int,
+    datacenter_id: str,
+) -> dict[str, Any]:
+    """Create a RunPod network volume via REST API.
+
+    POSTs to ``NETWORK_VOLUMES_URL`` with payload ``{name, size, dataCenterId}``.
+    Returns the full API response dict on success.
+    """
+    payload: dict[str, Any] = {
+        "name": name,
+        "size": size_gb,
+        "dataCenterId": datacenter_id,
+    }
+    response = httpx.post(
+        NETWORK_VOLUMES_URL,
+        json=payload,
+        headers=_auth_headers(api_key),
+        timeout=30,
+    )
+    if response.status_code not in (200, 201):
+        logger.error(
+            "create_network_volume failed: status=%d body=%s",
+            response.status_code,
+            response.text[:500],
+        )
+        raise RuntimeError(
+            f"Failed to create network volume '{name}': "
+            f"HTTP {response.status_code}: {response.text[:200]}"
+        )
+    return response.json()
+
+
 __all__ = [
     "create_pod",
+    "create_network_volume",
     "find_gpu_type",
     "get_network_volumes",
     "get_pod_ssh_details",
