@@ -142,6 +142,14 @@ def test_vibecomfy_builder_install_uses_separate_python311_venv():
     assert "uv pip install --python /opt/build/vibecomfy/.venv/bin/python -e /opt/build/vibecomfy" in body
 
 
+def test_prebuilt_build_installs_bundle_system_tools():
+    import inspect
+
+    source = inspect.getsource(cli._cmd_prebuilt_build)
+    assert "zstd" in source
+    assert "pv" in source
+
+
 # --------------------------------------------------------------------------- #
 # Manifest round-trip via simulated SSH
 # --------------------------------------------------------------------------- #

@@ -664,7 +664,7 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
             )
 
         with _prebuilt_phase("install_worker", workdir=_BUILDER_REIGH_WORKER_DIR):
-            apt_packages = "python3.10-venv python3.10-dev build-essential ffmpeg git curl wget"
+            apt_packages = "python3.10-venv python3.10-dev build-essential ffmpeg git curl wget zstd pv"
             sync_body = _uv_sync_builder_shell(
                 _BUILDER_REIGH_WORKER_DIR, env_path=_BUILDER_VENV_PATH, extras=("cuda124",)
             )
