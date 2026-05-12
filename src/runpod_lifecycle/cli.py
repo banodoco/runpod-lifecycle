@@ -18,6 +18,7 @@ from .config import RunPodConfig
 from .guard import PodGuard, install_signal_handlers
 from .lifecycle import launch as _launch
 from .pod import Pod
+from .probe import probe as _probe
 
 
 def _resolve_api_key(args: argparse.Namespace) -> str:
@@ -28,8 +29,25 @@ def _resolve_api_key(args: argparse.Namespace) -> str:
     return key
 
 
+def _coalesce_blank(value: str | None) -> str | None:
+    """Return ``None`` for missing-or-blank strings; pass real values through.
+
+    ``os.getenv`` returns ``""`` when an env var is set to the empty string,
+    which then falsely propagates as "set" through the rest of the launch
+    pipeline (e.g. ``RUNPOD_STORAGE_NAME=""`` would attempt to resolve a
+    blank storage name). Coalesce here so downstream code can keep using
+    ``if storage_name`` truthiness.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def _resolve_config(args: argparse.Namespace) -> RunPodConfig:
     api_key = _resolve_api_key(args)
+    arg_storage = _coalesce_blank(getattr(args, "storage_name", None))
+    env_storage = _coalesce_blank(os.getenv("RUNPOD_STORAGE_NAME"))
     return RunPodConfig(
         api_key=api_key,
         gpu_type=getattr(args, "gpu_type", None)
@@ -42,8 +60,7 @@ def _resolve_config(args: argparse.Namespace) -> RunPodConfig:
         or os.getenv("RUNPOD_NAME_PREFIX", "pod"),
         disk_size_gb=getattr(args, "disk_size_gb", None)
         or int(os.getenv("RUNPOD_DISK_SIZE_GB", "200")),
-        storage_name=getattr(args, "storage_name", None)
-        or os.getenv("RUNPOD_STORAGE_NAME"),
+        storage_name=arg_storage or env_storage,
     )
 
 
@@ -323,6 +340,54 @@ async def _cmd_volume_create(args: argparse.Namespace) -> int:
         return 1
 
 
+async def _cmd_probe(args: argparse.Namespace) -> int:
+    """Query RunPod for currently-launchable GPU configs (no pod created)."""
+    api_key = _resolve_api_key(args)
+
+    gpu_types_arg: list[str] | None = None
+    if getattr(args, "gpu_types", None):
+        gpu_types_arg = [g.strip() for g in args.gpu_types.split(",") if g.strip()] or None
+
+    datacenter_ids: list[str] | None = None
+    if getattr(args, "datacenter_ids", None):
+        datacenter_ids = [
+            d.strip() for d in args.datacenter_ids.split(",") if d.strip()
+        ] or None
+
+    results = await _probe(
+        api_key=api_key,
+        gpu_types=gpu_types_arg,
+        min_memory_gb=args.min_memory,
+        max_price_per_hour=args.max_price,
+        require_secure_cloud=not args.allow_community_cloud,
+        exclude_blackwell=args.exclude_blackwell,
+        container_disk_gb=args.container_disk_gb,
+        datacenter_ids=datacenter_ids,
+    )
+
+    fmt = getattr(args, "format", "json") or "json"
+    if fmt == "json":
+        print(json.dumps(results, indent=2))
+        return 0
+
+    # table
+    if not results:
+        print("(no viable configurations)")
+        return 0
+    headers = ["GPU TYPE", "MEM GB", "$/HR", "SECURE", "BLACKWELL"]
+    rows: list[list[str]] = []
+    for r in results:
+        rows.append([
+            str(r.get("gpu_type", "-")),
+            str(r.get("memory_gb", "-")),
+            f"${float(r.get('price_per_hour', 0.0)):.3f}",
+            "yes" if r.get("secure_cloud") else "no",
+            "yes" if r.get("is_blackwell") else "no",
+        ])
+    _print_table(rows, headers)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
@@ -421,6 +486,57 @@ def build_parser() -> argparse.ArgumentParser:
     p_vol_create.add_argument("size_gb", type=int)
     p_vol_create.add_argument("--datacenter", required=True, help="Datacenter ID (e.g. US-TX-1).")
 
+    p_probe = sub.add_parser(
+        "probe",
+        help="Query RunPod for currently-launchable GPU configs (no pod created).",
+    )
+    p_probe.add_argument(
+        "--gpu-types",
+        dest="gpu_types",
+        help="Comma-separated allow-list of GPU type ids (case-sensitive). "
+        "Default: consider every type RunPod returns.",
+    )
+    p_probe.add_argument(
+        "--min-memory",
+        type=int,
+        default=24,
+        help="Minimum GPU VRAM in GB (default: 24).",
+    )
+    p_probe.add_argument(
+        "--max-price",
+        type=float,
+        default=None,
+        help="Cap hourly uninterruptable price (USD).",
+    )
+    p_probe.add_argument(
+        "--allow-community-cloud",
+        action="store_true",
+        help="Include Community Cloud pricing (default: Secure Cloud only).",
+    )
+    p_probe.add_argument(
+        "--exclude-blackwell",
+        action="store_true",
+        help="Drop Blackwell variants (hivemind reports training-quality regression).",
+    )
+    p_probe.add_argument(
+        "--container-disk-gb",
+        type=int,
+        default=100,
+        help="Container disk size used for forward-compatible availability checks.",
+    )
+    p_probe.add_argument(
+        "--datacenter-ids",
+        dest="datacenter_ids",
+        help="Comma-separated datacenter id allow-list (forward-compatible; "
+        "currently informational only).",
+    )
+    p_probe.add_argument(
+        "--format",
+        choices=["json", "table"],
+        default="json",
+        help="Output format (default: json).",
+    )
+
     return parser
 
 
@@ -436,6 +552,7 @@ _HANDLERS: dict[str, Any] = {
     "ship": _cmd_ship,
     "fetch": _cmd_fetch,
     "run": _cmd_run,
+    "probe": _cmd_probe,
     "volumes": None,  # dispatched via volumes_cmd below
 }
 

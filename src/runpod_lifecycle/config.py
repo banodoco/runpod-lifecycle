@@ -77,6 +77,19 @@ def _parse_gpu_type_env(value: str | None) -> str | tuple[str, ...]:
     return parts
 
 
+def _parse_optional_string(value: str | None) -> str | None:
+    """Coalesce missing/blank env values to ``None``.
+
+    ``os.getenv`` yields ``""`` when a variable is set to the empty string
+    (e.g. ``RUNPOD_STORAGE_NAME=`` in a ``.env`` file). Empty strings are
+    truthy in some downstream paths, so treat blank as unset.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def _parse_env_vars(value: str | None) -> dict[str, str]:
     if value is None or value.strip() == "":
         return {}
@@ -144,7 +157,7 @@ class RunPodConfig:
             ),
             "ram_tiers": _parse_int_tuple(os.getenv("RUNPOD_RAM_TIERS"), DEFAULT_RAM_TIERS),
             "storage_volumes": _parse_csv_tuple(os.getenv("RUNPOD_STORAGE_VOLUMES")),
-            "storage_name": os.getenv("RUNPOD_STORAGE_NAME"),
+            "storage_name": _parse_optional_string(os.getenv("RUNPOD_STORAGE_NAME")),
             "ssh_public_key": os.getenv("RUNPOD_SSH_PUBLIC_KEY"),
             "ssh_private_key": os.getenv("RUNPOD_SSH_PRIVATE_KEY"),
             "ssh_public_key_path": os.getenv("RUNPOD_SSH_PUBLIC_KEY_PATH"),

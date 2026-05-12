@@ -109,6 +109,75 @@ def test_cli_terminate_requires_confirmation(
     assert called == []
 
 
+def test_cli_probe_prints_json(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "k")
+    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+
+    captured: dict = {}
+
+    async def fake_probe(*, api_key, **kwargs):
+        captured["api_key"] = api_key
+        captured["kwargs"] = kwargs
+        return [
+            {
+                "gpu_type": "RTX 6000 Ada",
+                "memory_gb": 48,
+                "price_per_hour": 0.77,
+                "secure_cloud": True,
+                "is_blackwell": False,
+                "datacenters_available": [],
+            }
+        ]
+
+    monkeypatch.setattr("runpod_lifecycle.cli._probe", fake_probe)
+    rc = cli.main([
+        "probe",
+        "--min-memory",
+        "48",
+        "--exclude-blackwell",
+        "--max-price",
+        "1.5",
+    ])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["gpu_type"] == "RTX 6000 Ada"
+    assert captured["api_key"] == "k"
+    assert captured["kwargs"]["min_memory_gb"] == 48
+    assert captured["kwargs"]["exclude_blackwell"] is True
+    assert captured["kwargs"]["max_price_per_hour"] == 1.5
+    # Secure-cloud is the default; --allow-community-cloud was not passed.
+    assert captured["kwargs"]["require_secure_cloud"] is True
+
+
+def test_cli_probe_table_format(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "k")
+    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+
+    async def fake_probe(**_kwargs):
+        return [
+            {
+                "gpu_type": "RTX 6000 Ada",
+                "memory_gb": 48,
+                "price_per_hour": 0.77,
+                "secure_cloud": True,
+                "is_blackwell": False,
+                "datacenters_available": [],
+            }
+        ]
+
+    monkeypatch.setattr("runpod_lifecycle.cli._probe", fake_probe)
+    rc = cli.main(["probe", "--format", "table"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "GPU TYPE" in out
+    assert "RTX 6000 Ada" in out
+    assert "$0.770" in out
+
+
 def test_cli_terminate_yes_skips_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "k")
     monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)

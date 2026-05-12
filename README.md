@@ -94,6 +94,32 @@ pod = await launch(cfg)
 
 For direct file transport or other low-level SSH work, `Pod.open_ssh_client()` returns a connected `paramiko`-compatible client. Callers are responsible for closing the returned client when they are done with it.
 
+## Probing availability
+
+Before launching, ask RunPod what is actually launchable right now — no pod is created:
+
+```bash
+runpod-lifecycle probe --min-memory 48 --exclude-blackwell --format table
+```
+
+```python
+import asyncio, os
+from runpod_lifecycle import probe
+
+async def main():
+    options = await probe(
+        api_key=os.environ["RUNPOD_API_KEY"],
+        min_memory_gb=48,
+        exclude_blackwell=True,
+    )
+    for o in options[:3]:
+        print(o["gpu_type"], o["price_per_hour"])
+
+asyncio.run(main())
+```
+
+Results are price-ranked; GPU types without current secure-cloud availability are dropped.
+
 ## Config Reference
 
 | field | env var | default | description |

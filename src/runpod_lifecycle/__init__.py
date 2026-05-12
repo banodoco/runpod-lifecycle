@@ -16,6 +16,7 @@ from .guard import PodGuard, install_signal_handlers
 from .api import create_network_volume
 from .lifecycle import find_gpu_type, get_network_volumes, launch
 from .pod import Pod
+from .probe import probe
 from .runner import ShipAndRunResult, ship_and_run, ship_and_run_detached
 from .shipping import (
     UploadHeartbeat,
@@ -39,6 +40,7 @@ __all__ = [
     "ship_and_run",
     "ship_and_run_detached",
     "launch",
+    "probe",
     "find_gpu_type",
     "get_network_volumes",
     "create_network_volume",

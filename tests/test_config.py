@@ -131,6 +131,29 @@ def test_gpu_type_list_input_normalizes_to_tuple() -> None:
     assert config.gpu_type_candidates == ("A", "B", "C")
 
 
+def test_empty_storage_name_env_coalesces_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """RUNPOD_STORAGE_NAME='' must behave like 'unset', not an empty volume name."""
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("RUNPOD_API_KEY", "api-key")
+    monkeypatch.setenv("RUNPOD_STORAGE_NAME", "")
+
+    config = RunPodConfig.from_env()
+
+    assert config.storage_name is None
+
+
+def test_whitespace_storage_name_env_coalesces_to_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("RUNPOD_API_KEY", "api-key")
+    monkeypatch.setenv("RUNPOD_STORAGE_NAME", "   ")
+
+    config = RunPodConfig.from_env()
+
+    assert config.storage_name is None
+
+
 def test_merge_returns_new_instance_with_overrides() -> None:
     original = RunPodConfig(api_key="api-key", name_prefix="pod", min_memory_gb=32)
 
