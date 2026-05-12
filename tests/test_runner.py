@@ -5,7 +5,7 @@ Coverage:
 - ship_and_run with terminate_after_exec=False → pod returned, NOT terminated
 - guard_factory mock → custom guard used
 - CancelledError path → result.returncode == 130
-- ship_and_run_detached with parameterized poll targets
+- ship_and_run_detached provisioning and reattach paths
 - ship_and_run_detached timeout path → returncode 124
 """
 
@@ -60,6 +60,7 @@ def _make_mock_pod(pod_id: str = "pod-test") -> MagicMock:
     """Create a mock Pod with all required methods."""
     mock_pod = MagicMock()
     mock_pod.id = pod_id
+    mock_pod.config = RunPodConfig(api_key="pod-key")
     mock_pod.wait_ready = AsyncMock()
     mock_pod._ensure_ssh_details = AsyncMock(return_value={
         "ip": "1.2.3.4", "port": 2201, "password": "***"
@@ -229,12 +230,12 @@ async def test_ship_and_run_cancelled_error_returns_130(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ship_and_run_detached — parameterized poll targets
+# ship_and_run_detached — provision path
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_ship_and_run_detached_with_parameterized_poll(tmp_path: Path) -> None:
-    """ship_and_run_detached uses the poll_command_template and poll_exit_marker."""
+async def test_ship_and_run_detached_provision_path_still_launches(tmp_path: Path) -> None:
+    """ship_and_run_detached keeps the original config-driven launch path."""
     config = RunPodConfig(api_key="***")
     mock_pod = _make_mock_pod("pod-det-1")
     local_root = tmp_path / "local5"
@@ -251,8 +252,6 @@ async def test_ship_and_run_detached_with_parameterized_poll(tmp_path: Path) -> 
         return next(exec_results)
 
     mock_pod.exec_ssh = fake_exec
-
-    custom_marker = "/tmp/my_custom_exit_code"
 
     with patch("runpod_lifecycle.runner._launch_pod", new_callable=AsyncMock) as mock_launch:
         mock_launch.return_value = mock_pod
@@ -271,12 +270,11 @@ async def test_ship_and_run_detached_with_parameterized_poll(tmp_path: Path) -> 
                     timeout=300,
                     terminate_after_exec=True,
                     poll_interval=1,
-                    poll_exit_marker=custom_marker,
-                    artifact_paths=["out"],
                 )
 
     assert result.returncode == 42  # parsed from polled "42"
     assert result.terminated is True
+    mock_launch.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -331,6 +329,81 @@ async def test_ship_and_run_detached_timeout_returns_124(tmp_path: Path) -> None
     assert result.returncode == 124  # timeout
 
 
+@pytest.mark.asyncio
+async def test_ship_and_run_detached_reattach_skips_launch() -> None:
+    """Supplying pod skips provisioning and runs on the existing pod."""
+    mock_pod = _make_mock_pod("pod-existing")
+    mock_pod.hourly_rate = 0.69
+
+    exec_results = iter([
+        (0, "GPU 0: ...", ""),   # nvidia-smi
+        (0, "12345\n", ""),       # nohup launch pid
+        (0, "0", ""),             # poll response
+    ])
+
+    async def fake_exec(cmd: str, timeout: int = 600) -> tuple[int, str, str]:
+        return next(exec_results)
+
+    mock_pod.exec_ssh = AsyncMock(side_effect=fake_exec)
+
+    with patch("runpod_lifecycle.runner._launch_pod", new_callable=AsyncMock) as mock_launch:
+        with patch("runpod_lifecycle.runner._upload_remote_script", new_callable=AsyncMock):
+            result = await ship_and_run_detached(
+                pod=mock_pod,
+                remote_script="echo ok",
+                timeout=30,
+                poll_interval=1,
+            )
+
+    assert result.returncode == 0
+    assert result.pod is mock_pod
+    assert result.cost_per_hr == 0.69
+    assert result.upload_info == {"mode": "none", "remote_root": "/workspace"}
+    mock_launch.assert_not_called()
+    mock_pod.wait_ready.assert_not_called()
+    mock_pod._ensure_ssh_details.assert_awaited()
+    mock_pod.terminate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ship_and_run_detached_requires_config_or_pod() -> None:
+    """Detached runner needs either provision config or a reattach pod."""
+    with pytest.raises(ValueError, match="requires either config or pod"):
+        await ship_and_run_detached(remote_script="echo ok")
+
+
+@pytest.mark.asyncio
+async def test_ship_and_run_detached_reattach_terminate_after_exec() -> None:
+    """terminate_after_exec=True terminates a supplied reattach pod."""
+    mock_pod = _make_mock_pod("pod-existing-terminate")
+
+    exec_results = iter([
+        (0, "GPU 0: ...", ""),   # nvidia-smi
+        (0, "12345\n", ""),       # nohup launch pid
+        (0, "0", ""),             # poll response
+    ])
+
+    async def fake_exec(cmd: str, timeout: int = 600) -> tuple[int, str, str]:
+        return next(exec_results)
+
+    mock_pod.exec_ssh = AsyncMock(side_effect=fake_exec)
+
+    with patch("runpod_lifecycle.runner._launch_pod", new_callable=AsyncMock) as mock_launch:
+        with patch("runpod_lifecycle.runner._upload_remote_script", new_callable=AsyncMock):
+            result = await ship_and_run_detached(
+                pod=mock_pod,
+                remote_script="echo ok",
+                timeout=30,
+                terminate_after_exec=True,
+                poll_interval=1,
+            )
+
+    assert result.returncode == 0
+    assert result.terminated is True
+    mock_launch.assert_not_called()
+    mock_pod.terminate.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # ShipAndRunResult dataclass
 # ---------------------------------------------------------------------------
@@ -343,6 +416,7 @@ def test_ship_and_run_result_defaults() -> None:
     assert result.stderr == ""
     assert result.pod is None
     assert result.artifact_root is None
+    assert result.cost_per_hr is None
     assert result.breach_log == []
     assert result.terminated is False
     assert result.upload_info == {}

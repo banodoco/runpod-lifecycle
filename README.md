@@ -94,6 +94,24 @@ pod = await launch(cfg)
 
 For direct file transport or other low-level SSH work, `Pod.open_ssh_client()` returns a connected `paramiko`-compatible client. Callers are responsible for closing the returned client when they are done with it.
 
+### Detached runs on an existing pod
+
+`ship_and_run_detached()` can either provision a fresh pod from `config` or
+reattach to a `Pod` that was launched earlier. Supplying `pod=` skips launch,
+storage attach, and RAM-tier fallback entirely; `config`, when also supplied,
+is treated only as an API-key source for operations on that pod.
+
+```python
+result = await ship_and_run_detached(
+    pod=existing_pod,
+    remote_script="python train.py --resume",
+    local_root=Path("payload"),
+    remote_root="/workspace/job",
+    exclude={".git", "__pycache__"},
+    terminate_after_exec=False,
+)
+```
+
 ## Probing availability
 
 Before launching, ask RunPod what is actually launchable right now — no pod is created:

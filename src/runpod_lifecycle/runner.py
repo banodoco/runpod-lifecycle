@@ -74,6 +74,7 @@ class ShipAndRunResult:
     stderr: str = ""
     pod: Pod | None = None
     artifact_root: Path | None = None
+    cost_per_hr: float | None = None
     breach_log: list[dict] = field(default_factory=list)
     terminated: bool = False
     upload_info: dict[str, Any] = field(default_factory=dict)
@@ -216,74 +217,67 @@ async def ship_and_run(
 
 
 async def ship_and_run_detached(
-    config: RunPodConfig,
-    remote_script: str,
+    config: RunPodConfig | None = None,
+    remote_script: str = "",
     *,
-    local_root: Path,
-    remote_root: str,
-    exclude: set[str],
+    pod: Pod | None = None,
+    local_root: Path | None = None,
+    remote_root: str = "/workspace",
+    exclude: set[str] | None = None,
     upload_mode: Literal["sftp_walk", "tarball"] = "sftp_walk",
-    timeout: int = 600,
+    timeout: int = 3600,
     name_prefix: str = "pod",
-    terminate_after_exec: bool = True,
-    guard_factory: Callable[..., PodGuard] | None = None,
-    poll_interval: int = 60,
-    poll_command_template: str = DEFAULT_POLL_COMMAND_TEMPLATE,
-    poll_exit_marker: str = DEFAULT_POLL_EXIT_MARKER,
-    artifact_paths: list[str] | None = None,
+    terminate_after_exec: bool = False,
+    poll_interval: int = 30,
 ) -> ShipAndRunResult:
-    """Launch a pod, ship a payload, run *remote_script* detached, poll
-    for completion, and download artifacts.
+    """Run *remote_script* detached on a new pod or an existing pod.
 
-    All polling parameters are fully parameterized — no consumer-specific
-    paths are baked in.
-
-    Parameters
-    ----------
-    poll_command_template:
-        Format string that receives ``{poll_exit_marker}``.  Default
-        cats the marker file.
-    poll_exit_marker:
-        Remote file path where the exit code is written.
-    artifact_paths:
-        Directories (relative to *remote_root*) to archive and download.
-        Defaults to ``["out", "output"]``.
+    Either pass *config* to provision a new pod or pass *pod* to reattach
+    to an already-provisioned pod. When both are supplied, *pod* wins and
+    *config* is used only as an API-key source.
     """
-    if artifact_paths is None:
-        artifact_paths = ["out", "output"]
+    if config is None and pod is None:
+        raise ValueError("ship_and_run_detached requires either config or pod")
 
-    _factory: Callable[..., PodGuard] = (
-        guard_factory if guard_factory is not None else PodGuard
-    )
-
-    guard = _factory(
-        name_prefix=name_prefix,
-        default_max_runtime_seconds=max(timeout * 2, 7200),
-        auto_terminate=terminate_after_exec,
-    )
+    if pod is not None and config is not None:
+        logger.info(
+            "ship_and_run_detached received both config and pod; "
+            "using pod and treating config as an api_key source only"
+        )
+        pod_config = getattr(pod, "config", None)
+        if pod_config is not None and hasattr(pod_config, "api_key"):
+            pod_config.api_key = config.api_key
 
     result = ShipAndRunResult(returncode=-1)
-    pod: Pod | None = None
+    active_pod = pod
+    guard: PodGuard | None = None
+    exclude_set = exclude or set()
+    poll_exit_marker = DEFAULT_POLL_EXIT_MARKER
+    poll_command_template = DEFAULT_POLL_COMMAND_TEMPLATE
+    artifact_paths = ["out", "output"]
     remote_script_path = "/tmp/runpod-lifecycle-remote-run.sh"
 
     try:
-        # ---- launch -------------------------------------------------------
-        # Backward-compat: if the guard exposes an old-style ``launch()``
-        # method, use it so monkeypatch injection still works.
-        if hasattr(guard, "launch"):
-            pod = await guard.launch()
-            if guard.pod is None and pod is not None:
-                guard.attach(pod)
-        else:
-            pod = await _launch_pod(
+        if active_pod is None:
+            assert config is not None
+            guard = PodGuard(
+                name_prefix=name_prefix,
+                default_max_runtime_seconds=max(timeout * 2, 7200),
+                auto_terminate=terminate_after_exec,
+            )
+            active_pod = await _launch_pod(
                 config, name=f"{name_prefix}-{int(time.time())}"
             )
-            guard.attach(pod)
-        result.pod = pod
+            guard.attach(active_pod)
+            await active_pod.wait_ready(timeout=300)
 
-        # ---- wait for SSH -------------------------------------------------
-        await pod.wait_ready(timeout=300)
-        ssh_details = await pod._ensure_ssh_details()
+        result.pod = active_pod
+        hourly_rate = getattr(active_pod, "hourly_rate", None)
+        if isinstance(hourly_rate, int | float):
+            result.cost_per_hr = float(hourly_rate)
+
+        # ---- SSH ----------------------------------------------------------
+        ssh_details = await active_pod._ensure_ssh_details()
         logger.info(
             "Pod SSH ready: root@%s:%s",
             ssh_details["ip"],
@@ -291,7 +285,7 @@ async def ship_and_run_detached(
         )
 
         # ---- GPU check ----------------------------------------------------
-        code, stdout, stderr = await pod.exec_ssh("nvidia-smi -L", timeout=60)
+        code, stdout, stderr = await active_pod.exec_ssh("nvidia-smi -L", timeout=60)
         if code != 0:
             result.returncode = code
             result.stdout = stdout
@@ -299,37 +293,43 @@ async def ship_and_run_detached(
             return result
 
         # ---- upload -------------------------------------------------------
-        if upload_mode == "tarball":
-            result.upload_info = await _upload_tarball(
-                pod, exclude, local_root=local_root, remote_root=remote_root
-            )
-        else:
-            client = pod.open_ssh_client()
-            try:
-                sftp = client.open_sftp()
+        if local_root is not None:
+            if upload_mode == "tarball":
+                result.upload_info = await _upload_tarball(
+                    active_pod,
+                    exclude_set,
+                    local_root=local_root,
+                    remote_root=remote_root,
+                )
+            else:
+                client = active_pod.open_ssh_client()
                 try:
-                    progress = UploadHeartbeat(label="sftp_upload")
-                    upload_dir(
-                        sftp,
-                        local_root,
-                        remote_root,
-                        exclude,
-                        progress=progress,
-                        local_root=local_root,
-                    )
-                    progress.tick(force=True)
+                    sftp = client.open_sftp()
+                    try:
+                        progress = UploadHeartbeat(label="sftp_upload")
+                        upload_dir(
+                            sftp,
+                            local_root,
+                            remote_root,
+                            exclude_set,
+                            progress=progress,
+                            local_root=local_root,
+                        )
+                        progress.tick(force=True)
+                    finally:
+                        sftp.close()
                 finally:
-                    sftp.close()
-            finally:
-                client.close()
-            result.upload_info = {
-                "mode": "sftp_walk",
-                "local_root": str(local_root),
-                "remote_root": remote_root,
-            }
+                    client.close()
+                result.upload_info = {
+                    "mode": "sftp_walk",
+                    "local_root": str(local_root),
+                    "remote_root": remote_root,
+                }
+        else:
+            result.upload_info = {"mode": "none", "remote_root": remote_root}
 
         # ---- upload remote script -----------------------------------------
-        await _upload_remote_script(pod, remote_script)
+        await _upload_remote_script(active_pod, remote_script)
 
         # ---- launch detached command --------------------------------------
         launch_command = (
@@ -340,7 +340,7 @@ async def ship_and_run_detached(
             f'rc=$?; printf "%s" "$rc" > {poll_exit_marker}; exit "$rc"'
         )
 
-        code, stdout, stderr = await pod.exec_ssh(
+        code, stdout, stderr = await active_pod.exec_ssh(
             f"nohup bash -lc {launch_command!r} "
             f">/tmp/runpod-lifecycle-launch.log 2>&1 & echo $!",
             timeout=30,
@@ -364,7 +364,7 @@ async def ship_and_run_detached(
                 poll_exit_marker=poll_exit_marker
             )
             try:
-                code, stdout, stderr = await pod.exec_ssh(
+                code, stdout, stderr = await active_pod.exec_ssh(
                     poll_cmd, timeout=60
                 )
             except Exception as exc:
@@ -375,19 +375,20 @@ async def ship_and_run_detached(
             exit_code = _parse_detached_exit(stdout)
             if exit_code is not None:
                 result.returncode = exit_code
-                try:
-                    artifact_root = await download_artifact_archive(
-                        pod,
-                        remote_root=remote_root,
-                        artifact_paths=artifact_paths,
-                        local_artifact_root=local_root / "artifacts",
-                        exit_code=exit_code,
-                        remote_command=launch_command,
-                        upload=result.upload_info,
-                    )
-                    result.artifact_root = artifact_root
-                except Exception as exc:
-                    logger.warning("artifact_download_failed=%s", exc)
+                if local_root is not None:
+                    try:
+                        artifact_root = await download_artifact_archive(
+                            active_pod,
+                            remote_root=remote_root,
+                            artifact_paths=artifact_paths,
+                            local_artifact_root=local_root / "artifacts",
+                            exit_code=exit_code,
+                            remote_command=launch_command,
+                            upload=result.upload_info,
+                        )
+                        result.artifact_root = artifact_root
+                    except Exception as exc:
+                        logger.warning("artifact_download_failed=%s", exc)
                 return result
 
             await asyncio.sleep(poll_interval)
@@ -398,9 +399,13 @@ async def ship_and_run_detached(
         return result
 
     finally:
-        if terminate_after_exec:
-            await guard.terminate()
+        if terminate_after_exec and active_pod is not None:
+            if guard is not None:
+                await guard.terminate()
+            else:
+                await active_pod.terminate()
             result.terminated = True
         else:
-            result.pod = pod
-        result.breach_log = list(guard.breach_log)
+            result.pod = active_pod
+        if guard is not None:
+            result.breach_log = list(guard.breach_log)
