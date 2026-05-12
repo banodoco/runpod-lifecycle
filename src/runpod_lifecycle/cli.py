@@ -517,7 +517,7 @@ def _vibecomfy_install_builder_shell(
             "PY\n"
         )
     return (
-        f"uv venv --python 3.11 {_quote(venv_path)}\n"
+        f"uv venv --seed --python 3.11 {_quote(venv_path)}\n"
         f"uv pip install --python {py} -e {_quote(workdir)}\n"
         f"uv pip install --python {py} "
         "'comfyui@git+https://github.com/peteromallet/ComfyUI.git@fix/latentupscale-model-mmap-residency' "

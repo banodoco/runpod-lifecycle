@@ -138,7 +138,7 @@ def test_vibecomfy_builder_install_uses_separate_python311_venv():
         attention_profile="portable",
     )
 
-    assert "uv venv --python 3.11 /opt/build/vibecomfy/.venv" in body
+    assert "uv venv --seed --python 3.11 /opt/build/vibecomfy/.venv" in body
     assert "uv pip install --python /opt/build/vibecomfy/.venv/bin/python -e /opt/build/vibecomfy" in body
 
 
