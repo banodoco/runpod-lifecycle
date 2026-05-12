@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Iterable
 
 from dotenv import load_dotenv
 
@@ -41,6 +41,42 @@ def _parse_int_tuple(value: str | None, default: tuple[int, ...]) -> tuple[int, 
     return tuple(int(part) for part in parts)
 
 
+def _normalize_gpu_type(
+    value: str | Iterable[str] | None,
+) -> tuple[str, ...]:
+    """Normalize a gpu_type input (str | list | tuple) to a tuple of strings.
+
+    Empty/whitespace entries are dropped while preserving order. A single
+    string is wrapped into a 1-tuple. ``None`` becomes an empty tuple.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        stripped = value.strip()
+        return (stripped,) if stripped else ()
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise TypeError(
+                f"gpu_type entries must be strings, got {type(item).__name__}"
+            )
+        stripped = item.strip()
+        if stripped:
+            items.append(stripped)
+    return tuple(items)
+
+
+def _parse_gpu_type_env(value: str | None) -> str | tuple[str, ...]:
+    """Parse RUNPOD_GPU_TYPE env. Returns a tuple when comma-separated."""
+    if value is None:
+        return DEFAULT_GPU_TYPE
+    parts = _parse_csv_tuple(value)
+    if len(parts) <= 1:
+        # Preserve single-string behavior for backwards compatibility.
+        return parts[0] if parts else DEFAULT_GPU_TYPE
+    return parts
+
+
 def _parse_env_vars(value: str | None) -> dict[str, str]:
     if value is None or value.strip() == "":
         return {}
@@ -53,7 +89,7 @@ def _parse_env_vars(value: str | None) -> dict[str, str]:
 @dataclass(slots=True)
 class RunPodConfig:
     api_key: str
-    gpu_type: str = DEFAULT_GPU_TYPE
+    gpu_type: str | tuple[str, ...] | list[str] = DEFAULT_GPU_TYPE
     worker_image: str = DEFAULT_WORKER_IMAGE
     template_id: str = DEFAULT_TEMPLATE_ID
     volume_mount_path: str = DEFAULT_VOLUME_MOUNT_PATH
@@ -73,13 +109,28 @@ class RunPodConfig:
     name_prefix: str = "pod"
     ports: str | None = None
 
+    def __post_init__(self) -> None:
+        # Normalize list inputs to a tuple while preserving str inputs as-is.
+        if isinstance(self.gpu_type, list):
+            object.__setattr__(self, "gpu_type", _normalize_gpu_type(self.gpu_type))
+        elif isinstance(self.gpu_type, tuple):
+            # Re-normalize tuples to strip empties / whitespace consistently.
+            object.__setattr__(self, "gpu_type", _normalize_gpu_type(self.gpu_type))
+
+    @property
+    def gpu_type_candidates(self) -> tuple[str, ...]:
+        """Return the ordered list of GPU types to try, regardless of input form."""
+        if isinstance(self.gpu_type, str):
+            return (self.gpu_type,) if self.gpu_type else ()
+        return tuple(self.gpu_type)
+
     @classmethod
     def from_env(cls, **overrides: Any) -> "RunPodConfig":
         load_dotenv()
 
         data: dict[str, Any] = {
             "api_key": os.getenv("RUNPOD_API_KEY"),
-            "gpu_type": os.getenv("RUNPOD_GPU_TYPE", DEFAULT_GPU_TYPE),
+            "gpu_type": _parse_gpu_type_env(os.getenv("RUNPOD_GPU_TYPE")),
             "worker_image": os.getenv("RUNPOD_WORKER_IMAGE", DEFAULT_WORKER_IMAGE),
             "template_id": os.getenv("RUNPOD_TEMPLATE_ID", DEFAULT_TEMPLATE_ID),
             "volume_mount_path": os.getenv("RUNPOD_VOLUME_MOUNT_PATH", DEFAULT_VOLUME_MOUNT_PATH),

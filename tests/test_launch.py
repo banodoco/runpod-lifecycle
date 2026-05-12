@@ -156,6 +156,162 @@ def test_launch_raises_before_create_when_gpu_missing(
     assert runpod_sdk_mock.create_pod.call_count == 0
 
 
+def test_launch_accepts_single_string_gpu_type(
+    base_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_pod_mock = MagicMock(return_value={"id": "pod-string"})
+    seen: list[str] = []
+
+    def fake_find(gpu_type: str, api_key: str) -> dict[str, str]:
+        seen.append(gpu_type)
+        return {"id": f"id-{gpu_type}", "displayName": gpu_type}
+
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.find_gpu_type", fake_find)
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.get_storage_volume_id",
+        lambda api_key, storage_name: {"vol-a": "id-a", "vol-b": "id-b"}[storage_name],
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.check_and_expand_storage",
+        lambda api_key, volume_id, min_free_gb=50, storage_name=None: {"ok": True},
+    )
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", create_pod_mock)
+
+    cfg = base_config.merge(gpu_type="NVIDIA L40S")
+    assert cfg.gpu_type == "NVIDIA L40S"  # single string preserved
+    assert cfg.gpu_type_candidates == ("NVIDIA L40S",)
+
+    pod = asyncio.run(launch(cfg, name="single-str"))
+    assert pod.id == "pod-string"
+    assert seen == ["NVIDIA L40S"]
+
+
+def test_launch_accepts_single_item_list_gpu_type(
+    base_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_pod_mock = MagicMock(return_value={"id": "pod-list"})
+    seen: list[str] = []
+
+    def fake_find(gpu_type: str, api_key: str) -> dict[str, str]:
+        seen.append(gpu_type)
+        return {"id": f"id-{gpu_type}", "displayName": gpu_type}
+
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.find_gpu_type", fake_find)
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.get_storage_volume_id",
+        lambda api_key, storage_name: {"vol-a": "id-a", "vol-b": "id-b"}[storage_name],
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.check_and_expand_storage",
+        lambda api_key, volume_id, min_free_gb=50, storage_name=None: {"ok": True},
+    )
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", create_pod_mock)
+
+    cfg = base_config.merge(gpu_type=["NVIDIA L40S"])
+    assert cfg.gpu_type == ("NVIDIA L40S",)  # list normalized to tuple
+    assert cfg.gpu_type_candidates == ("NVIDIA L40S",)
+
+    pod = asyncio.run(launch(cfg, name="single-list"))
+    assert pod.id == "pod-list"
+    assert seen == ["NVIDIA L40S"]
+
+
+def test_launch_falls_back_through_gpu_candidates(
+    base_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidates = [
+        "NVIDIA RTX 6000 Ada Generation",
+        "NVIDIA RTX A6000",
+        "NVIDIA L40S",
+    ]
+    # First two GPUs: every create_pod call fails. Third: succeeds on first try.
+    seen_gpus: list[str] = []
+
+    def fake_find(gpu_type: str, api_key: str) -> dict[str, str]:
+        return {"id": f"id-{gpu_type}", "displayName": gpu_type}
+
+    def fake_create(**kwargs: object) -> dict[str, str]:
+        gpu_id = kwargs["gpu_type_id"]
+        assert isinstance(gpu_id, str)
+        seen_gpus.append(gpu_id)
+        if gpu_id == f"id-{candidates[2]}":
+            return {"id": "pod-third"}
+        raise RuntimeError("no longer any instances available")
+
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.find_gpu_type", fake_find)
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.get_storage_volume_id",
+        lambda api_key, storage_name: {"vol-a": "id-a", "vol-b": "id-b"}[storage_name],
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.check_and_expand_storage",
+        lambda api_key, volume_id, min_free_gb=50, storage_name=None: {"ok": True},
+    )
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", fake_create)
+
+    events: list[tuple[str | None, str, dict[str, object]]] = []
+
+    async def on_state(event) -> None:  # type: ignore[no-untyped-def]
+        events.append((event.pod_id, event.state.value, event.detail))
+
+    cfg = base_config.merge(gpu_type=candidates)
+    pod = asyncio.run(
+        launch(cfg, name="multi", hooks=EventHooks(on_state_change=on_state))
+    )
+
+    assert pod.id == "pod-third"
+    # Third GPU should appear in seen_gpus exactly once (succeeded immediately).
+    # First two should have exhausted the RAM x storage matrix (3 tiers * 2 storages = 6 attempts each).
+    assert seen_gpus.count(f"id-{candidates[2]}") == 1
+
+    # Provisioning events should record per-candidate iteration in metadata.
+    provisioning_gpu_types = [
+        detail.get("gpu_type")
+        for (_pid, state, detail) in events
+        if state == PodState.PROVISIONING.value and "gpu_type" in detail and _pid is None
+    ]
+    assert provisioning_gpu_types == candidates
+
+
+def test_launch_all_gpu_candidates_fail_raises_aggregated(
+    base_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidates = [
+        "NVIDIA RTX 6000 Ada Generation",
+        "NVIDIA RTX A6000",
+        "NVIDIA L40S",
+    ]
+
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.find_gpu_type",
+        lambda gpu_type, api_key: {"id": f"id-{gpu_type}", "displayName": gpu_type},
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.get_storage_volume_id",
+        lambda api_key, storage_name: {"vol-a": "id-a", "vol-b": "id-b"}[storage_name],
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.check_and_expand_storage",
+        lambda api_key, volume_id, min_free_gb=50, storage_name=None: {"ok": True},
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.create_pod",
+        MagicMock(side_effect=RuntimeError("no longer any instances available")),
+    )
+
+    cfg = base_config.merge(gpu_type=candidates)
+    with pytest.raises(LaunchFailure) as excinfo:
+        asyncio.run(launch(cfg, name="all-fail"))
+
+    message = str(excinfo.value)
+    for gpu_type in candidates:
+        assert gpu_type in message, f"expected {gpu_type!r} in {message!r}"
+
+
 def test_launch_volumeless_uses_one_create_per_ram_tier_and_skips_storage_checks(
     volumeless_config,
     monkeypatch: pytest.MonkeyPatch,

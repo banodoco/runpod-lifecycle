@@ -74,6 +74,24 @@ asyncio.run(main())
 
 If `storage_name` is unset and `storage_volumes` is empty, `launch()` creates a volumeless pod by passing `network_volume_id=None`. That is intentional new behavior in this package.
 
+### Multi-GPU fallback
+
+`gpu_type` accepts a single string (backwards-compatible) or an ordered list of
+candidates. `launch()` tries each in turn and returns the first that provisions;
+if every candidate is exhausted, a `LaunchFailure` aggregates the per-candidate
+reasons. The env var `RUNPOD_GPU_TYPE` accepts a comma-separated list.
+
+```python
+cfg = RunPodConfig.from_env(
+    gpu_type=[
+        "NVIDIA RTX 6000 Ada Generation",
+        "NVIDIA RTX A6000",
+        "NVIDIA L40S",
+    ],
+)
+pod = await launch(cfg)
+```
+
 For direct file transport or other low-level SSH work, `Pod.open_ssh_client()` returns a connected `paramiko`-compatible client. Callers are responsible for closing the returned client when they are done with it.
 
 ## Config Reference

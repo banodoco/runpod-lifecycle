@@ -90,6 +90,47 @@ def test_ports_field_accepts_custom_value() -> None:
     assert config.ports == "8675/http,22/tcp"
 
 
+def test_gpu_type_env_var_parses_comma_separated_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("RUNPOD_API_KEY", "api-key")
+    monkeypatch.setenv(
+        "RUNPOD_GPU_TYPE", "NVIDIA RTX 6000 Ada Generation,NVIDIA L40S"
+    )
+
+    config = RunPodConfig.from_env()
+
+    assert config.gpu_type == (
+        "NVIDIA RTX 6000 Ada Generation",
+        "NVIDIA L40S",
+    )
+    assert config.gpu_type_candidates == (
+        "NVIDIA RTX 6000 Ada Generation",
+        "NVIDIA L40S",
+    )
+
+
+def test_gpu_type_env_var_single_value_stays_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("RUNPOD_API_KEY", "api-key")
+    monkeypatch.setenv("RUNPOD_GPU_TYPE", "NVIDIA L40S")
+
+    config = RunPodConfig.from_env()
+
+    assert config.gpu_type == "NVIDIA L40S"
+    assert config.gpu_type_candidates == ("NVIDIA L40S",)
+
+
+def test_gpu_type_list_input_normalizes_to_tuple() -> None:
+    config = RunPodConfig(api_key="test", gpu_type=["A", "B", "C"])
+
+    assert config.gpu_type == ("A", "B", "C")
+    assert config.gpu_type_candidates == ("A", "B", "C")
+
+
 def test_merge_returns_new_instance_with_overrides() -> None:
     original = RunPodConfig(api_key="api-key", name_prefix="pod", min_memory_gb=32)
 
