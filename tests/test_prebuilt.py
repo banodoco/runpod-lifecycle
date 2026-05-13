@@ -158,12 +158,14 @@ def test_prebuilt_manifest_uv_probe_uses_bootstrapped_path():
     assert ".local/bin" in source
 
 
-def test_prebuilt_verification_uses_existing_read_only_node_probe():
+def test_prebuilt_verification_uses_runtime_import_probe():
     import inspect
     from runpod_lifecycle import prebuilt
 
     source = inspect.getsource(prebuilt)
-    assert "nodes list --limit 1 --json" in source
+    assert "import vibecomfy; import comfy" in source
+    assert "vibecomfy-runtime-ok" in source
+    assert "nodes list" not in source
     assert "nodes verify" not in source
     assert "torch.version.cuda" in source
     assert "uv run --python" not in source

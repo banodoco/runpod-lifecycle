@@ -329,19 +329,19 @@ def _probe_venv_size(ssh, contract: PrebuiltEnvContract, manifest: PrebuiltManif
     return None
 
 
-def _probe_node_schema_verify(ssh, contract: PrebuiltEnvContract) -> str | None:
+def _probe_vibecomfy_runtime_import(ssh, contract: PrebuiltEnvContract) -> str | None:
     cmd = (
         f"cd {_quote(contract.runtime_vibecomfy_path)} && "
         f"{_quote(contract.runtime_vibecomfy_path + '/.venv/bin/python')} "
-        "-m vibecomfy.cli nodes list --limit 1 --json"
+        "-c 'import vibecomfy; import comfy; print(\"vibecomfy-runtime-ok\")'"
     )
-    exit_code, _stdout, stderr = _ssh_execute(ssh, "bash -lc " + _quote(cmd), timeout=300, check=False)
+    exit_code, stdout, stderr = _ssh_execute(ssh, "bash -lc " + _quote(cmd), timeout=300, check=False)
     if exit_code != 0:
         return (
-            "node-schema verify failed for VibeComfy at "
+            "VibeComfy runtime import failed at "
             f"{contract.runtime_vibecomfy_path}. Run `rl prebuilt invalidate --volume-name "
             f"{contract.volume_name}` then `rl prebuilt build`. stderr:\n"
-            f"{_stderr_excerpt(stderr)}"
+            f"{_stderr_excerpt(stderr)}\nstdout:\n{_stderr_excerpt(stdout)}"
         )
     return None
 
@@ -366,10 +366,9 @@ def verify_extracted_env(
     size_issue = _probe_venv_size(ssh, contract, manifest)
     if size_issue:
         issues.append(size_issue)
-    # Always run the node-schema verify probe regardless of any earlier drift.
-    node_issue = _probe_node_schema_verify(ssh, contract)
-    if node_issue:
-        issues.append(node_issue)
+    runtime_issue = _probe_vibecomfy_runtime_import(ssh, contract)
+    if runtime_issue:
+        issues.append(runtime_issue)
     return issues
 
 
