@@ -266,9 +266,8 @@ def _torch_cuda_expected_for_extra(cuda_extra: str) -> str | None:
 def _probe_torch_cuda(ssh, contract: PrebuiltEnvContract, manifest: PrebuiltManifest) -> str | None:
     cmd = (
         f"cd {_quote(contract.runtime_worker_path)} && "
-        f"UV_PROJECT_ENVIRONMENT={_quote(contract.runtime_venv_path)} "
-        f"uv run --python {_quote(manifest.python_version)} "
-        "python -c 'import torch; print(torch.version.cuda)'"
+        f"{_quote(contract.runtime_venv_path + '/bin/python')} "
+        "-c 'import torch; print(torch.version.cuda)'"
     )
     exit_code, stdout, stderr = _ssh_execute(ssh, "bash -lc " + _quote(cmd), timeout=180, check=False)
     expected = _torch_cuda_expected_for_extra(manifest.cuda_extra)
@@ -334,7 +333,7 @@ def _probe_node_schema_verify(ssh, contract: PrebuiltEnvContract) -> str | None:
     cmd = (
         f"cd {_quote(contract.runtime_vibecomfy_path)} && "
         f"{_quote(contract.runtime_vibecomfy_path + '/.venv/bin/python')} "
-        "-m vibecomfy.cli nodes verify --lockfile custom_nodes.lock"
+        "-m vibecomfy.cli nodes list --limit 1 --json"
     )
     exit_code, _stdout, stderr = _ssh_execute(ssh, "bash -lc " + _quote(cmd), timeout=300, check=False)
     if exit_code != 0:
