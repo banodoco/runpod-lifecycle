@@ -200,6 +200,12 @@ rl prebuilt reconcile --data-center <DATA_CENTER_ID> \
   --enriched-targets-json /tmp/reigh-targets.enriched.json
 ```
 
+Reconcile launches a short-lived pod only to hydrate model assets onto the
+network volume. By default it tries smaller/cheaper GPUs before RTX 4090, so
+asset hydration does not compete with inference validation capacity. Override
+`--gpu-type` with a comma-separated candidate list when a data center has a
+known better fit.
+
 `status` and `cleanup` only operate on validation pod prefixes
 `reigh-livetest-builder-` and `reigh-livetest-prebuilt-`. `cleanup` requires
 `--yes` outside `--dry-run` and must never be used for unrelated user pods.
