@@ -142,6 +142,22 @@ def test_vibecomfy_builder_install_uses_separate_python311_venv():
     assert "uv pip install --python /opt/build/vibecomfy/.venv/bin/python -e /opt/build/vibecomfy" in body
 
 
+def test_vibecomfy_builder_install_pins_cuda124_torch_after_custom_nodes():
+    body = cli._vibecomfy_install_builder_shell(
+        "/opt/build/vibecomfy",
+        python_path="/opt/build/vibecomfy/.venv/bin/python",
+        attention_profile="portable",
+    )
+
+    torch_pin = (
+        "uv pip install --python /opt/build/vibecomfy/.venv/bin/python "
+        "--index-url https://download.pytorch.org/whl/cu124 torch torchvision torchaudio"
+    )
+    assert body.count(torch_pin) == 2
+    assert "expected VibeComfy torch CUDA 12.4" in body
+    assert body.index("nodes restore --lockfile custom_nodes.lock") < body.rindex(torch_pin)
+
+
 def test_prebuilt_build_installs_bundle_system_tools():
     import inspect
 
@@ -168,6 +184,7 @@ def test_prebuilt_verification_uses_runtime_import_probe():
     assert "nodes list" not in source
     assert "nodes verify" not in source
     assert "torch.version.cuda" in source
+    assert "_probe_vibecomfy_torch_cuda" in source
     assert "uv run --python" not in source
 
 

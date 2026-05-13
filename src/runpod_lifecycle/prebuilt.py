@@ -263,27 +263,57 @@ def _torch_cuda_expected_for_extra(cuda_extra: str) -> str | None:
     return None
 
 
-def _probe_torch_cuda(ssh, contract: PrebuiltEnvContract, manifest: PrebuiltManifest) -> str | None:
+def _probe_python_torch_cuda(
+    ssh,
+    *,
+    python_path: str,
+    cwd: str,
+    label: str,
+    contract: PrebuiltEnvContract,
+    manifest: PrebuiltManifest,
+) -> str | None:
     cmd = (
-        f"cd {_quote(contract.runtime_worker_path)} && "
-        f"{_quote(contract.runtime_venv_path + '/bin/python')} "
+        f"cd {_quote(cwd)} && "
+        f"{_quote(python_path)} "
         "-c 'import torch; print(torch.version.cuda)'"
     )
     exit_code, stdout, stderr = _ssh_execute(ssh, "bash -lc " + _quote(cmd), timeout=180, check=False)
     expected = _torch_cuda_expected_for_extra(manifest.cuda_extra)
     if exit_code != 0:
         return (
-            f"torch CUDA probe failed (exit={exit_code}); expected {expected} for cuda_extra={manifest.cuda_extra}. "
+            f"{label} torch CUDA probe failed (exit={exit_code}); expected {expected} for cuda_extra={manifest.cuda_extra}. "
             f"Re-run `rl prebuilt invalidate --volume-name {contract.volume_name}` then `rl prebuilt build`. stderr:\n"
             f"{_stderr_excerpt(stderr)}"
         )
     observed = (stdout or "").strip().splitlines()[-1].strip() if stdout.strip() else ""
     if expected and observed != expected:
         return (
-            f"torch CUDA version {observed!r} != expected {expected!r} for cuda_extra={manifest.cuda_extra}. "
+            f"{label} torch CUDA version {observed!r} != expected {expected!r} for cuda_extra={manifest.cuda_extra}. "
             f"Re-run `rl prebuilt invalidate --volume-name {contract.volume_name}` then `rl prebuilt build`."
         )
     return None
+
+
+def _probe_worker_torch_cuda(ssh, contract: PrebuiltEnvContract, manifest: PrebuiltManifest) -> str | None:
+    return _probe_python_torch_cuda(
+        ssh,
+        python_path=contract.runtime_venv_path + "/bin/python",
+        cwd=contract.runtime_worker_path,
+        label="worker",
+        contract=contract,
+        manifest=manifest,
+    )
+
+
+def _probe_vibecomfy_torch_cuda(ssh, contract: PrebuiltEnvContract, manifest: PrebuiltManifest) -> str | None:
+    return _probe_python_torch_cuda(
+        ssh,
+        python_path=contract.runtime_vibecomfy_path + "/.venv/bin/python",
+        cwd=contract.runtime_vibecomfy_path,
+        label="VibeComfy",
+        contract=contract,
+        manifest=manifest,
+    )
 
 
 def _probe_vibecomfy_assets(ssh, contract: PrebuiltEnvContract) -> list[str]:
@@ -359,9 +389,12 @@ def verify_extracted_env(
     is expected to join all returned issues into a single error message.
     """
     issues: list[str] = []
-    torch_issue = _probe_torch_cuda(ssh, contract, manifest)
-    if torch_issue:
-        issues.append(torch_issue)
+    worker_torch_issue = _probe_worker_torch_cuda(ssh, contract, manifest)
+    if worker_torch_issue:
+        issues.append(worker_torch_issue)
+    vibecomfy_torch_issue = _probe_vibecomfy_torch_cuda(ssh, contract, manifest)
+    if vibecomfy_torch_issue:
+        issues.append(vibecomfy_torch_issue)
     issues.extend(_probe_vibecomfy_assets(ssh, contract))
     size_issue = _probe_venv_size(ssh, contract, manifest)
     if size_issue:

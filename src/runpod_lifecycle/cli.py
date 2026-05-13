@@ -503,6 +503,16 @@ def _vibecomfy_install_builder_shell(
     """Render the post-clone VibeComfy install body the builder pod will execute."""
     venv_path = python_path.rsplit("/bin/python", 1)[0]
     py = _quote(python_path)
+    torch_cuda124 = (
+        f"uv pip install --python {py} --index-url https://download.pytorch.org/whl/cu124 "
+        "torch torchvision torchaudio\n"
+        f"{py} - <<'PY'\n"
+        "import torch\n"
+        "if torch.version.cuda != '12.4':\n"
+        "    raise RuntimeError(f'expected VibeComfy torch CUDA 12.4, got {torch.version.cuda!r}')\n"
+        "print('vibecomfy torch cuda', torch.version.cuda)\n"
+        "PY\n"
+    )
     sage_block = ""
     if attention_profile == "sage":
         sage_block = (
@@ -522,10 +532,12 @@ def _vibecomfy_install_builder_shell(
         f"uv pip install --python {py} "
         "'comfyui@git+https://github.com/peteromallet/ComfyUI.git@fix/latentupscale-model-mmap-residency' "
         "'comfy-script[default]'\n"
+        f"{torch_cuda124}"
         f"{sage_block}"
         f"cd {_quote(workdir)}\n"
         "test -f custom_nodes.lock\n"
         f"{py} -m vibecomfy.cli nodes restore --lockfile custom_nodes.lock\n"
+        f"{torch_cuda124}"
         f"test -f {_quote(workdir)}/template_index.json\n"
         f"test -f {_quote(workdir)}/workflow_corpus/manifests/coverage.json\n"
     )
