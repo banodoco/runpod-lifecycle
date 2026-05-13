@@ -32,7 +32,7 @@ def test_launch_happy_path_returns_pod_and_emits_provisioning(
     )
     monkeypatch.setattr(
         "runpod_lifecycle.lifecycle.check_and_expand_storage",
-        lambda api_key, volume_id, min_free_gb=50, storage_name=None: {"ok": True},
+        lambda *args, **kwargs: {"ok": True},
     )
     monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", create_pod_mock)
 
@@ -73,7 +73,7 @@ def test_launch_uses_ram_tier_fallback(base_config, monkeypatch: pytest.MonkeyPa
     )
     monkeypatch.setattr(
         "runpod_lifecycle.lifecycle.check_and_expand_storage",
-        lambda api_key, volume_id, min_free_gb=50, storage_name=None: {"ok": True},
+        lambda *args, **kwargs: {"ok": True},
     )
     monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", create_pod_mock)
 
@@ -99,7 +99,7 @@ def test_launch_falls_back_to_second_storage_within_tier(
     )
     monkeypatch.setattr(
         "runpod_lifecycle.lifecycle.check_and_expand_storage",
-        lambda api_key, volume_id, min_free_gb=50, storage_name=None: {"ok": True},
+        lambda *args, **kwargs: {"ok": True},
     )
     monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", create_pod_mock)
 
@@ -131,7 +131,7 @@ def test_launch_exhausted_fallback_emits_on_error_once(
     )
     monkeypatch.setattr(
         "runpod_lifecycle.lifecycle.check_and_expand_storage",
-        lambda api_key, volume_id, min_free_gb=50, storage_name=None: {"ok": True},
+        lambda *args, **kwargs: {"ok": True},
     )
     monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", create_pod_mock)
 
@@ -174,7 +174,7 @@ def test_launch_accepts_single_string_gpu_type(
     )
     monkeypatch.setattr(
         "runpod_lifecycle.lifecycle.check_and_expand_storage",
-        lambda api_key, volume_id, min_free_gb=50, storage_name=None: {"ok": True},
+        lambda *args, **kwargs: {"ok": True},
     )
     monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", create_pod_mock)
 
@@ -205,7 +205,7 @@ def test_launch_accepts_single_item_list_gpu_type(
     )
     monkeypatch.setattr(
         "runpod_lifecycle.lifecycle.check_and_expand_storage",
-        lambda api_key, volume_id, min_free_gb=50, storage_name=None: {"ok": True},
+        lambda *args, **kwargs: {"ok": True},
     )
     monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", create_pod_mock)
 
@@ -248,7 +248,7 @@ def test_launch_falls_back_through_gpu_candidates(
     )
     monkeypatch.setattr(
         "runpod_lifecycle.lifecycle.check_and_expand_storage",
-        lambda api_key, volume_id, min_free_gb=50, storage_name=None: {"ok": True},
+        lambda *args, **kwargs: {"ok": True},
     )
     monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", fake_create)
 
@@ -296,7 +296,7 @@ def test_launch_all_gpu_candidates_fail_raises_aggregated(
     )
     monkeypatch.setattr(
         "runpod_lifecycle.lifecycle.check_and_expand_storage",
-        lambda api_key, volume_id, min_free_gb=50, storage_name=None: {"ok": True},
+        lambda *args, **kwargs: {"ok": True},
     )
     monkeypatch.setattr(
         "runpod_lifecycle.lifecycle.create_pod",

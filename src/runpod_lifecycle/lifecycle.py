@@ -124,6 +124,7 @@ async def _try_launch_one_gpu(
                     storage_volume_id,
                     50,
                     storage_name,
+                    config.disk_size_gb,
                 )
                 expanded_storage_ids.add(storage_volume_id)
 

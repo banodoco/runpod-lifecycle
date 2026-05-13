@@ -46,8 +46,9 @@ def check_and_expand_storage(
     volume_id: str,
     min_free_gb: int = 50,
     storage_name: str | None = None,
+    target_size_gb: int | None = None,
 ) -> dict[str, Any]:
-    """Check current network volume size and expand when below the source threshold."""
+    """Check current network volume size and expand when below the requested threshold."""
     try:
         volumes = get_network_volumes(api_key)
         volume_info = next((volume for volume in volumes if volume.get("id") == volume_id), None)
@@ -63,6 +64,21 @@ def check_and_expand_storage(
             }
 
         current_size_gb = volume_info.get("size", 0)
+        requested_target_gb = int(target_size_gb or 0)
+        if requested_target_gb > 0 and current_size_gb < requested_target_gb:
+            expanded = _expand_network_volume(api_key, volume_id, requested_target_gb)
+            return {
+                "ok": True,
+                "expanded": expanded,
+                "current_size_gb": current_size_gb,
+                "target_size_gb": requested_target_gb,
+                "message": (
+                    f"Expanded storage '{label}' to {requested_target_gb} GB"
+                    if expanded
+                    else f"Expansion failed for storage '{label}', continuing anyway"
+                ),
+            }
+
         if current_size_gb >= 100:
             return {
                 "ok": True,

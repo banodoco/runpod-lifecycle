@@ -77,6 +77,34 @@ def test_check_and_expand_storage_skips_when_already_large(monkeypatch: pytest.M
     assert result["current_size_gb"] == 120
 
 
+def test_check_and_expand_storage_expands_to_requested_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "runpod_lifecycle.storage.get_network_volumes",
+        lambda api_key: [{"id": "volume-1", "name": "primary", "size": 250}],
+    )
+    seen: dict[str, int] = {}
+
+    def fake_expand(api_key: str, volume_id: str, size_gb: int) -> bool:
+        seen["size_gb"] = size_gb
+        return True
+
+    monkeypatch.setattr("runpod_lifecycle.storage._expand_network_volume", fake_expand)
+
+    result = check_and_expand_storage(
+        "api-key",
+        "volume-1",
+        storage_name="primary",
+        target_size_gb=500,
+    )
+
+    assert result["expanded"] is True
+    assert result["current_size_gb"] == 250
+    assert result["target_size_gb"] == 500
+    assert seen == {"size_gb": 500}
+
+
 def test_evaluate_storage_health_requests_expansion_at_threshold() -> None:
     result = evaluate_storage_health(
         {"total_gb": 100, "used_gb": 90, "free_gb": 10, "percent_used": 90},
