@@ -150,6 +150,14 @@ def test_prebuilt_build_installs_bundle_system_tools():
     assert "pv" in source
 
 
+def test_prebuilt_manifest_uv_probe_uses_bootstrapped_path():
+    import inspect
+
+    source = inspect.getsource(cli._cmd_prebuilt_build)
+    assert "uv --version" in source
+    assert ".local/bin" in source
+
+
 # --------------------------------------------------------------------------- #
 # Manifest round-trip via simulated SSH
 # --------------------------------------------------------------------------- #

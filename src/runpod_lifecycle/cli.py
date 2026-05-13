@@ -739,7 +739,10 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
                 await asyncio.to_thread(_read_builder_hashes, ssh)
             )
             uv_version_stdout, _ = await asyncio.to_thread(
-                _exec_check, ssh, "uv --version", timeout=30
+                _exec_check,
+                ssh,
+                "bash -lc 'export PATH=\"$HOME/.local/bin:$PATH\" && uv --version'",
+                timeout=30,
             )
             venv_size_stdout, _ = await asyncio.to_thread(
                 _exec_check,
