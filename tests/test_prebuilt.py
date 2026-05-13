@@ -17,6 +17,7 @@ from runpod_lifecycle.prebuilt import (
     PrebuiltHealthReport,
     PrebuiltManifest,
     PrebuiltPythonEnvReport,
+    _probe_extra_model_paths,
     _selected_assets_from_enriched,
     acquire_build_lock,
     compute_lockfile_hash,
@@ -551,6 +552,8 @@ class _ProbeSSH:
             return 0, "", ""
         if command.startswith("test -r ") and "extra_model_paths.yaml" in command:
             return 0, f"reigh:\n  base_path: {self.contract.models_path}\n", ""
+        if "config.extra_model_paths_config" in command:
+            return 0, "extra_model_paths_ok\n", ""
         if command.startswith("test -f "):
             if "missing-model.safetensors" in command:
                 return 1, "", "missing"
@@ -605,6 +608,21 @@ def test_health_probe_groups_source_schema_asset_and_runtime_issues():
         f"{contract.models_path}/checkpoints/missing-model.safetensors"
     ]
     assert asset_issue.detail["url"] == "https://example.invalid/missing-model.safetensors"
+
+
+def test_health_probe_reports_embedded_extra_model_paths_not_loaded():
+    contract = _make_contract()
+
+    class BrokenExtraModelPathsSSH(_ProbeSSH):
+        def execute_command(self, command: str, timeout: int = 600):
+            if "config.extra_model_paths_config" in command:
+                return 1, "", "expected /models/vae in vae paths, got []"
+            return super().execute_command(command, timeout)
+
+    issues = _probe_extra_model_paths(BrokenExtraModelPathsSSH(contract), contract)
+
+    assert [issue.code for issue in issues] == ["extra_model_paths_not_loaded_by_embedded_comfy"]
+    assert issues[0].detail["expected_models_path"] == contract.models_path
 
 
 def test_selected_assets_from_enriched_manifest_deduplicates_same_template_asset():

@@ -617,6 +617,48 @@ def _probe_extra_model_paths(ssh, contract: PrebuiltEnvContract) -> list[Prebuil
                 detail={"path": path, "expected_models_path": contract.models_path},
             )
         ]
+    check_script = f"""
+from pathlib import Path
+from comfy.cli_args import default_configuration
+from comfy.cmd.folder_paths import init_default_paths
+from comfy.component_model.folder_path_types import FolderNames
+
+config = default_configuration()
+config.extra_model_paths_config = [str(Path({path!r}).resolve())]
+folders = FolderNames(is_root=True)
+init_default_paths(folders, config, replace_existing=True)
+expected = {contract.models_path!r} + "/vae"
+paths = list(folders["vae"].paths)
+if expected not in paths:
+    raise SystemExit(f"expected {{expected}} in vae paths, got {{paths!r}}")
+print("extra_model_paths_ok")
+"""
+    check_command = (
+        f"cd {_quote(contract.runtime_vibecomfy_path)} && "
+        f"{_quote(contract.runtime_vibecomfy_path + '/.venv/bin/python')} - <<'PY'\n"
+        f"{check_script}"
+        "PY"
+    )
+    exit_code, stdout, stderr = _ssh_execute(
+        ssh,
+        "bash -lc " + _quote(check_command),
+        timeout=120,
+        check=False,
+    )
+    if exit_code != 0:
+        return [
+            _health_issue(
+                "environment",
+                "extra_model_paths_not_loaded_by_embedded_comfy",
+                "Embedded Comfy did not load extra_model_paths.yaml into model picker paths.",
+                detail={
+                    "path": path,
+                    "expected_models_path": contract.models_path,
+                    "stdout": _stderr_excerpt(stdout),
+                    "stderr": _stderr_excerpt(stderr),
+                },
+            )
+        ]
     return []
 
 
