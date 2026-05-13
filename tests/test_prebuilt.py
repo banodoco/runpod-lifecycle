@@ -17,6 +17,7 @@ from runpod_lifecycle.prebuilt import (
     PrebuiltHealthReport,
     PrebuiltManifest,
     PrebuiltPythonEnvReport,
+    _selected_assets_from_enriched,
     acquire_build_lock,
     compute_lockfile_hash,
     compute_pyproject_hash,
@@ -178,6 +179,22 @@ def test_worker_python_version_probe_shell_enforces_exact_major_minor():
     assert "expected = '3.11'" in body
     assert "worker python version mismatch" in body
     assert "observed != expected" in body
+
+
+def test_uv_sync_builder_shell_pins_requested_worker_python():
+    body = cli._uv_sync_builder_shell(
+        "/opt/build/reigh-worker",
+        env_path="/opt/reigh-worker-live-test-venv",
+        python_version="3.11",
+        extras=("cuda124",),
+    )
+
+    assert "uv sync --python 3.11 --extra cuda124" in body
+    assert 'uv venv --seed --python 3.11 "$UV_PROJECT_ENVIRONMENT"' in body
+    assert body.index("uv venv --seed --python 3.11") < body.index(
+        "uv sync --python 3.11 --extra cuda124"
+    )
+    assert "UV_PROJECT_ENVIRONMENT=/opt/reigh-worker-live-test-venv" in body
 
 
 def test_prebuilt_build_installs_bundle_system_tools():
@@ -534,10 +551,41 @@ def test_health_probe_groups_source_schema_asset_and_runtime_issues():
     asset_issue = next(issue for issue in report.issues if issue.group == "assets")
     assert asset_issue.code == "missing_model_asset"
     assert asset_issue.detail["name"] == "missing-model.safetensors"
+    assert asset_issue.detail["expected_path"] == f"{contract.models_path}/checkpoints/missing-model.safetensors"
     assert asset_issue.detail["paths_checked"] == [
         f"{contract.models_path}/checkpoints/missing-model.safetensors"
     ]
     assert asset_issue.detail["url"] == "https://example.invalid/missing-model.safetensors"
+
+
+def test_selected_assets_from_enriched_manifest_deduplicates_same_template_asset():
+    manifest = {
+        "targets": [
+            {
+                "template_id": "image/z_image",
+                "assets": [
+                    {
+                        "name": "z_image_bf16.safetensors",
+                        "expected_path": "/models/checkpoints/z_image_bf16.safetensors",
+                    },
+                    {
+                        "name": "z_image_bf16.safetensors",
+                        "expected_path": "/models/checkpoints/z_image_bf16.safetensors",
+                    },
+                ],
+            }
+        ]
+    }
+
+    assets = _selected_assets_from_enriched(manifest)
+
+    assert assets == [
+        {
+            "template_id": "image/z_image",
+            "name": "z_image_bf16.safetensors",
+            "expected_path": "/models/checkpoints/z_image_bf16.safetensors",
+        }
+    ]
 
 
 def test_enriched_manifest_without_errors_records_runtime_deferred_info():
@@ -577,6 +625,24 @@ def test_select_prebuilt_volume_uses_data_center_normalization_and_name_match():
     selected = select_prebuilt_volume(volumes, profile="portable", data_center_id="eur-no-1")
     assert selected is not None
     assert selected["id"] == "a"
+
+
+def test_select_prebuilt_volume_requires_filter_for_multiple_profile_matches():
+    volumes = [
+        {
+            "id": "a",
+            "name": "reigh-livetest-prebuilt-portable-eur-no-1",
+            "dataCenterId": "EUR-NO-1",
+        },
+        {
+            "id": "b",
+            "name": "reigh-livetest-prebuilt-portable-us-tx-1",
+            "dataCenterId": "US-TX-1",
+        },
+    ]
+
+    with pytest.raises(ValueError, match="Candidates: .*id=a.*id=b"):
+        select_prebuilt_volume(volumes, profile="portable")
 
 
 # --------------------------------------------------------------------------- #

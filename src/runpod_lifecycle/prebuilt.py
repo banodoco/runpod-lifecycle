@@ -219,8 +219,8 @@ def select_prebuilt_volume(
     """Select a prebuilt volume deterministically from RunPod volume records.
 
     Selection is based on the actual ``dataCenterId`` field when a data center
-    is supplied. Without a data-center filter, matches are sorted by normalized
-    data center then name so callers do not depend on RunPod response order.
+    is supplied. Without a data-center or explicit name, multiple matching
+    canonical profile volumes are ambiguous and must be resolved by the caller.
     """
     requested_name = str(volume_name or "").strip()
     normalized_dc = normalize_data_center_id(data_center_id) if data_center_id else None
@@ -247,6 +247,18 @@ def select_prebuilt_volume(
             str(item.get("id") or ""),
         )
     )
+    if len(matches) > 1 and not normalized_dc and not requested_name:
+        candidates = [
+            f"{item.get('name') or '<unnamed>'} "
+            f"({item.get('dataCenterId') or item.get('data_center_id') or 'unknown-dc'}, "
+            f"id={item.get('id') or 'unknown-id'})"
+            for item in matches
+        ]
+        raise ValueError(
+            "Multiple prebuilt volumes match profile "
+            f"{profile!r}; pass --data-center or --volume-name. Candidates: "
+            + ", ".join(candidates)
+        )
     return matches[0] if matches else None
 
 
@@ -612,12 +624,21 @@ def _selected_assets_from_enriched(enriched_manifest: dict[str, Any] | None) -> 
     if not isinstance(enriched_manifest, dict):
         return []
     assets: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
     for target in enriched_manifest.get("targets", []):
         if not isinstance(target, dict):
             continue
         template_id = target.get("template_id")
         for asset in target.get("assets", []):
             if isinstance(asset, dict):
+                key = (
+                    str(template_id or ""),
+                    str(asset.get("expected_path") or ""),
+                    str(asset.get("name") or ""),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
                 assets.append({"template_id": template_id, **asset})
     return assets
 
@@ -734,6 +755,7 @@ def _probe_selected_assets(
                         "template_id": asset.get("template_id"),
                         "name": name,
                         "category": asset.get("category") or asset.get("subdir"),
+                        "expected_path": str(expected_path),
                         "paths_checked": checked,
                         "url": asset.get("url"),
                         "remediation": asset.get("remediation"),

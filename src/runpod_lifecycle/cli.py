@@ -504,7 +504,13 @@ def _exec_check(ssh: SSHClient, command: str, *, timeout: int = 600) -> tuple[st
     return stdout, stderr
 
 
-def _uv_sync_builder_shell(workdir: str, *, env_path: str, extras: tuple[str, ...]) -> str:
+def _uv_sync_builder_shell(
+    workdir: str,
+    *,
+    env_path: str,
+    python_version: str,
+    extras: tuple[str, ...],
+) -> str:
     """Render the same uv-sync shell that reigh-worker run_install emits.
 
     Kept in-line here so runpod-lifecycle stays self-contained (no reigh-worker
@@ -512,14 +518,19 @@ def _uv_sync_builder_shell(workdir: str, *, env_path: str, extras: tuple[str, ..
     """
     if not extras:
         raise ValueError("_uv_sync_builder_shell requires a non-empty extras tuple")
+    if not python_version:
+        raise ValueError("_uv_sync_builder_shell requires python_version")
     extras_args = " ".join(f"--extra {e}" for e in extras)
+    python_arg = shlex.quote(str(python_version))
     return (
         f"cd {shlex.quote(workdir)}\n"
         'export PATH="$HOME/.local/bin:$PATH"\n'
         f"export UV_PROJECT_ENVIRONMENT={env_path}\n"
         "export UV_LINK_MODE=copy\n"
+        'rm -rf "$UV_PROJECT_ENVIRONMENT"\n'
+        f'uv venv --seed --python {python_arg} "$UV_PROJECT_ENVIRONMENT"\n'
         "for attempt in 1 2 3; do\n"
-        f"  if uv sync {extras_args}; then\n"
+        f"  if uv sync --python {python_arg} {extras_args}; then\n"
         "    break\n"
         "  fi\n"
         '  echo "uv sync attempt $attempt failed; cleaning partial venv and retrying"\n'
@@ -1264,9 +1275,13 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
             )
 
         with _prebuilt_phase("install_worker", workdir=_BUILDER_REIGH_WORKER_DIR):
-            apt_packages = "python3.10-venv python3.10-dev build-essential ffmpeg git curl wget zstd pv"
+            apt_python = f"python{contract.python_version}"
+            apt_packages = f"{apt_python}-venv {apt_python}-dev build-essential ffmpeg git curl wget zstd pv"
             sync_body = _uv_sync_builder_shell(
-                _BUILDER_REIGH_WORKER_DIR, env_path=_BUILDER_VENV_PATH, extras=("cuda124",)
+                _BUILDER_REIGH_WORKER_DIR,
+                env_path=_BUILDER_VENV_PATH,
+                python_version=contract.python_version,
+                extras=("cuda124",),
             )
             script = (
                 "set -euo pipefail\n"
