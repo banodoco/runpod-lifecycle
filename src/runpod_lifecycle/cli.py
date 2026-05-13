@@ -1122,7 +1122,8 @@ async def _cmd_prebuilt_reconcile(args: argparse.Namespace) -> int:
             )
         with _prebuilt_phase("open_ssh", pod_id=pod_obj.id):
             ssh = await _connect_builder_ssh(pod_obj)
-        for asset in payload["fetch_plan"]:
+        total_assets = len(payload["fetch_plan"])
+        for index, asset in enumerate(payload["fetch_plan"], start=1):
             expected_path = asset.get("expected_path")
             url = asset.get("url")
             name = asset.get("name")
@@ -1134,6 +1135,19 @@ async def _cmd_prebuilt_reconcile(args: argparse.Namespace) -> int:
                     }
                 )
                 continue
+            print(
+                json.dumps(
+                    {
+                        "event": "prebuilt_reconcile_fetch_start",
+                        "index": index,
+                        "total": total_assets,
+                        "name": name,
+                        "expected_path": expected_path,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
             script = (
                 "set -euo pipefail\n"
                 f"if [ -f {_quote(str(expected_path))} ]; then\n"
@@ -1141,7 +1155,8 @@ async def _cmd_prebuilt_reconcile(args: argparse.Namespace) -> int:
                 "  exit 0\n"
                 "fi\n"
                 f"mkdir -p {_quote(str(Path(str(expected_path)).parent))}\n"
-                f"curl -L --fail {_quote(str(url))} -o {_quote(str(expected_path))}\n"
+                f"curl -L --fail --retry 3 --retry-delay 5 --continue-at - {_quote(str(url))} "
+                f"-o {_quote(str(expected_path))}\n"
                 "echo fetched\n"
             )
             exit_code, stdout, stderr = await asyncio.to_thread(
@@ -1157,6 +1172,19 @@ async def _cmd_prebuilt_reconcile(args: argparse.Namespace) -> int:
                         "status": (stdout or "").strip().splitlines()[-1] if stdout.strip() else "ok",
                     }
                 )
+                print(
+                    json.dumps(
+                        {
+                            "event": "prebuilt_reconcile_fetch_done",
+                            "index": index,
+                            "total": total_assets,
+                            "name": name,
+                            "status": reconciled[-1]["status"],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
             else:
                 failed.append(
                     {
@@ -1164,6 +1192,19 @@ async def _cmd_prebuilt_reconcile(args: argparse.Namespace) -> int:
                         "expected_path": expected_path,
                         "error": _redact_sensitive_text(_stderr_excerpt(stderr)),
                     }
+                )
+                print(
+                    json.dumps(
+                        {
+                            "event": "prebuilt_reconcile_fetch_failed",
+                            "index": index,
+                            "total": total_assets,
+                            "name": name,
+                            "error": failed[-1]["error"],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
                 )
         result = {
             "action": "prebuilt reconcile",

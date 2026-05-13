@@ -235,6 +235,17 @@ def test_launch_prebuilt_probe_accepts_gpu_candidate_list(monkeypatch):
     assert captured["timeout"] == 900
 
 
+def test_prebuilt_reconcile_reports_fetch_progress_and_resume_curl():
+    import inspect
+
+    source = inspect.getsource(cli._cmd_prebuilt_reconcile)
+    assert "prebuilt_reconcile_fetch_start" in source
+    assert "prebuilt_reconcile_fetch_done" in source
+    assert "prebuilt_reconcile_fetch_failed" in source
+    assert "--continue-at -" in source
+    assert "--retry 3" in source
+
+
 def test_prebuilt_build_installs_bundle_system_tools():
     import inspect
 
