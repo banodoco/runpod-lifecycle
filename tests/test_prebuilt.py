@@ -236,6 +236,23 @@ def test_launch_prebuilt_probe_accepts_gpu_candidate_list(monkeypatch):
     assert captured["timeout"] == 900
 
 
+def test_prebuilt_reconcile_defaults_to_hydration_gpu_fallbacks():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "prebuilt",
+            "reconcile",
+            "--data-center",
+            "EUR-NO-1",
+            "--enriched-targets-json",
+            "targets.enriched.json",
+        ]
+    )
+
+    assert args.gpu_type.startswith("NVIDIA L4,")
+    assert "NVIDIA GeForce RTX 4090" in args.gpu_type
+
+
 def test_prebuilt_reconcile_reports_fetch_progress_and_resume_curl():
     import inspect
 

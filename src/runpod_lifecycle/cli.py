@@ -419,6 +419,13 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
 PREBUILT_VOLUME_NAME_PREFIX = "reigh-livetest-prebuilt-"
 _BUILDER_POD_PREFIX = "reigh-livetest-builder-"
 _PREBUILT_POD_PREFIX = "reigh-livetest-prebuilt-"
+_PREBUILT_RECONCILE_GPU_FALLBACKS = (
+    "NVIDIA L4,"
+    "NVIDIA RTX A4000,"
+    "NVIDIA RTX 4000 Ada Generation,"
+    "NVIDIA A40,"
+    "NVIDIA GeForce RTX 4090"
+)
 _PREBUILT_CLEANUP_PREFIXES = (_BUILDER_POD_PREFIX, _PREBUILT_POD_PREFIX)
 _BUILDER_REIGH_WORKER_DIR = "/opt/build/reigh-worker"
 _BUILDER_VIBECOMFY_DIR = "/opt/build/vibecomfy"
@@ -1998,7 +2005,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_pb_reconcile.add_argument("--data-center", required=True)
     p_pb_reconcile.add_argument("--attention-profile", choices=["portable", "sage"], default="portable")
-    p_pb_reconcile.add_argument("--gpu-type", default="NVIDIA GeForce RTX 4090")
+    p_pb_reconcile.add_argument(
+        "--gpu-type",
+        default=_PREBUILT_RECONCILE_GPU_FALLBACKS,
+        help=(
+            "Comma-separated GPU candidate list for the short-lived asset hydration pod. "
+            "Defaults to cheaper/smaller GPUs before RTX 4090 because reconciliation only downloads files."
+        ),
+    )
     p_pb_reconcile.add_argument("--container-disk-gb", type=int, default=100)
     p_pb_reconcile.add_argument(
         "--min-memory-gb",
