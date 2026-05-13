@@ -316,6 +316,20 @@ def test_create_pod_uses_prior_default_ports_when_none(runpod_sdk_mock) -> None:
     assert kwargs["ports"] == "22/tcp,8888/http"
 
 
+def test_create_pod_allows_cloud_type_override(runpod_sdk_mock, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUNPOD_CLOUD_TYPE", "community")
+    runpod_sdk_mock.create_pod.return_value = {"id": "pod-community"}
+
+    api.create_pod(
+        api_key="api-key",
+        gpu_type_id="gpu-1",
+        image_name="image",
+    )
+
+    kwargs = runpod_sdk_mock.create_pod.call_args.kwargs
+    assert kwargs["cloud_type"] == "COMMUNITY"
+
+
 def test_create_pod_passes_custom_ports_through(runpod_sdk_mock) -> None:
     runpod_sdk_mock.create_pod.return_value = {"id": "pod-custom-ports"}
     api.create_pod(

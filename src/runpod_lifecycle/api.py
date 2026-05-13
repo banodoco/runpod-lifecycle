@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import logging
+import os
 from typing import Any
 
 import httpx
@@ -117,12 +118,13 @@ def create_pod(
     sdk = _get_runpod()
     sdk.api_key = api_key
 
+    cloud_type = os.getenv("RUNPOD_CLOUD_TYPE", "SECURE").strip().upper() or "SECURE"
     params: dict[str, Any] = {
         "name": name,
         "image_name": image_name,
         "gpu_type_id": gpu_type_id,
         "gpu_count": 1,
-        "cloud_type": "SECURE",
+        "cloud_type": cloud_type,
         "volume_in_gb": disk_in_gb,
         "container_disk_in_gb": container_disk_in_gb,
         "min_vcpu_count": min_vcpu_count,
