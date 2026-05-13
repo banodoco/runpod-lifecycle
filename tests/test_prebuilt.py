@@ -197,6 +197,44 @@ def test_uv_sync_builder_shell_pins_requested_worker_python():
     assert "UV_PROJECT_ENVIRONMENT=/opt/reigh-worker-live-test-venv" in body
 
 
+def test_launch_prebuilt_probe_accepts_gpu_candidate_list(monkeypatch):
+    captured = {}
+
+    class FakePod:
+        id = "pod-1"
+
+        async def wait_ready(self, timeout):
+            captured["timeout"] = timeout
+
+    async def fake_selected_volume_id(api_key, contract):
+        captured["selected"] = (api_key, contract.volume_name)
+        return "vol-1"
+
+    async def fake_launch(config, *, name):
+        captured["gpu_type"] = config.gpu_type
+        captured["name"] = name
+        return FakePod()
+
+    monkeypatch.setattr(cli, "_selected_prebuilt_volume_id", fake_selected_volume_id)
+    monkeypatch.setattr(cli, "_launch", fake_launch)
+    pod = asyncio.run(
+        cli._launch_prebuilt_probe_pod(
+            argparse.Namespace(
+                gpu_type="NVIDIA GeForce RTX 4090,NVIDIA L4",
+                container_disk_gb=100,
+                min_memory_gb=16,
+            ),
+            api_key="key-1",
+            contract=_make_contract(),
+            action="reconcile",
+        )
+    )
+
+    assert pod.id == "pod-1"
+    assert captured["gpu_type"] == ("NVIDIA GeForce RTX 4090", "NVIDIA L4")
+    assert captured["timeout"] == 900
+
+
 def test_prebuilt_build_installs_bundle_system_tools():
     import inspect
 

@@ -716,10 +716,11 @@ async def _launch_prebuilt_probe_pod(
     action: str,
 ) -> Pod:
     await _selected_prebuilt_volume_id(api_key, contract)
-    gpu_type = getattr(args, "gpu_type", None) or "NVIDIA GeForce RTX 4090"
-    gpu = await asyncio.to_thread(find_gpu_type, gpu_type, api_key)
-    if not gpu:
-        raise RuntimeError(f"GPU type not found: {gpu_type!r}")
+    gpu_type_arg = getattr(args, "gpu_type", None) or "NVIDIA GeForce RTX 4090"
+    gpu_types = tuple(part.strip() for part in str(gpu_type_arg).split(",") if part.strip())
+    if not gpu_types:
+        raise RuntimeError("At least one GPU type is required")
+    gpu_type: str | tuple[str, ...] = gpu_types[0] if len(gpu_types) == 1 else gpu_types
     pod_name = f"{_PREBUILT_POD_PREFIX}{action}-{_builder_timestamp_label()}"
     config = RunPodConfig(
         api_key=api_key,
