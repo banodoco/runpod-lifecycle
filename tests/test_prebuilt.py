@@ -13,14 +13,23 @@ import pytest
 
 from runpod_lifecycle.prebuilt import (
     PrebuiltEnvContract,
+    PrebuiltHealthIssue,
+    PrebuiltHealthReport,
     PrebuiltManifest,
+    PrebuiltPythonEnvReport,
     acquire_build_lock,
     compute_lockfile_hash,
     compute_pyproject_hash,
+    health_issues_from_enriched_manifest,
+    health_path,
     lock_path,
     manifest_path,
     read_manifest,
+    read_health_report,
+    run_prebuilt_health_probes,
+    select_prebuilt_volume,
     write_manifest,
+    write_health_report,
 )
 from runpod_lifecycle import cli
 
@@ -159,12 +168,43 @@ def test_vibecomfy_builder_install_pins_cuda124_torch_after_custom_nodes():
     assert body.index("nodes restore --lockfile custom_nodes.lock") < body.rindex(torch_pin)
 
 
+def test_worker_python_version_probe_shell_enforces_exact_major_minor():
+    body = cli._worker_python_version_probe_shell(
+        "/opt/reigh-worker-live-test-venv/bin/python",
+        "3.11",
+    )
+
+    assert "/opt/reigh-worker-live-test-venv/bin/python - <<'PY'" in body
+    assert "expected = '3.11'" in body
+    assert "worker python version mismatch" in body
+    assert "observed != expected" in body
+
+
 def test_prebuilt_build_installs_bundle_system_tools():
     import inspect
 
     source = inspect.getsource(cli._cmd_prebuilt_build)
     assert "zstd" in source
     assert "pv" in source
+
+
+def test_prebuilt_extract_installs_required_system_tools():
+    contract = cli._builder_contract(
+        argparse.Namespace(
+            data_center="EUR-NO-1",
+            attention_profile="portable",
+            python_version="3.10",
+            volume_name=None,
+        )
+    )
+
+    body = cli._extract_prebuilt_runtime_shell(contract)
+
+    assert "apt-get update" in body
+    assert "apt-get install -y --no-install-recommends ffmpeg git curl zstd tar" in body
+    assert body.index("apt-get install") < body.index("tar --use-compress-program zstd")
+    assert "extra_model_paths.yaml" in body
+    assert f"base_path: {contract.models_path}" in body
 
 
 def test_prebuilt_manifest_uv_probe_uses_bootstrapped_path():
@@ -344,6 +384,55 @@ def test_write_manifest_then_read_manifest_round_trip():
     assert loaded == manifest
 
 
+def test_write_health_report_then_read_health_report_round_trip():
+    ssh = _FakeSSH()
+    contract = _make_contract()
+    report = PrebuiltHealthReport(
+        schema_version=1,
+        generated_at_utc="2026-05-13T12:00:00+00:00",
+        volume_name=contract.volume_name,
+        data_center_id=contract.data_center_id,
+        attention_profile=contract.attention_profile,
+        worker_env=PrebuiltPythonEnvReport(
+            label="worker",
+            python_path="/opt/reigh-worker-live-test-venv/bin/python",
+            cwd="/opt/reigh-livetest-prebuilt/worker",
+            python_version="3.11",
+            torch_version="2.6.0",
+            torch_cuda="12.4",
+            import_ok=True,
+        ),
+        vibecomfy_env=PrebuiltPythonEnvReport(
+            label="vibecomfy",
+            python_path="/opt/reigh-livetest-prebuilt/vibecomfy/.venv/bin/python",
+            cwd="/opt/reigh-livetest-prebuilt/vibecomfy",
+            python_version="3.11",
+            torch_version="2.6.0",
+            torch_cuda="12.4",
+            import_ok=True,
+        ),
+        issues=[
+            PrebuiltHealthIssue(
+                group="assets",
+                code="missing_model_asset",
+                message="missing checkpoint",
+                detail={"paths_checked": ["/workspace/reigh-livetest-prebuilt/models/checkpoints/x.safetensors"]},
+            )
+        ],
+        targets_path="/workspace/reigh-livetest-prebuilt/runs/r/targets.json",
+        enriched_path="/workspace/reigh-livetest-prebuilt/runs/r/targets.enriched.json",
+    )
+
+    write_health_report(ssh, contract, report)
+    assert health_path(contract) in ssh.fs.files
+    loaded = read_health_report(ssh, contract)
+    assert loaded is not None
+    assert loaded.worker_env.python_path != loaded.vibecomfy_env.python_path
+    assert loaded.worker_env.torch_cuda == "12.4"
+    assert loaded.vibecomfy_env.import_ok is True
+    assert loaded.issues[0].group == "assets"
+
+
 def test_read_manifest_returns_none_when_missing():
     ssh = _FakeSSH()
     contract = _make_contract()
@@ -366,6 +455,128 @@ def test_read_manifest_filters_unknown_payload_keys():
     loaded = read_manifest(ssh, contract)
     assert loaded is not None
     assert loaded.python_version == "3.11"
+
+
+class _ProbeSSH:
+    def __init__(self, contract: PrebuiltEnvContract) -> None:
+        self.contract = contract
+        self.commands: list[tuple[str, int]] = []
+
+    def execute_command(self, command: str, timeout: int = 600):
+        self.commands.append((command, timeout))
+        if command.startswith("command -v "):
+            return 0, "", ""
+        if "/bin/python - <<'PY'" in command:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "python_version": "3.11",
+                        "torch_version": "2.6.0",
+                        "torch_cuda": "12.4",
+                        "import_ok": True,
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                "",
+            )
+        if command.startswith("test -e "):
+            return 0, "", ""
+        if command.startswith("test -r ") and "extra_model_paths.yaml" in command:
+            return 0, f"reigh:\n  base_path: {self.contract.models_path}\n", ""
+        if command.startswith("test -f "):
+            if "missing-model.safetensors" in command:
+                return 1, "", "missing"
+            return 0, "", ""
+        return 1, "", f"unhandled fake probe command: {command}"
+
+
+def test_health_probe_groups_source_schema_asset_and_runtime_issues():
+    contract = _make_contract()
+    manifest = _make_manifest()
+    enriched = {
+        "targets": [
+            {
+                "template_id": "image/z_image",
+                "source": {
+                    "runtime_source_of_truth": False,
+                    "source_mode": "json_runtime_wrapper",
+                },
+                "schema": {"compile_error": "missing required input prompt"},
+                "assets": [
+                    {
+                        "name": "missing-model.safetensors",
+                        "category": "checkpoints",
+                        "expected_path": f"{contract.models_path}/checkpoints/missing-model.safetensors",
+                        "paths_checked": [
+                            f"{contract.models_path}/checkpoints/missing-model.safetensors"
+                        ],
+                        "url": "https://example.invalid/missing-model.safetensors",
+                        "remediation": "vibecomfy fetch model missing-model.safetensors",
+                    }
+                ],
+            }
+        ]
+    }
+
+    report = run_prebuilt_health_probes(
+        _ProbeSSH(contract),
+        contract,
+        manifest,
+        targets_path="/workspace/reigh-livetest-prebuilt/runs/r/targets.json",
+        enriched_path="/workspace/reigh-livetest-prebuilt/runs/r/targets.enriched.json",
+        enriched_manifest=enriched,
+    )
+
+    groups = {issue.group for issue in report.issues}
+    assert {"workflow_source", "schema", "assets"}.issubset(groups)
+    asset_issue = next(issue for issue in report.issues if issue.group == "assets")
+    assert asset_issue.code == "missing_model_asset"
+    assert asset_issue.detail["name"] == "missing-model.safetensors"
+    assert asset_issue.detail["paths_checked"] == [
+        f"{contract.models_path}/checkpoints/missing-model.safetensors"
+    ]
+    assert asset_issue.detail["url"] == "https://example.invalid/missing-model.safetensors"
+
+
+def test_enriched_manifest_without_errors_records_runtime_deferred_info():
+    issues = health_issues_from_enriched_manifest(
+        {
+            "targets": [
+                {
+                    "template_id": "image/z_image",
+                    "source": {"runtime_source_of_truth": True},
+                    "schema": {"node_count": 3},
+                    "assets": [],
+                    "issues": [],
+                }
+            ]
+        }
+    )
+
+    assert len(issues) == 1
+    assert issues[0].group == "runtime_deferred"
+    assert issues[0].severity == "info"
+
+
+def test_select_prebuilt_volume_uses_data_center_normalization_and_name_match():
+    volumes = [
+        {
+            "id": "b",
+            "name": "reigh-livetest-prebuilt-portable-us-tx-1",
+            "dataCenterId": "US-TX-1",
+        },
+        {
+            "id": "a",
+            "name": "reigh-livetest-prebuilt-portable-eur-no-1",
+            "dataCenterId": "EUR_NO_1",
+        },
+    ]
+
+    selected = select_prebuilt_volume(volumes, profile="portable", data_center_id="eur-no-1")
+    assert selected is not None
+    assert selected["id"] == "a"
 
 
 # --------------------------------------------------------------------------- #

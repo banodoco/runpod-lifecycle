@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+from dataclasses import asdict, is_dataclass
 import json
 import os
 import re
@@ -26,10 +27,17 @@ from .prebuilt import (
     PrebuiltEnvContract,
     PrebuiltManifest,
     acquire_build_lock,
+    build_error_health_report,
+    build_missing_manifest_health_report,
     compute_lockfile_hash,
     compute_pyproject_hash,
+    health_path,
     manifest_path,
+    prebuilt_volume_name_for_profile,
     read_manifest,
+    run_prebuilt_health_probes,
+    select_prebuilt_volume,
+    write_health_report,
     write_manifest,
 )
 from .probe import probe as _probe
@@ -410,6 +418,8 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
 
 PREBUILT_VOLUME_NAME_PREFIX = "reigh-livetest-prebuilt-"
 _BUILDER_POD_PREFIX = "reigh-livetest-builder-"
+_PREBUILT_POD_PREFIX = "reigh-livetest-prebuilt-"
+_PREBUILT_CLEANUP_PREFIXES = (_BUILDER_POD_PREFIX, _PREBUILT_POD_PREFIX)
 _BUILDER_REIGH_WORKER_DIR = "/opt/build/reigh-worker"
 _BUILDER_VIBECOMFY_DIR = "/opt/build/vibecomfy"
 _BUILDER_VENV_PATH = "/opt/reigh-worker-live-test-venv"
@@ -448,8 +458,11 @@ def _builder_timestamp_label() -> str:
 
 
 def _builder_contract(args: argparse.Namespace) -> PrebuiltEnvContract:
+    volume_name = args.volume_name or prebuilt_volume_name_for_profile(
+        args.attention_profile, args.data_center
+    )
     return PrebuiltEnvContract(
-        volume_name=args.volume_name,
+        volume_name=volume_name,
         data_center_id=args.data_center,
         attention_profile=args.attention_profile,
         comfyui_pin=getattr(args, "comfyui_pin", "fix/latentupscale-model-mmap-residency"),
@@ -460,6 +473,26 @@ def _builder_contract(args: argparse.Namespace) -> PrebuiltEnvContract:
 
 def _quote(value: str) -> str:
     return shlex.quote(str(value))
+
+
+def _stderr_excerpt(text: str) -> str:
+    lines = (text or "").splitlines()
+    if len(lines) <= 40:
+        return "\n".join(lines)
+    return "\n".join(lines[:20] + ["..."] + lines[-20:])
+
+
+def _redact_sensitive_text(text: str) -> str:
+    patterns = [
+        r"RUNPOD_API_KEY=[^\s]+",
+        r"SUPABASE_SERVICE_ROLE_KEY=[^\s]+",
+        r"hf_[A-Za-z0-9_=-]+",
+        r"rp_[A-Za-z0-9_=-]+",
+    ]
+    redacted = text or ""
+    for pattern in patterns:
+        redacted = re.sub(pattern, "[REDACTED]", redacted)
+    return redacted
 
 
 def _exec_check(ssh: SSHClient, command: str, *, timeout: int = 600) -> tuple[str, str]:
@@ -543,6 +576,21 @@ def _vibecomfy_install_builder_shell(
     )
 
 
+def _worker_python_version_probe_shell(python_path: str, expected_version: str) -> str:
+    """Render a strict major.minor Python-version check for the worker venv."""
+    return (
+        "set -euo pipefail\n"
+        f"{_quote(python_path)} - <<'PY'\n"
+        "import sys\n"
+        f"expected = {expected_version!r}\n"
+        "observed = f'{sys.version_info.major}.{sys.version_info.minor}'\n"
+        "if observed != expected:\n"
+        "    raise SystemExit(f'worker python version mismatch: observed {observed}, expected {expected}')\n"
+        "print(observed)\n"
+        "PY\n"
+    )
+
+
 def _bundle_directory_shell(*, source_parent: str, source_name: str, bundle_path: str) -> str:
     staging = f"{bundle_path}.staging"
     return (
@@ -577,12 +625,550 @@ async def _connect_builder_ssh(pod: Pod) -> SSHClient:
 async def _cmd_prebuilt(args: argparse.Namespace) -> int:
     dispatch = {
         "build": _cmd_prebuilt_build,
+        "check": _cmd_prebuilt_check,
+        "cleanup": _cmd_prebuilt_cleanup,
         "inspect": _cmd_prebuilt_inspect,
         "invalidate": _cmd_prebuilt_invalidate,
         "list": _cmd_prebuilt_list,
+        "reconcile": _cmd_prebuilt_reconcile,
+        "status": _cmd_prebuilt_status,
     }
     handler = dispatch[args.prebuilt_cmd]
     return await handler(args)
+
+
+def _prebuilt_target_summary(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "targets_json": str(args.targets_json) if getattr(args, "targets_json", None) else None,
+        "asset_manifest": str(args.asset_manifest) if getattr(args, "asset_manifest", None) else None,
+        "enriched_targets_json": str(args.enriched_targets_json)
+        if getattr(args, "enriched_targets_json", None)
+        else None,
+        "local_vibecomfy_dir": str(args.local_vibecomfy_dir)
+        if getattr(args, "local_vibecomfy_dir", None)
+        else None,
+        "models_root": str(args.models_root) if getattr(args, "models_root", None) else None,
+    }
+
+
+def _read_json_path(path: str | Path) -> Any:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _pod_summary_dict(pod: discovery.PodSummary) -> dict[str, Any]:
+    if is_dataclass(pod):
+        return asdict(pod)
+    return dict(getattr(pod, "__dict__", {}))
+
+
+def _prefixes_from_args(args: argparse.Namespace) -> tuple[str, ...]:
+    prefixes = tuple(getattr(args, "prefix", None) or _PREBUILT_CLEANUP_PREFIXES)
+    disallowed = [p for p in prefixes if p not in _PREBUILT_CLEANUP_PREFIXES]
+    if disallowed:
+        raise ValueError(
+            "prebuilt status/cleanup is restricted to validation pod prefixes: "
+            + ", ".join(_PREBUILT_CLEANUP_PREFIXES)
+        )
+    return prefixes
+
+
+async def _list_prebuilt_pods(api_key: str, prefixes: tuple[str, ...]) -> list[discovery.PodSummary]:
+    pods_by_id: dict[str, discovery.PodSummary] = {}
+    for prefix in prefixes:
+        for pod in await discovery.list_pods(api_key, name_prefix=prefix):
+            pods_by_id[pod.id] = pod
+    return sorted(pods_by_id.values(), key=lambda p: (p.name or "", p.id))
+
+
+async def _selected_prebuilt_volume_id(api_key: str, contract: PrebuiltEnvContract) -> str:
+    volumes = await asyncio.to_thread(get_network_volumes, api_key)
+    selected_volume = select_prebuilt_volume(
+        volumes or [],
+        profile=contract.attention_profile,
+        data_center_id=contract.data_center_id,
+        volume_name=contract.volume_name,
+    )
+    volume_id = str((selected_volume or {}).get("id") or "")
+    if not volume_id:
+        raise RuntimeError(
+            f"Network volume {contract.volume_name!r} not found in datacenter "
+            f"{contract.data_center_id!r}."
+        )
+    return volume_id
+
+
+async def _launch_prebuilt_probe_pod(
+    args: argparse.Namespace,
+    *,
+    api_key: str,
+    contract: PrebuiltEnvContract,
+    action: str,
+) -> Pod:
+    await _selected_prebuilt_volume_id(api_key, contract)
+    gpu_type = getattr(args, "gpu_type", None) or "NVIDIA GeForce RTX 4090"
+    gpu = await asyncio.to_thread(find_gpu_type, gpu_type, api_key)
+    if not gpu:
+        raise RuntimeError(f"GPU type not found: {gpu_type!r}")
+    pod_name = f"{_PREBUILT_POD_PREFIX}{action}-{_builder_timestamp_label()}"
+    config = RunPodConfig(
+        api_key=api_key,
+        gpu_type=gpu_type,
+        worker_image=_RUNPOD_BASE_IMAGE,
+        container_disk_gb=max(100, int(getattr(args, "container_disk_gb", 100) or 100)),
+        min_memory_gb=max(16, int(getattr(args, "min_memory_gb", 16) or 16)),
+        name_prefix=_PREBUILT_POD_PREFIX,
+        disk_size_gb=500,
+        storage_name=contract.volume_name,
+    )
+    pod = await _launch(config, name=pod_name)
+    await pod.wait_ready(timeout=900)
+    return pod
+
+
+def _extract_prebuilt_runtime_shell(contract: PrebuiltEnvContract) -> str:
+    venv_bundle = f"{contract.cache_root}/{_VENV_BUNDLE_NAME}"
+    vibecomfy_bundle = f"{contract.cache_root}/{_VIBECOMFY_BUNDLE_NAME}"
+    runtime_parent = contract.runtime_vibecomfy_path.rsplit("/", 1)[0]
+    return (
+        "set -euo pipefail\n"
+        "export DEBIAN_FRONTEND=noninteractive\n"
+        "apt-get update\n"
+        "apt-get install -y --no-install-recommends ffmpeg git curl zstd tar\n"
+        f"test -f {_quote(venv_bundle)}\n"
+        f"test -f {_quote(vibecomfy_bundle)}\n"
+        f"rm -rf {_quote(contract.runtime_venv_path)} {_quote(contract.runtime_vibecomfy_path)}\n"
+        f"mkdir -p {_quote(runtime_parent)} {_quote(contract.runtime_worker_path)}\n"
+        f"tar --use-compress-program zstd -xf {_quote(venv_bundle)} -C /opt\n"
+        f"tar --use-compress-program zstd -xf {_quote(vibecomfy_bundle)} -C {_quote(runtime_parent)}\n"
+        f"cat > {_quote(contract.runtime_vibecomfy_path + '/extra_model_paths.yaml')} <<'YAML'\n"
+        "reigh_prebuilt:\n"
+        f"  base_path: {_quote(contract.models_path)}\n"
+        "  checkpoints: checkpoints\n"
+        "  clip: clip\n"
+        "  clip_vision: clip_vision\n"
+        "  configs: configs\n"
+        "  controlnet: controlnet\n"
+        "  diffusion_models: diffusion_models\n"
+        "  embeddings: embeddings\n"
+        "  loras: loras\n"
+        "  style_models: style_models\n"
+        "  text_encoders: text_encoders\n"
+        "  unet: unet\n"
+        "  upscale_models: upscale_models\n"
+        "  vae: vae\n"
+        "YAML\n"
+    )
+
+
+def _asset_entries_from_enriched_manifest(payload: Any) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        return entries
+    for target in payload.get("targets", []):
+        if not isinstance(target, dict):
+            continue
+        template_id = target.get("template_id")
+        for asset in target.get("assets", []):
+            if isinstance(asset, dict):
+                entries.append({"template_id": template_id, **asset})
+    return entries
+
+
+def _asset_entries_from_manifest(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [entry for entry in payload if isinstance(entry, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in ("assets", "model_assets"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [entry for entry in value if isinstance(entry, dict)]
+    return _asset_entries_from_enriched_manifest(payload)
+
+
+def _asset_fetch_plan(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    plan: list[dict[str, Any]] = []
+    for entry in entries:
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        expected_path = entry.get("expected_path")
+        url = entry.get("url")
+        plan.append(
+            {
+                "name": name,
+                "template_id": entry.get("template_id"),
+                "category": entry.get("category") or entry.get("subdir") or entry.get("directory"),
+                "expected_path": expected_path,
+                "url": url,
+                "present": bool(entry.get("present")),
+                "remediation": entry.get("remediation")
+                or (
+                    f"curl -L {url} -o {expected_path}"
+                    if isinstance(url, str) and isinstance(expected_path, str)
+                    else None
+                ),
+            }
+        )
+    return plan
+
+
+def _selected_enriched_manifest_from_args(args: argparse.Namespace) -> dict[str, Any] | None:
+    if getattr(args, "enriched_targets_json", None):
+        payload = _read_json_path(args.enriched_targets_json)
+        return payload if isinstance(payload, dict) else None
+    if getattr(args, "asset_manifest", None):
+        entries = _asset_entries_from_manifest(_read_json_path(args.asset_manifest))
+        return {
+            "schema_version": 1,
+            "producer": "runpod-lifecycle.asset-manifest-adapter",
+            "targets": [
+                {
+                    "template_id": "asset_manifest",
+                    "assets": entries,
+                    "issues": [
+                        {
+                            "group": "runtime_deferred",
+                            "code": "workflow_source_schema_not_enriched",
+                            "severity": "warning",
+                            "message": "Asset manifest supplied without VibeComfy source/schema enrichment.",
+                        }
+                    ],
+                }
+            ],
+        }
+    return None
+
+
+def _health_summary(report) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for issue in report.issues:
+        grouped.setdefault(issue.group, []).append(asdict(issue))
+    return {
+        "ok": report.ok,
+        "health_path": None,
+        "issue_count": len(report.issues),
+        "issues_by_group": grouped,
+    }
+
+
+async def _cmd_prebuilt_check(args: argparse.Namespace) -> int:
+    contract = _builder_contract(args)
+    payload = {
+        "action": "prebuilt check",
+        "dry_run": bool(args.dry_run),
+        "volume_name": contract.volume_name,
+        "data_center_id": contract.data_center_id,
+        "attention_profile": contract.attention_profile,
+        "gpu_type": args.gpu_type,
+        "container_disk_gb": args.container_disk_gb,
+        "min_memory_gb": args.min_memory_gb,
+        "python_version": contract.python_version,
+        "manifest_path": manifest_path(contract),
+        "target_handoff": _prebuilt_target_summary(args),
+    }
+    if args.dry_run:
+        payload["no_credentials_required"] = True
+        payload["would_probe"] = [
+            "manifest",
+            "worker_env",
+            "vibecomfy_env",
+            "custom_nodes",
+            "extra_model_paths",
+            "workflow_source",
+            "schema",
+            "assets",
+        ]
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    api_key = _resolve_api_key(args)
+    pod_obj: Pod | None = None
+    ssh: SSHClient | None = None
+    try:
+        with _prebuilt_phase("provision_prebuilt_check_pod", volume=contract.volume_name):
+            pod_obj = await _launch_prebuilt_probe_pod(
+                args, api_key=api_key, contract=contract, action="check"
+            )
+        with _prebuilt_phase("open_ssh", pod_id=pod_obj.id):
+            ssh = await _connect_builder_ssh(pod_obj)
+        manifest = await asyncio.to_thread(read_manifest, ssh, contract)
+        enriched_manifest = _selected_enriched_manifest_from_args(args)
+        if manifest is None:
+            report = build_missing_manifest_health_report(
+                contract,
+                reason=(
+                    f"No prebuilt manifest found at {manifest_path(contract)}. "
+                    "Build or repair the prebuilt volume before running validation."
+                ),
+                targets_path=str(args.targets_json) if args.targets_json else None,
+                enriched_path=str(args.enriched_targets_json) if args.enriched_targets_json else None,
+            )
+        else:
+            with _prebuilt_phase("extract_prebuilt_runtime", pod_id=pod_obj.id):
+                try:
+                    await asyncio.to_thread(
+                        _exec_check,
+                        ssh,
+                        "bash -lc " + _quote(_extract_prebuilt_runtime_shell(contract)),
+                        timeout=1800,
+                    )
+                except Exception as exc:  # noqa: BLE001 - persist health evidence for early failures
+                    report = build_error_health_report(
+                        contract,
+                        group="environment",
+                        code="bundle_extract_failed",
+                        reason=f"Failed to extract prebuilt bundles: {type(exc).__name__}: {exc}",
+                        targets_path=str(args.targets_json) if args.targets_json else None,
+                        enriched_path=str(args.enriched_targets_json) if args.enriched_targets_json else None,
+                        detail={"manifest_path": manifest_path(contract)},
+                    )
+                else:
+                    with _prebuilt_phase("run_prebuilt_health_probes", pod_id=pod_obj.id):
+                        report = await asyncio.to_thread(
+                            run_prebuilt_health_probes,
+                            ssh,
+                            contract,
+                            manifest,
+                            targets_path=str(args.targets_json) if args.targets_json else None,
+                            enriched_path=str(args.enriched_targets_json) if args.enriched_targets_json else None,
+                            enriched_manifest=enriched_manifest,
+                        )
+        with _prebuilt_phase("write_health_report", path=health_path(contract)):
+            await asyncio.to_thread(write_health_report, ssh, contract, report)
+        result = _health_summary(report)
+        result.update(
+            {
+                "action": "prebuilt check",
+                "pod_id": pod_obj.id,
+                "volume_name": contract.volume_name,
+                "health_path": health_path(contract),
+            }
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if report.ok else 1
+    finally:
+        if ssh is not None:
+            try:
+                ssh.disconnect()
+            except Exception:
+                pass
+        if pod_obj is not None:
+            try:
+                with _prebuilt_phase("terminate_prebuilt_check_pod", pod_id=pod_obj.id):
+                    await pod_obj.terminate()
+            except Exception as exc:
+                print(f"warning: failed to terminate prebuilt check pod {pod_obj.id}: {exc}", file=sys.stderr)
+
+
+async def _cmd_prebuilt_status(args: argparse.Namespace) -> int:
+    prefixes = _prefixes_from_args(args)
+    if args.dry_run:
+        print(
+            json.dumps(
+                {
+                    "action": "prebuilt status",
+                    "dry_run": True,
+                    "no_credentials_required": True,
+                    "prefixes": list(prefixes),
+                    "json": bool(args.json),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    api_key = _resolve_api_key(args)
+    pods = await _list_prebuilt_pods(api_key, prefixes)
+    if args.json:
+        print(json.dumps([_pod_summary_dict(pod) for pod in pods], default=str, indent=2))
+        return 0
+    _print_table(
+        [_summary_to_row(pod) for pod in pods],
+        ["ID", "NAME", "STATUS", "GPU", "UPTIME", "COST"],
+    )
+    _print_cost(pods)
+    return 0
+
+
+async def _cmd_prebuilt_cleanup(args: argparse.Namespace) -> int:
+    prefixes = _prefixes_from_args(args)
+    if args.dry_run:
+        print(
+            json.dumps(
+                {
+                    "action": "prebuilt cleanup",
+                    "dry_run": True,
+                    "no_credentials_required": True,
+                    "prefixes": list(prefixes),
+                    "older_than_seconds": args.older_than,
+                    "would_terminate_only_allowlisted_prefixes": True,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    if not args.yes:
+        print("error: prebuilt cleanup requires --yes outside --dry-run", file=sys.stderr)
+        return 2
+    api_key = _resolve_api_key(args)
+    pods = await _list_prebuilt_pods(api_key, prefixes)
+    if args.older_than is not None:
+        pods = [
+            pod
+            for pod in pods
+            if pod.uptime_seconds is not None and pod.uptime_seconds >= args.older_than
+        ]
+    terminated: list[str] = []
+    failed: list[dict[str, str]] = []
+    for pod in pods:
+        if not any((pod.name or "").startswith(prefix) for prefix in prefixes):
+            failed.append({"pod_id": pod.id, "error": "name did not match allowlisted prefix"})
+            continue
+        try:
+            await discovery.terminate(pod.id, api_key)
+            terminated.append(pod.id)
+        except Exception as exc:  # noqa: BLE001 - continue cleanup and report all failures
+            failed.append({"pod_id": pod.id, "error": str(exc)})
+    result = {
+        "action": "prebuilt cleanup",
+        "prefixes": list(prefixes),
+        "terminated": terminated,
+        "failed": failed,
+    }
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        for pod_id in terminated:
+            print(f"terminated {pod_id}")
+        for item in failed:
+            print(f"failed {item['pod_id']}: {item['error']}", file=sys.stderr)
+    return 1 if failed else 0
+
+
+async def _cmd_prebuilt_reconcile(args: argparse.Namespace) -> int:
+    contract = _builder_contract(args)
+    handoff = _prebuilt_target_summary(args)
+    payload: dict[str, Any] = {
+        "action": "prebuilt reconcile",
+        "dry_run": bool(args.dry_run),
+        "volume_name": contract.volume_name,
+        "data_center_id": contract.data_center_id,
+        "attention_profile": contract.attention_profile,
+        "target_handoff": handoff,
+        "fetch_plan": [],
+    }
+    if args.enriched_targets_json:
+        payload["fetch_plan"] = _asset_fetch_plan(
+            _asset_entries_from_enriched_manifest(_read_json_path(args.enriched_targets_json))
+        )
+    elif args.asset_manifest:
+        payload["fetch_plan"] = _asset_fetch_plan(
+            _asset_entries_from_manifest(_read_json_path(args.asset_manifest))
+        )
+    elif args.targets_json:
+        output_hint = str(Path(args.targets_json).with_suffix(".enriched.json"))
+        payload["requires_enrichment"] = True
+        payload["remediation"] = (
+            "Generate enriched metadata before reconciling assets: "
+            f"vibecomfy workflows enrich-targets --targets-json {args.targets_json} "
+            f"--output {output_hint}"
+            + (f" --models-root {args.models_root}" if args.models_root else "")
+        )
+        if args.local_vibecomfy_dir:
+            payload["local_enrichment_command"] = (
+                f"cd {args.local_vibecomfy_dir} && python -m vibecomfy.cli workflows enrich-targets "
+                f"--targets-json {args.targets_json} --output {output_hint}"
+                + (f" --models-root {args.models_root}" if args.models_root else "")
+            )
+    if args.dry_run:
+        payload["no_credentials_required"] = True
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    if not payload["fetch_plan"]:
+        payload["status"] = "blocked"
+        payload["message"] = (
+            "Non-dry-run reconcile requires --enriched-targets-json or --asset-manifest with explicit assets. "
+            "Plain --targets-json must be enriched first."
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
+        return 2
+    api_key = _resolve_api_key(args)
+    pod_obj: Pod | None = None
+    ssh: SSHClient | None = None
+    reconciled: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    try:
+        with _prebuilt_phase("provision_prebuilt_reconcile_pod", volume=contract.volume_name):
+            pod_obj = await _launch_prebuilt_probe_pod(
+                args, api_key=api_key, contract=contract, action="reconcile"
+            )
+        with _prebuilt_phase("open_ssh", pod_id=pod_obj.id):
+            ssh = await _connect_builder_ssh(pod_obj)
+        for asset in payload["fetch_plan"]:
+            expected_path = asset.get("expected_path")
+            url = asset.get("url")
+            name = asset.get("name")
+            if not expected_path or not url:
+                failed.append(
+                    {
+                        "name": name,
+                        "error": "asset is missing expected_path or url; cannot reconcile without guessing",
+                    }
+                )
+                continue
+            script = (
+                "set -euo pipefail\n"
+                f"if [ -f {_quote(str(expected_path))} ]; then\n"
+                "  echo present\n"
+                "  exit 0\n"
+                "fi\n"
+                f"mkdir -p {_quote(str(Path(str(expected_path)).parent))}\n"
+                f"curl -L --fail {_quote(str(url))} -o {_quote(str(expected_path))}\n"
+                "echo fetched\n"
+            )
+            exit_code, stdout, stderr = await asyncio.to_thread(
+                ssh.execute_command,
+                "bash -lc " + _quote(script),
+                7200,
+            )
+            if exit_code == 0:
+                reconciled.append(
+                    {
+                        "name": name,
+                        "expected_path": expected_path,
+                        "status": (stdout or "").strip().splitlines()[-1] if stdout.strip() else "ok",
+                    }
+                )
+            else:
+                failed.append(
+                    {
+                        "name": name,
+                        "expected_path": expected_path,
+                        "error": _redact_sensitive_text(_stderr_excerpt(stderr)),
+                    }
+                )
+        result = {
+            "action": "prebuilt reconcile",
+            "pod_id": pod_obj.id,
+            "volume_name": contract.volume_name,
+            "reconciled": reconciled,
+            "failed": failed,
+        }
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 1 if failed else 0
+    finally:
+        if ssh is not None:
+            try:
+                ssh.disconnect()
+            except Exception:
+                pass
+        if pod_obj is not None:
+            try:
+                with _prebuilt_phase("terminate_prebuilt_reconcile_pod", pod_id=pod_obj.id):
+                    await pod_obj.terminate()
+            except Exception as exc:
+                print(f"warning: failed to terminate prebuilt reconcile pod {pod_obj.id}: {exc}", file=sys.stderr)
 
 
 async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
@@ -631,11 +1217,13 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
             if not gpu:
                 raise RuntimeError(f"GPU type not found: {args.gpu_type!r}")
             volumes = await asyncio.to_thread(get_network_volumes, api_key)
-            volume_id: str | None = None
-            for entry in volumes or []:
-                if str(entry.get("name") or "") == contract.volume_name:
-                    volume_id = str(entry.get("id") or "")
-                    break
+            selected_volume = select_prebuilt_volume(
+                volumes or [],
+                profile=contract.attention_profile,
+                data_center_id=contract.data_center_id,
+                volume_name=contract.volume_name,
+            )
+            volume_id = str((selected_volume or {}).get("id") or "")
             if not volume_id:
                 raise RuntimeError(
                     f"Network volume {contract.volume_name!r} not found in datacenter "
@@ -692,6 +1280,19 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
             )
             await asyncio.to_thread(
                 _exec_check, ssh, "bash -lc " + _quote(script), timeout=3600
+            )
+
+        with _prebuilt_phase("verify_worker_python", expected=contract.python_version):
+            await asyncio.to_thread(
+                _exec_check,
+                ssh,
+                "bash -lc "
+                + _quote(
+                    _worker_python_version_probe_shell(
+                        f"{_BUILDER_VENV_PATH}/bin/python", contract.python_version
+                    )
+                ),
+                timeout=120,
             )
 
         with _prebuilt_phase("install_vibecomfy", workdir=_BUILDER_VIBECOMFY_DIR):
@@ -1190,7 +1791,10 @@ def build_parser() -> argparse.ArgumentParser:
         "build",
         help="Provision a builder pod and bake the prebuilt env onto the named volume.",
     )
-    p_pb_build.add_argument("--volume-name", required=True)
+    p_pb_build.add_argument(
+        "--volume-name",
+        help="Prebuilt network volume name. Defaults to the canonical name for --attention-profile and --data-center.",
+    )
     p_pb_build.add_argument("--data-center", required=True)
     p_pb_build.add_argument(
         "--attention-profile", choices=["portable", "sage"], default="portable"
@@ -1228,10 +1832,72 @@ def build_parser() -> argparse.ArgumentParser:
         help="Continue past lock-busy errors (use only when previous build crashed).",
     )
 
+    p_pb_check = prebuilt_sub.add_parser(
+        "check",
+        help="Check a prebuilt validation environment before expensive workflow runs.",
+    )
+    p_pb_check.add_argument(
+        "--volume-name",
+        help="Prebuilt network volume name. Defaults to the canonical name for --attention-profile and --data-center.",
+    )
+    p_pb_check.add_argument("--data-center", required=True)
+    p_pb_check.add_argument("--attention-profile", choices=["portable", "sage"], default="portable")
+    p_pb_check.add_argument("--gpu-type", default="NVIDIA GeForce RTX 4090")
+    p_pb_check.add_argument("--container-disk-gb", type=int, default=100)
+    p_pb_check.add_argument(
+        "--min-memory-gb",
+        type=int,
+        default=16,
+        help="Minimum host RAM for the short-lived probe pod; default keeps health checks launchable.",
+    )
+    p_pb_check.add_argument("--python-version", default="3.10")
+    p_pb_check.add_argument("--targets-json", type=Path, help="Selected Reigh target manifest JSON.")
+    p_pb_check.add_argument("--asset-manifest", type=Path, help="Optional enriched asset manifest JSON.")
+    p_pb_check.add_argument("--enriched-targets-json", type=Path, help="VibeComfy enriched target manifest JSON.")
+    p_pb_check.add_argument("--local-vibecomfy-dir", type=Path, help="Local VibeComfy checkout for enrichment handoff.")
+    p_pb_check.add_argument("--models-root", type=Path, help="Model root used for local enrichment expectations.")
+    p_pb_check.add_argument("--dry-run", action="store_true")
+
+    p_pb_status = prebuilt_sub.add_parser(
+        "status",
+        help="List validation pods launched by the prebuilt tooling allowlist.",
+    )
+    p_pb_status.add_argument(
+        "--prefix",
+        action="append",
+        choices=list(_PREBUILT_CLEANUP_PREFIXES),
+        help="Allowlisted validation pod prefix to include. Repeatable; defaults to builder and prebuilt prefixes.",
+    )
+    p_pb_status.add_argument("--json", action="store_true")
+    p_pb_status.add_argument("--dry-run", action="store_true")
+
+    p_pb_cleanup = prebuilt_sub.add_parser(
+        "cleanup",
+        help="Terminate only allowlisted validation pods launched by prebuilt tooling.",
+    )
+    p_pb_cleanup.add_argument(
+        "--prefix",
+        action="append",
+        choices=list(_PREBUILT_CLEANUP_PREFIXES),
+        help="Allowlisted validation pod prefix to clean. Repeatable; defaults to builder and prebuilt prefixes.",
+    )
+    p_pb_cleanup.add_argument(
+        "--older-than",
+        type=_parse_duration,
+        default=None,
+        help="Only terminate validation pods with uptime >= this duration (e.g. 1h, 30m, 90s).",
+    )
+    p_pb_cleanup.add_argument("--yes", "-y", action="store_true", help="Required outside --dry-run.")
+    p_pb_cleanup.add_argument("--json", action="store_true")
+    p_pb_cleanup.add_argument("--dry-run", action="store_true")
+
     p_pb_inspect = prebuilt_sub.add_parser(
         "inspect", help="Provision a probe pod, attach the volume, print its manifest."
     )
-    p_pb_inspect.add_argument("--volume-name", required=True)
+    p_pb_inspect.add_argument(
+        "--volume-name",
+        help="Prebuilt network volume name. Defaults to the canonical name for --attention-profile and --data-center.",
+    )
     p_pb_inspect.add_argument("--data-center", required=True)
     p_pb_inspect.add_argument("--attention-profile", choices=["portable", "sage"], default="portable")
     p_pb_inspect.add_argument("--gpu-type", default="NVIDIA GeForce RTX 4090")
@@ -1243,7 +1909,10 @@ def build_parser() -> argparse.ArgumentParser:
         "invalidate",
         help="Remove the manifest and both bundles from the volume (preserves models/ and build.lock).",
     )
-    p_pb_invalidate.add_argument("--volume-name", required=True)
+    p_pb_invalidate.add_argument(
+        "--volume-name",
+        help="Prebuilt network volume name. Defaults to the canonical name for --attention-profile and --data-center.",
+    )
     p_pb_invalidate.add_argument("--data-center", required=True)
     p_pb_invalidate.add_argument("--attention-profile", choices=["portable", "sage"], default="portable")
     p_pb_invalidate.add_argument("--gpu-type", default="NVIDIA GeForce RTX 4090")
@@ -1256,6 +1925,33 @@ def build_parser() -> argparse.ArgumentParser:
         "list", help="Enumerate RunPod network volumes matching the prebuilt prefix."
     )
     p_pb_list.add_argument("--json", action="store_true")
+
+    p_pb_reconcile = prebuilt_sub.add_parser(
+        "reconcile",
+        help="Plan or reconcile selected model assets for a prebuilt validation environment.",
+    )
+    p_pb_reconcile.add_argument(
+        "--volume-name",
+        help="Prebuilt network volume name. Defaults to the canonical name for --attention-profile and --data-center.",
+    )
+    p_pb_reconcile.add_argument("--data-center", required=True)
+    p_pb_reconcile.add_argument("--attention-profile", choices=["portable", "sage"], default="portable")
+    p_pb_reconcile.add_argument("--gpu-type", default="NVIDIA GeForce RTX 4090")
+    p_pb_reconcile.add_argument("--container-disk-gb", type=int, default=100)
+    p_pb_reconcile.add_argument(
+        "--min-memory-gb",
+        type=int,
+        default=16,
+        help="Minimum host RAM for the short-lived probe pod; default keeps asset reconciliation launchable.",
+    )
+    p_pb_reconcile.add_argument("--python-version", default="3.10")
+    p_pb_reconcile.add_argument("--targets-json", type=Path, help="Selected Reigh target manifest JSON.")
+    p_pb_reconcile.add_argument("--asset-manifest", type=Path, help="Asset manifest JSON with explicit assets.")
+    p_pb_reconcile.add_argument("--enriched-targets-json", type=Path, help="VibeComfy enriched target manifest JSON.")
+    p_pb_reconcile.add_argument("--local-vibecomfy-dir", type=Path, help="Local VibeComfy checkout for enrichment handoff.")
+    p_pb_reconcile.add_argument("--models-root", type=Path, help="Model root used for local enrichment expectations.")
+    p_pb_reconcile.add_argument("--dry-run", action="store_true")
+    p_pb_reconcile.add_argument("--json", action="store_true", help="Reserved for symmetry; output is JSON.")
 
     return parser
 

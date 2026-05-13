@@ -25,6 +25,110 @@ def test_cli_help_runs(capsys: pytest.CaptureFixture[str]) -> None:
     assert "list" in out and "find-orphans" in out and "terminate" in out
 
 
+def test_prebuilt_help_lists_validation_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.build_parser().parse_args(["prebuilt", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    for subcommand in ("check", "status", "cleanup", "reconcile"):
+        assert subcommand in out
+
+
+def test_prebuilt_dry_run_commands_do_not_require_api_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    enriched = tmp_path / "enriched.json"
+    enriched.write_text(json.dumps({"targets": []}), encoding="utf-8")
+
+    commands = [
+        ["prebuilt", "check", "--data-center", "EUR-NO-1", "--dry-run"],
+        ["prebuilt", "status", "--dry-run"],
+        ["prebuilt", "cleanup", "--dry-run"],
+        [
+            "prebuilt",
+            "reconcile",
+            "--data-center",
+            "EUR-NO-1",
+            "--dry-run",
+            "--enriched-targets-json",
+            str(enriched),
+        ],
+    ]
+    for argv in commands:
+        assert cli.main(argv) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["dry_run"] is True
+        assert payload["no_credentials_required"] is True
+        if argv[1] == "check":
+            assert payload["min_memory_gb"] == 16
+
+
+def test_prebuilt_reconcile_plain_targets_blocks_before_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    targets = tmp_path / "targets.json"
+    targets.write_text(json.dumps({"targets": [{"template_id": "image/z_image"}]}), encoding="utf-8")
+
+    rc = cli.main([
+        "prebuilt",
+        "reconcile",
+        "--data-center",
+        "EUR-NO-1",
+        "--targets-json",
+        str(targets),
+    ])
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["status"] == "blocked"
+    assert "Plain --targets-json must be enriched first" in payload["message"]
+
+
+def test_prebuilt_reconcile_dry_run_local_enrichment_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    targets = tmp_path / "targets.json"
+    targets.write_text(json.dumps({"targets": [{"template_id": "image/z_image"}]}), encoding="utf-8")
+
+    rc = cli.main([
+        "prebuilt",
+        "reconcile",
+        "--data-center",
+        "US-TX-1",
+        "--dry-run",
+        "--targets-json",
+        str(targets),
+        "--local-vibecomfy-dir",
+        "/opt/vibecomfy",
+        "--models-root",
+        "/workspace/reigh-livetest-prebuilt/models",
+    ])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["requires_enrichment"] is True
+    assert "vibecomfy workflows enrich-targets" in payload["remediation"]
+    assert payload["local_enrichment_command"].startswith("cd /opt/vibecomfy")
+
+
+def test_prebuilt_cleanup_rejects_unallowlisted_prefix() -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.build_parser().parse_args([
+            "prebuilt",
+            "cleanup",
+            "--prefix",
+            "user-owned-pod-",
+            "--dry-run",
+        ])
+    assert exc.value.code == 2
+
+
 def test_cli_missing_api_key_exits(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
     monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)

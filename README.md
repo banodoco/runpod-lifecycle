@@ -138,6 +138,75 @@ asyncio.run(main())
 
 Results are price-ranked; GPU types without current secure-cloud availability are dropped.
 
+## Reigh Prebuilt Validation Environment
+
+`rl prebuilt ...` manages the reusable RunPod volume used by Reigh VibeComfy
+live validation. The default target is a portable RTX 4090 profile. Larger GPU
+types can be requested with `--gpu-type`, and `--attention-profile sage` is an
+explicit opt-in profile; SageAttention failures must not block the portable
+profile.
+
+Canonical volume names are derived from the actual RunPod `dataCenterId`:
+
+```text
+reigh-livetest-prebuilt-<attention-profile>-<normalized-data-center-id>
+```
+
+For example, a RunPod `dataCenterId` of `EUR-NO-1` maps to
+`reigh-livetest-prebuilt-portable-eur-no-1`. Treat that as an example, not a
+hard-coded region.
+
+Common sequence:
+
+```bash
+# Build or refresh a portable volume in a chosen RunPod data center.
+rl prebuilt build --data-center <DATA_CENTER_ID> --attention-profile portable
+
+# Cheap no-credential contract checks. These must not launch pods.
+rl prebuilt check --data-center <DATA_CENTER_ID> --dry-run
+rl prebuilt status --dry-run
+rl prebuilt cleanup --dry-run
+
+# Emit selected targets in reigh-worker, then enrich them in VibeComfy.
+python -m scripts.live_test.main --variant fresh --backend vibecomfy \
+  --case z_image_turbo --emit-targets-json /tmp/reigh-targets.json
+python -m vibecomfy.cli workflows enrich-targets \
+  --targets-json /tmp/reigh-targets.json \
+  --output /tmp/reigh-targets.enriched.json \
+  --models-root /workspace/reigh-livetest-prebuilt/models
+
+# Check the real prebuilt environment before expensive workflow runs.
+rl prebuilt check --data-center <DATA_CENTER_ID> \
+  --enriched-targets-json /tmp/reigh-targets.enriched.json
+```
+
+`check` writes `env.health.json` on the prebuilt volume. Its grouped issues
+separate environment setup, custom nodes, workflow source, schema, assets, and
+runtime-deferred work. Missing model diagnostics include the asset name,
+category/path, paths checked, URL when known, and remediation text.
+
+Reconcile behavior is deliberately conservative:
+
+```bash
+# Plain target JSON does not contain enough asset metadata; this prints the
+# enrichment command instead of guessing.
+rl prebuilt reconcile --data-center <DATA_CENTER_ID> --dry-run \
+  --targets-json /tmp/reigh-targets.json
+
+# Enriched targets or an explicit asset manifest may produce a fetch plan.
+rl prebuilt reconcile --data-center <DATA_CENTER_ID> --dry-run \
+  --enriched-targets-json /tmp/reigh-targets.enriched.json
+rl prebuilt reconcile --data-center <DATA_CENTER_ID> \
+  --enriched-targets-json /tmp/reigh-targets.enriched.json
+```
+
+`status` and `cleanup` only operate on validation pod prefixes
+`reigh-livetest-builder-` and `reigh-livetest-prebuilt-`. `cleanup` requires
+`--yes` outside `--dry-run` and must never be used for unrelated user pods.
+Use `rl prebuilt list` to inspect matching network volumes and
+`rl prebuilt invalidate --data-center <DATA_CENTER_ID> --attention-profile portable`
+when the bundle contract should be rebuilt from scratch.
+
 ## Config Reference
 
 | field | env var | default | description |
