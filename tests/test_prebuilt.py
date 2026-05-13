@@ -151,7 +151,8 @@ def test_vibecomfy_builder_install_pins_cuda124_torch_after_custom_nodes():
 
     torch_pin = (
         "uv pip install --python /opt/build/vibecomfy/.venv/bin/python "
-        "--index-url https://download.pytorch.org/whl/cu124 torch torchvision torchaudio"
+        "--index-url https://download.pytorch.org/whl/cu124 --force-reinstall "
+        "torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0"
     )
     assert body.count(torch_pin) == 2
     assert "expected VibeComfy torch CUDA 12.4" in body

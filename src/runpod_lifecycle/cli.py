@@ -504,8 +504,8 @@ def _vibecomfy_install_builder_shell(
     venv_path = python_path.rsplit("/bin/python", 1)[0]
     py = _quote(python_path)
     torch_cuda124 = (
-        f"uv pip install --python {py} --index-url https://download.pytorch.org/whl/cu124 "
-        "torch torchvision torchaudio\n"
+        f"uv pip install --python {py} --index-url https://download.pytorch.org/whl/cu124 --force-reinstall "
+        "torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0\n"
         f"{py} - <<'PY'\n"
         "import torch\n"
         "if torch.version.cuda != '12.4':\n"
