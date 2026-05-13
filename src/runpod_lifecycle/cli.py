@@ -799,12 +799,17 @@ def _asset_entries_from_manifest(payload: Any) -> list[dict[str, Any]]:
 
 def _asset_fetch_plan(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     plan: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
     for entry in entries:
         name = entry.get("name")
         if not isinstance(name, str) or not name:
             continue
         expected_path = entry.get("expected_path")
         url = entry.get("url")
+        key = (name, str(expected_path or ""), str(url or ""))
+        if key in seen:
+            continue
+        seen.add(key)
         plan.append(
             {
                 "name": name,

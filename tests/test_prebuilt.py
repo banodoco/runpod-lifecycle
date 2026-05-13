@@ -588,6 +588,31 @@ def test_selected_assets_from_enriched_manifest_deduplicates_same_template_asset
     ]
 
 
+def test_asset_fetch_plan_deduplicates_repeated_template_assets():
+    plan = cli._asset_fetch_plan(
+        [
+            {
+                "template_id": "image/z_image",
+                "name": "z_image_bf16.safetensors",
+                "category": "diffusion_models",
+                "expected_path": "/models/diffusion_models/z_image_bf16.safetensors",
+                "url": "https://example.invalid/z_image_bf16.safetensors",
+            },
+            {
+                "template_id": "image/z_image_img2img",
+                "name": "z_image_bf16.safetensors",
+                "category": "diffusion_models",
+                "expected_path": "/models/diffusion_models/z_image_bf16.safetensors",
+                "url": "https://example.invalid/z_image_bf16.safetensors",
+            },
+        ]
+    )
+
+    assert len(plan) == 1
+    assert plan[0]["name"] == "z_image_bf16.safetensors"
+    assert plan[0]["expected_path"] == "/models/diffusion_models/z_image_bf16.safetensors"
+
+
 def test_enriched_manifest_without_errors_records_runtime_deferred_info():
     issues = health_issues_from_enriched_manifest(
         {
