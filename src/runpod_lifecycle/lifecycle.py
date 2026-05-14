@@ -288,4 +288,70 @@ async def launch(
     raise error
 
 
-__all__ = ["find_gpu_type", "get_network_volumes", "launch"]
+async def launch_when_available(
+    config: RunPodConfig,
+    *,
+    name: str | None = None,
+    hooks: EventHooks | None = None,
+    max_wait_sec: int = 900,
+    retry_interval_sec: int = 30,
+) -> Pod:
+    """Keep trying to claim the requested launch matrix until capacity appears.
+
+    This is for cost-sensitive jobs that should wait for a specific cheaper GPU
+    and attached network volume instead of immediately escalating to a more
+    expensive candidate. It retries the exact same ``launch`` request until it
+    succeeds or the bounded wait expires.
+    """
+    if max_wait_sec <= 0:
+        return await launch(config, name=name, hooks=hooks)
+    if retry_interval_sec <= 0:
+        raise ValueError("retry_interval_sec must be positive")
+
+    hooks = hooks or EventHooks()
+    deadline = time.monotonic() + max_wait_sec
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return await launch(config, name=name, hooks=hooks)
+        except LaunchFailure as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await _emit_error(
+                    hooks,
+                    exc,
+                    {
+                        "name": name,
+                        "attempts": attempt,
+                        "max_wait_sec": max_wait_sec,
+                        "retry_interval_sec": retry_interval_sec,
+                    },
+                )
+                raise LaunchFailure(
+                    f"Capacity did not become available after {attempt} attempts "
+                    f"over {max_wait_sec}s: {exc}"
+                ) from exc
+            sleep_for = min(retry_interval_sec, max(0.0, remaining))
+            logger.warning(
+                "Launch attempt %s failed; retrying in %.1fs before escalating or failing: %s",
+                attempt,
+                sleep_for,
+                exc,
+            )
+            await _emit_state(
+                hooks,
+                None,
+                PodState.PROVISIONING,
+                {
+                    "name": name,
+                    "attempt": attempt,
+                    "retry_in_sec": sleep_for,
+                    "max_wait_sec": max_wait_sec,
+                    "last_error": str(exc),
+                },
+            )
+            await asyncio.sleep(sleep_for)
+
+
+__all__ = ["find_gpu_type", "get_network_volumes", "launch", "launch_when_available"]

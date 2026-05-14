@@ -46,7 +46,7 @@ from .prebuilt import (
     write_health_report,
     write_manifest,
 )
-from .lifecycle import find_gpu_type, get_network_volumes, launch
+from .lifecycle import find_gpu_type, get_network_volumes, launch, launch_when_available
 from .pod import Pod
 from .probe import probe
 from .runner import ShipAndRunResult, ship_and_run, ship_and_run_detached
@@ -72,6 +72,7 @@ __all__ = [
     "ship_and_run",
     "ship_and_run_detached",
     "launch",
+    "launch_when_available",
     "probe",
     "find_gpu_type",
     "get_network_volumes",

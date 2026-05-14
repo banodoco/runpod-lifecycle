@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 from . import api, config as cfg, discovery
 from .config import RunPodConfig
 from .guard import PodGuard, install_signal_handlers
-from .lifecycle import find_gpu_type, get_network_volumes, launch as _launch
+from .lifecycle import find_gpu_type, get_network_volumes, launch as _launch, launch_when_available as _launch_when_available
 from .pod import Pod
 from .prebuilt import (
     PrebuiltEnvContract,
@@ -219,7 +219,15 @@ async def _cmd_launch(args: argparse.Namespace) -> int:
     """Launch a new RunPod pod. With --detach, prints details and exits 0."""
     config = _resolve_config(args)
     name = getattr(args, "name", None)
-    pod = await _launch(config, name=name)
+    if getattr(args, "wait_capacity", None):
+        pod = await _launch_when_available(
+            config,
+            name=name,
+            max_wait_sec=args.wait_capacity,
+            retry_interval_sec=args.retry_interval,
+        )
+    else:
+        pod = await _launch(config, name=name)
     await pod.wait_ready(timeout=getattr(args, "timeout", 600))
 
     ssh_details = await pod._ensure_ssh_details()
@@ -1757,6 +1765,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_launch.add_argument("--storage-name", help="Network volume name to attach.")
     p_launch.add_argument("--timeout", type=int, default=600, help="Seconds to wait for pod readiness.")
     p_launch.add_argument("--datacenter-id", help="Datacenter ID (e.g. US-TX-1).")
+    p_launch.add_argument(
+        "--wait-capacity",
+        type=int,
+        default=0,
+        help="Seconds to keep retrying the requested GPU/storage matrix before failing.",
+    )
+    p_launch.add_argument(
+        "--retry-interval",
+        type=int,
+        default=30,
+        help="Seconds between --wait-capacity launch attempts.",
+    )
 
     p_exec = sub.add_parser("exec", help="Execute a command on an existing pod via SSH.")
     p_exec.add_argument("pod_id")

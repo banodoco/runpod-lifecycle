@@ -7,7 +7,7 @@ import pytest
 
 from runpod_lifecycle.errors import LaunchFailure
 from runpod_lifecycle.events import EventHooks, PodState
-from runpod_lifecycle.lifecycle import launch
+from runpod_lifecycle.lifecycle import launch, launch_when_available
 from runpod_lifecycle.pod import Pod
 
 
@@ -81,6 +81,98 @@ def test_launch_uses_ram_tier_fallback(base_config, monkeypatch: pytest.MonkeyPa
 
     assert pod._ram_tier == 32
     assert [call.kwargs["min_memory_in_gb"] for call in create_pod_mock.call_args_list] == [64, 64, 32]
+
+
+def test_launch_when_available_retries_until_capacity_appears(
+    base_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_pod_mock = MagicMock(
+        side_effect=[
+            RuntimeError("no longer any instances available"),
+            RuntimeError("no longer any instances available"),
+            RuntimeError("no longer any instances available"),
+            RuntimeError("no longer any instances available"),
+            {"id": "pod-claimed"},
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.find_gpu_type",
+        lambda gpu_type, api_key: {"id": "gpu-1", "displayName": gpu_type},
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.get_storage_volume_id",
+        lambda api_key, storage_name: {"vol-a": "id-a", "vol-b": "id-b"}[storage_name],
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.check_and_expand_storage",
+        lambda *args, **kwargs: {"ok": True},
+    )
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", create_pod_mock)
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.asyncio.sleep", fake_sleep)
+
+    pod = asyncio.run(
+        launch_when_available(
+            base_config.merge(ram_tiers=(64,), storage_volumes=()),
+            name="wait-for-4090",
+            max_wait_sec=120,
+            retry_interval_sec=10,
+        )
+    )
+
+    assert pod.id == "pod-claimed"
+    assert sleeps == [10, 10, 10, 10]
+    assert create_pod_mock.call_count == 5
+
+
+def test_launch_when_available_times_out_after_bounded_retries(
+    base_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_pod_mock = MagicMock(side_effect=RuntimeError("no longer any instances available"))
+    clock = {"value": 0.0}
+    sleeps: list[float] = []
+
+    def fake_monotonic() -> float:
+        return clock["value"]
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["value"] += seconds
+
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.find_gpu_type",
+        lambda gpu_type, api_key: {"id": "gpu-1", "displayName": gpu_type},
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.get_storage_volume_id",
+        lambda api_key, storage_name: {"vol-a": "id-a", "vol-b": "id-b"}[storage_name],
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.check_and_expand_storage",
+        lambda *args, **kwargs: {"ok": True},
+    )
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", create_pod_mock)
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(LaunchFailure, match="Capacity did not become available"):
+        asyncio.run(
+            launch_when_available(
+                base_config.merge(ram_tiers=(64,), storage_volumes=()),
+                name="wait-timeout",
+                max_wait_sec=15,
+                retry_interval_sec=10,
+            )
+        )
+
+    assert sleeps == [10, 5]
+    assert create_pod_mock.call_count == 3
 
 
 def test_launch_falls_back_to_second_storage_within_tier(
