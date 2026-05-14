@@ -92,6 +92,33 @@ cfg = RunPodConfig.from_env(
 pod = await launch(cfg)
 ```
 
+### Waiting For Cheaper Capacity
+
+When cost matters more than launching immediately, use `launch_when_available()`
+or the CLI `--wait-capacity` flag. This retries the exact requested GPU, RAM
+tier, and network-volume matrix for a bounded period before failing, so a
+validation job can wait for an RTX 4090 slot instead of silently escalating to a
+more expensive GPU.
+
+```python
+from runpod_lifecycle import RunPodConfig, launch_when_available
+
+cfg = RunPodConfig.from_env(
+    gpu_type="NVIDIA GeForce RTX 4090",
+    storage_name="reigh-livetest-prebuilt-portable-eur-no-1",
+)
+pod = await launch_when_available(cfg, max_wait_sec=900, retry_interval_sec=60)
+```
+
+```bash
+runpod-lifecycle launch \
+  --gpu-type "NVIDIA GeForce RTX 4090" \
+  --storage-name reigh-livetest-prebuilt-portable-eur-no-1 \
+  --wait-capacity 900 \
+  --retry-interval 60 \
+  --detach
+```
+
 For direct file transport or other low-level SSH work, `Pod.open_ssh_client()` returns a connected `paramiko`-compatible client. Callers are responsible for closing the returned client when they are done with it.
 
 ### Detached runs on an existing pod
