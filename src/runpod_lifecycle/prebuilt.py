@@ -544,8 +544,13 @@ def _probe_sageattention(ssh, contract: PrebuiltEnvContract) -> list[PrebuiltHea
         f"cd {_quote(contract.runtime_vibecomfy_path)}\n"
         f"{_quote(python_path)} - <<'PY'\n"
         "import sageattention\n"
+        "import sageattention.core as core\n"
         "if not callable(getattr(sageattention, 'sageattn', None)):\n"
         "    raise SystemExit('sageattn callable missing')\n"
+        "cuda_version = core.get_cuda_version()\n"
+        "if cuda_version < (12, 8):\n"
+        "    raise SystemExit(f'SageAttention-ada fast path requires CUDA >= 12.8, got {cuda_version}')\n"
+        "print('sageattention fast path validated', cuda_version)\n"
         "PY\n"
     )
     exit_code, _stdout, stderr = _ssh_execute(
@@ -560,7 +565,7 @@ def _probe_sageattention(ssh, contract: PrebuiltEnvContract) -> list[PrebuiltHea
         _health_issue(
             "environment",
             "sageattention_unavailable",
-            "SageAttention profile requested but sageattention could not be imported/validated.",
+            "SageAttention profile requested but the VibeComfy runtime is not fast-path capable.",
             detail={"stderr": _stderr_excerpt(stderr)},
         )
     ]
@@ -627,10 +632,11 @@ config = default_configuration()
 config.extra_model_paths_config = [str(Path({path!r}).resolve())]
 folders = FolderNames(is_root=True)
 init_default_paths(folders, config, replace_existing=True)
-expected = {contract.models_path!r} + "/vae"
-paths = list(folders["vae"].paths)
-if expected not in paths:
-    raise SystemExit(f"expected {{expected}} in vae paths, got {{paths!r}}")
+for folder_name in ("vae", "latent_upscale_models"):
+    expected = {contract.models_path!r} + "/" + folder_name
+    paths = list(folders[folder_name].paths)
+    if expected not in paths:
+        raise SystemExit(f"expected {{expected}} in {{folder_name}} paths, got {{paths!r}}")
 print("extra_model_paths_ok")
 """
     check_command = (
@@ -877,6 +883,7 @@ def run_prebuilt_health_probes(
 ) -> PrebuiltHealthReport:
     """Run grouped health probes against an attached/extracted prebuilt pod."""
     expected_cuda = _torch_cuda_expected_for_extra(manifest.cuda_extra)
+    vibecomfy_expected_cuda = "12.8" if contract.attention_profile == "sage" else expected_cuda
     worker_env = _probe_python_env_report(
         ssh,
         label="worker",
@@ -906,7 +913,7 @@ def run_prebuilt_health_probes(
             vibecomfy_env,
             group="environment",
             expected_python=None,
-            expected_cuda=expected_cuda,
+            expected_cuda=vibecomfy_expected_cuda,
         )
     )
     issues.extend(_probe_sageattention(ssh, contract))

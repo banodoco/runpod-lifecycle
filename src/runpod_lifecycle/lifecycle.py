@@ -174,6 +174,8 @@ async def _try_launch_one_gpu(
                 ram_tier=ram_tier,
                 storage_volume=storage_volume_id,
             )
+            pod._gpu_type = gpu_type
+            pod._storage_name = storage_name
             await _emit_state(
                 hooks,
                 pod.id,

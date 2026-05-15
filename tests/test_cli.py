@@ -282,6 +282,87 @@ def test_cli_probe_table_format(
     assert "$0.770" in out
 
 
+def test_resolve_config_accepts_storage_volume_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "k")
+    monkeypatch.setenv("RUNPOD_STORAGE_NAME", "primary")
+    monkeypatch.setenv("RUNPOD_STORAGE_VOLUMES", "env-a, env-b")
+
+    args = cli.build_parser().parse_args([
+        "launch",
+        "--storage-volumes",
+        "cli-a, cli-b",
+        "--gpu-type",
+        "NVIDIA L40S",
+        "--min-memory-gb",
+        "16",
+        "--ram-tiers",
+        "32, 24, 16",
+    ])
+
+    config = cli._resolve_config(args)
+    assert config.storage_name == "primary"
+    assert config.storage_volumes == ("cli-a", "cli-b")
+    assert config.gpu_type == "NVIDIA L40S"
+    assert config.min_memory_gb == 16
+    assert config.ram_tiers == (32, 24, 16)
+
+
+def test_launch_probe_only_terminates_claimed_pod(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "k")
+    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+
+    class FakePod:
+        id = "pod-probe"
+        name = "probe-name"
+        _gpu_type = "NVIDIA L4"
+        _ram_tier = 32
+        _storage_name = "portable"
+        _storage_volume = "vol-123"
+
+        def __init__(self) -> None:
+            self.terminated = False
+
+        async def terminate(self) -> None:
+            self.terminated = True
+
+    launched: dict[str, object] = {}
+
+    async def fake_launch(config, *, name=None):
+        launched["config"] = config
+        launched["name"] = name
+        return FakePod()
+
+    monkeypatch.setattr("runpod_lifecycle.cli._launch", fake_launch)
+
+    rc = cli.main([
+        "launch",
+        "--probe-only",
+        "--name",
+        "claim-test",
+        "--gpu-type",
+        "NVIDIA L4,NVIDIA RTX A5000",
+        "--storage-name",
+        "primary",
+        "--storage-volumes",
+        "portable, fallback",
+    ])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["pod_id"] == "pod-probe"
+    assert payload["terminated"] is True
+    assert payload["selected_gpu_type"] == "NVIDIA L4"
+    assert payload["selected_storage_name"] == "portable"
+    assert payload["gpu_type_candidates"] == ["NVIDIA L4", "NVIDIA RTX A5000"]
+    assert payload["storage_candidates"] == ["primary", "portable", "fallback"]
+    assert launched["name"] == "claim-test"
+
+
 def test_cli_terminate_yes_skips_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "k")
     monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)

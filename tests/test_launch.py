@@ -48,6 +48,8 @@ def test_launch_happy_path_returns_pod_and_emits_provisioning(
     assert pod.id == "pod-123"
     assert pod._ram_tier == 64
     assert pod._storage_volume == "id-a"
+    assert pod._gpu_type == base_config.gpu_type_candidates[0]
+    assert pod._storage_name == "vol-a"
     assert events[0] == (None, PodState.PROVISIONING.value, {"name": "happy-pod"})
     assert create_pod_mock.call_count == 1
     assert create_pod_mock.call_args.kwargs["min_memory_in_gb"] == 64

@@ -67,14 +67,60 @@ def _coalesce_blank(value: str | None) -> str | None:
     return stripped or None
 
 
+def _parse_csv_values(value: str | None) -> tuple[str, ...]:
+    if value is None or value.strip() == "":
+        return ()
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def _parse_csv_ints(value: str | None) -> tuple[int, ...]:
+    if value is None or value.strip() == "":
+        return ()
+    values: list[int] = []
+    for part in value.split(","):
+        stripped = part.strip()
+        if stripped:
+            values.append(int(stripped))
+    return tuple(values)
+
+
+def _unique_values(values: list[str | None] | tuple[str | None, ...]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _resolve_storage_volumes(args: argparse.Namespace) -> tuple[str, ...]:
+    cli_values = _parse_csv_values(getattr(args, "storage_volumes", None))
+    env_values = _parse_csv_values(os.getenv("RUNPOD_STORAGE_VOLUMES"))
+    return cli_values or env_values
+
+
+def _resolve_gpu_type(args: argparse.Namespace) -> str | tuple[str, ...]:
+    cli_values = _parse_csv_values(getattr(args, "gpu_type", None))
+    if len(cli_values) == 1:
+        return cli_values[0]
+    if cli_values:
+        return cli_values
+    return os.getenv("RUNPOD_GPU_TYPE", cfg.DEFAULT_GPU_TYPE)
+
+
 def _resolve_config(args: argparse.Namespace) -> RunPodConfig:
     api_key = _resolve_api_key(args)
     arg_storage = _coalesce_blank(getattr(args, "storage_name", None))
     env_storage = _coalesce_blank(os.getenv("RUNPOD_STORAGE_NAME"))
+    storage_volumes = _resolve_storage_volumes(args)
+    ram_tiers = _parse_csv_ints(getattr(args, "ram_tiers", None)) or _parse_csv_ints(
+        os.getenv("RUNPOD_RAM_TIERS")
+    ) or cfg.DEFAULT_RAM_TIERS
     return RunPodConfig(
         api_key=api_key,
-        gpu_type=getattr(args, "gpu_type", None)
-        or os.getenv("RUNPOD_GPU_TYPE", cfg.DEFAULT_GPU_TYPE),
+        gpu_type=_resolve_gpu_type(args),
         worker_image=getattr(args, "image", None)
         or os.getenv("RUNPOD_WORKER_IMAGE", cfg.DEFAULT_WORKER_IMAGE),
         container_disk_gb=getattr(args, "container_disk_gb", None)
@@ -83,7 +129,11 @@ def _resolve_config(args: argparse.Namespace) -> RunPodConfig:
         or os.getenv("RUNPOD_NAME_PREFIX", "pod"),
         disk_size_gb=getattr(args, "disk_size_gb", None)
         or int(os.getenv("RUNPOD_DISK_SIZE_GB", "200")),
+        min_memory_gb=getattr(args, "min_memory_gb", None)
+        or int(os.getenv("RUNPOD_MIN_MEMORY_GB", "32")),
+        ram_tiers=ram_tiers,
         storage_name=arg_storage or env_storage,
+        storage_volumes=storage_volumes,
     )
 
 
@@ -219,6 +269,7 @@ async def _cmd_launch(args: argparse.Namespace) -> int:
     """Launch a new RunPod pod. With --detach, prints details and exits 0."""
     config = _resolve_config(args)
     name = getattr(args, "name", None)
+    pod: Pod | None = None
     if getattr(args, "wait_capacity", None):
         pod = await _launch_when_available(
             config,
@@ -228,6 +279,29 @@ async def _cmd_launch(args: argparse.Namespace) -> int:
         )
     else:
         pod = await _launch(config, name=name)
+
+    if getattr(args, "probe_only", False):
+        info = {
+            "pod_id": pod.id,
+            "name": pod.name,
+            "selected_gpu_type": getattr(pod, "_gpu_type", None),
+            "selected_ram_tier_gb": getattr(pod, "_ram_tier", None),
+            "selected_storage_name": getattr(pod, "_storage_name", None),
+            "selected_storage_volume_id": getattr(pod, "_storage_volume", None),
+            "gpu_type_candidates": list(config.gpu_type_candidates),
+            "storage_candidates": _unique_values([config.storage_name, *config.storage_volumes]),
+            "terminated": False,
+        }
+        try:
+            await pod.terminate()
+            info["terminated"] = True
+            print(json.dumps(info, indent=2))
+            return 0
+        except Exception as exc:
+            info["terminate_error"] = str(exc)
+            print(json.dumps(info, indent=2), file=sys.stderr)
+            return 1
+
     await pod.wait_ready(timeout=getattr(args, "timeout", 600))
 
     ssh_details = await pod._ensure_ssh_details()
@@ -562,13 +636,22 @@ def _vibecomfy_install_builder_shell(
     """Render the post-clone VibeComfy install body the builder pod will execute."""
     venv_path = python_path.rsplit("/bin/python", 1)[0]
     py = _quote(python_path)
-    torch_cuda124 = (
-        f"uv pip install --python {py} --index-url https://download.pytorch.org/whl/cu124 --force-reinstall "
-        "torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0\n"
+    if attention_profile == "sage":
+        torch_index = "https://download.pytorch.org/whl/cu128"
+        torch_packages = "torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1"
+        expected_cuda = "12.8"
+    else:
+        torch_index = "https://download.pytorch.org/whl/cu124"
+        torch_packages = "torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0"
+        expected_cuda = "12.4"
+    torch_cuda = (
+        f"uv pip install --python {py} --index-url {torch_index} --force-reinstall "
+        f"{torch_packages}\n"
+        f"uv pip install --python {py} 'numpy<2.3,>=1.24.4'\n"
         f"{py} - <<'PY'\n"
         "import torch\n"
-        "if torch.version.cuda != '12.4':\n"
-        "    raise RuntimeError(f'expected VibeComfy torch CUDA 12.4, got {torch.version.cuda!r}')\n"
+        f"if torch.version.cuda != {expected_cuda!r}:\n"
+        f"    raise RuntimeError(f'expected VibeComfy torch CUDA {expected_cuda}, got {{torch.version.cuda!r}}')\n"
         "print('vibecomfy torch cuda', torch.version.cuda)\n"
         "PY\n"
     )
@@ -576,13 +659,16 @@ def _vibecomfy_install_builder_shell(
     if attention_profile == "sage":
         sage_block = (
             "rm -rf /tmp/sageattention\n"
-            "git clone --depth 1 https://github.com/thu-ml/SageAttention.git /tmp/sageattention\n"
+            "git clone --depth 1 https://github.com/fblissjr/SageAttention-ada.git /tmp/sageattention\n"
             f"uv pip install --python {py} --no-build-isolation /tmp/sageattention\n"
             f"{py} - <<'PY'\n"
             "import sageattention\n"
+            "import sageattention.core as core\n"
             "if not callable(getattr(sageattention, 'sageattn', None)):\n"
             "    raise RuntimeError('sageattention import succeeded but sageattn is missing')\n"
-            "print('sageattention verified')\n"
+            "if core.get_cuda_version() < (12, 8):\n"
+            "    raise RuntimeError(f'SageAttention-ada fast path requires CUDA >= 12.8, got {core.get_cuda_version()}')\n"
+            "print('sageattention verified', core.get_cuda_version())\n"
             "PY\n"
         )
     return (
@@ -591,12 +677,12 @@ def _vibecomfy_install_builder_shell(
         f"uv pip install --python {py} "
         "'comfyui@git+https://github.com/peteromallet/ComfyUI.git@fix/latentupscale-model-mmap-residency' "
         "'comfy-script[default]'\n"
-        f"{torch_cuda124}"
+        f"{torch_cuda}"
         f"{sage_block}"
         f"cd {_quote(workdir)}\n"
         "test -f custom_nodes.lock\n"
         f"{py} -m vibecomfy.cli nodes restore --lockfile custom_nodes.lock\n"
-        f"{torch_cuda124}"
+        f"{torch_cuda}"
         f"test -f {_quote(workdir)}/template_index.json\n"
         f"test -f {_quote(workdir)}/workflow_corpus/manifests/coverage.json\n"
     )
@@ -777,6 +863,7 @@ def _extract_prebuilt_runtime_shell(contract: PrebuiltEnvContract) -> str:
         "  controlnet: controlnet\n"
         "  diffusion_models: diffusion_models\n"
         "  embeddings: embeddings\n"
+        "  latent_upscale_models: latent_upscale_models\n"
         "  loras: loras\n"
         "  style_models: style_models\n"
         "  text_encoders: text_encoders\n"
@@ -1128,13 +1215,20 @@ async def _cmd_prebuilt_reconcile(args: argparse.Namespace) -> int:
     api_key = _resolve_api_key(args)
     pod_obj: Pod | None = None
     ssh: SSHClient | None = None
+    terminate_pod = True
     reconciled: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     try:
-        with _prebuilt_phase("provision_prebuilt_reconcile_pod", volume=contract.volume_name):
-            pod_obj = await _launch_prebuilt_probe_pod(
-                args, api_key=api_key, contract=contract, action="reconcile"
-            )
+        if args.pod_id:
+            terminate_pod = False
+            with _prebuilt_phase("attach_prebuilt_reconcile_pod", pod_id=args.pod_id):
+                pod_obj = await discovery.get_pod(args.pod_id, _resolve_config(args))
+                await pod_obj.wait_ready(timeout=60)
+        else:
+            with _prebuilt_phase("provision_prebuilt_reconcile_pod", volume=contract.volume_name):
+                pod_obj = await _launch_prebuilt_probe_pod(
+                    args, api_key=api_key, contract=contract, action="reconcile"
+                )
         with _prebuilt_phase("open_ssh", pod_id=pod_obj.id):
             ssh = await _connect_builder_ssh(pod_obj)
         total_assets = len(payload["fetch_plan"])
@@ -1236,7 +1330,7 @@ async def _cmd_prebuilt_reconcile(args: argparse.Namespace) -> int:
                 ssh.disconnect()
             except Exception:
                 pass
-        if pod_obj is not None:
+        if pod_obj is not None and terminate_pod:
             try:
                 with _prebuilt_phase("terminate_prebuilt_reconcile_pod", pod_id=pod_obj.id):
                     await pod_obj.terminate()
@@ -1253,6 +1347,9 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
         return 2
     contract = _builder_contract(args)
     pod_name = f"{_BUILDER_POD_PREFIX}{_builder_timestamp_label()}"
+    build_gpu_type = _resolve_gpu_type(args)
+    build_ram_tiers = _parse_csv_ints(getattr(args, "ram_tiers", None)) or cfg.DEFAULT_RAM_TIERS
+    build_min_memory_gb = int(getattr(args, "min_memory_gb", 32) or 32)
 
     if args.dry_run:
         print(
@@ -1267,6 +1364,10 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
                     "worker_ref": args.worker_ref,
                     "vibecomfy_ref": args.vibecomfy_ref,
                     "python_version": contract.python_version,
+                    "gpu_type": build_gpu_type,
+                    "min_memory_gb": build_min_memory_gb,
+                    "ram_tiers": list(build_ram_tiers),
+                    "capacity_wait_sec": int(getattr(args, "capacity_wait_sec", 0) or 0),
                     "container_disk_gb": args.container_disk_gb,
                     "volume_disk_gb": args.volume_disk_gb,
                     "cache_root": contract.cache_root,
@@ -1284,11 +1385,8 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
     lock_release = None
     try:
         with _prebuilt_phase(
-            "provision_builder_pod", name=pod_name, gpu_type=args.gpu_type
+            "provision_builder_pod", name=pod_name, gpu_type=build_gpu_type
         ):
-            gpu = await asyncio.to_thread(find_gpu_type, args.gpu_type, api_key)
-            if not gpu:
-                raise RuntimeError(f"GPU type not found: {args.gpu_type!r}")
             volumes = await asyncio.to_thread(get_network_volumes, api_key)
             selected_volume = select_prebuilt_volume(
                 volumes or [],
@@ -1304,14 +1402,24 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
                 )
             config = RunPodConfig(
                 api_key=api_key,
-                gpu_type=args.gpu_type,
+                gpu_type=build_gpu_type,
                 worker_image=_RUNPOD_BASE_IMAGE,
                 container_disk_gb=args.container_disk_gb,
                 name_prefix=_BUILDER_POD_PREFIX,
                 disk_size_gb=args.volume_disk_gb,
+                min_memory_gb=build_min_memory_gb,
+                ram_tiers=build_ram_tiers,
                 storage_name=contract.volume_name,
             )
-            pod_obj = await _launch(config, name=pod_name)
+            if getattr(args, "capacity_wait_sec", 0):
+                pod_obj = await _launch_when_available(
+                    config,
+                    name=pod_name,
+                    max_wait_sec=int(args.capacity_wait_sec),
+                    retry_interval_sec=int(args.capacity_retry_interval_sec),
+                )
+            else:
+                pod_obj = await _launch(config, name=pod_name)
             await pod_obj.wait_ready(timeout=900)
 
         with _prebuilt_phase("open_ssh", pod_id=pod_obj.id):
@@ -1761,10 +1869,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_launch.add_argument("--image", help="Docker image (default: pytorch devel).")
     p_launch.add_argument("--container-disk-gb", type=int, default=200, help="Container disk size GB.")
     p_launch.add_argument("--disk-size-gb", type=int, default=200, help="Pod disk size GB.")
+    p_launch.add_argument("--min-memory-gb", type=int, help="Minimum host RAM GB for launch fallback.")
+    p_launch.add_argument(
+        "--ram-tiers",
+        help="Comma-separated host RAM tiers to try, e.g. 32,24,16. Defaults to RUNPOD_RAM_TIERS.",
+    )
     p_launch.add_argument("--name-prefix", help="Prefix for auto-generated pod name.")
     p_launch.add_argument("--storage-name", help="Network volume name to attach.")
+    p_launch.add_argument(
+        "--storage-volumes",
+        help=(
+            "Comma-separated network volume names to try after --storage-name. "
+            "Defaults to RUNPOD_STORAGE_VOLUMES."
+        ),
+    )
     p_launch.add_argument("--timeout", type=int, default=600, help="Seconds to wait for pod readiness.")
     p_launch.add_argument("--datacenter-id", help="Datacenter ID (e.g. US-TX-1).")
+    p_launch.add_argument(
+        "--probe-only",
+        action="store_true",
+        help="Claim the first launchable GPU/storage/RAM candidate, print it, and immediately terminate it.",
+    )
     p_launch.add_argument(
         "--wait-capacity",
         type=int,
@@ -1892,6 +2017,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_pb_build.add_argument("--vibecomfy-ref", default="main")
     p_pb_build.add_argument(
         "--gpu-type", default="NVIDIA GeForce RTX 4090", help="GPU type to provision the builder pod with."
+    )
+    p_pb_build.add_argument("--min-memory-gb", type=int, default=32)
+    p_pb_build.add_argument(
+        "--ram-tiers",
+        help="Comma-separated host RAM tiers to try for the builder pod, e.g. 32,24,16.",
+    )
+    p_pb_build.add_argument(
+        "--capacity-wait-sec",
+        type=int,
+        default=0,
+        help="Seconds to keep retrying the requested builder GPU/storage matrix before failing.",
+    )
+    p_pb_build.add_argument(
+        "--capacity-retry-interval-sec",
+        type=int,
+        default=30,
+        help="Seconds between builder capacity retries.",
     )
     p_pb_build.add_argument(
         "--container-disk-gb",
@@ -2041,6 +2183,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum host RAM for the short-lived probe pod; default keeps asset reconciliation launchable.",
     )
     p_pb_reconcile.add_argument("--python-version", default="3.10")
+    p_pb_reconcile.add_argument("--pod-id", help="Reuse an existing pod attached to the prebuilt volume; do not terminate it.")
     p_pb_reconcile.add_argument("--targets-json", type=Path, help="Selected Reigh target manifest JSON.")
     p_pb_reconcile.add_argument("--asset-manifest", type=Path, help="Asset manifest JSON with explicit assets.")
     p_pb_reconcile.add_argument("--enriched-targets-json", type=Path, help="VibeComfy enriched target manifest JSON.")

@@ -79,7 +79,8 @@ If `storage_name` is unset and `storage_volumes` is empty, `launch()` creates a 
 `gpu_type` accepts a single string (backwards-compatible) or an ordered list of
 candidates. `launch()` tries each in turn and returns the first that provisions;
 if every candidate is exhausted, a `LaunchFailure` aggregates the per-candidate
-reasons. The env var `RUNPOD_GPU_TYPE` accepts a comma-separated list.
+reasons. The env var `RUNPOD_GPU_TYPE` accepts a comma-separated list. The CLI
+`--gpu-type` flag accepts the same comma-separated form.
 
 ```python
 cfg = RunPodConfig.from_env(
@@ -117,6 +118,22 @@ runpod-lifecycle launch \
   --wait-capacity 900 \
   --retry-interval 60 \
   --detach
+```
+
+When you need to discover where capacity can actually be claimed, use
+`--storage-volumes` with `--probe-only`. This walks the same GPU x RAM x storage
+matrix as a real launch, prints the selected candidate, and immediately
+terminates the claimed pod.
+
+```bash
+runpod-lifecycle launch \
+  --gpu-type "NVIDIA RTX A5000,NVIDIA L4,NVIDIA A40,NVIDIA L40S,NVIDIA GeForce RTX 4090" \
+  --storage-volumes "Peter,Training,EU-NO-1,EU-CZ-1,reigh-livetest-prebuilt-portable-eur-no-1" \
+  --min-memory-gb 16 \
+  --ram-tiers "32,24,16" \
+  --wait-capacity 900 \
+  --retry-interval 60 \
+  --probe-only
 ```
 
 For direct file transport or other low-level SSH work, `Pod.open_ssh_client()` returns a connected `paramiko`-compatible client. Callers are responsible for closing the returned client when they are done with it.
@@ -188,6 +205,15 @@ Common sequence:
 ```bash
 # Build or refresh a portable volume in a chosen RunPod data center.
 rl prebuilt build --data-center <DATA_CENTER_ID> --attention-profile portable
+
+# When cheaper capacity is intermittent, let the builder wait across candidates.
+rl prebuilt build \
+  --volume-name EUR-IS-1 \
+  --data-center EUR-IS-1 \
+  --gpu-type "NVIDIA L4,NVIDIA RTX A5000,NVIDIA GeForce RTX 4090" \
+  --min-memory-gb 16 \
+  --ram-tiers "32,24,16" \
+  --capacity-wait-sec 900
 
 # Cheap no-credential contract checks. These must not launch pods.
 rl prebuilt check --data-center <DATA_CENTER_ID> --dry-run

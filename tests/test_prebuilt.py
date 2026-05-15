@@ -170,6 +170,25 @@ def test_vibecomfy_builder_install_pins_cuda124_torch_after_custom_nodes():
     assert body.index("nodes restore --lockfile custom_nodes.lock") < body.rindex(torch_pin)
 
 
+def test_vibecomfy_builder_sage_profile_requires_cuda128_fast_path():
+    body = cli._vibecomfy_install_builder_shell(
+        "/opt/build/vibecomfy",
+        python_path="/opt/build/vibecomfy/.venv/bin/python",
+        attention_profile="sage",
+    )
+
+    torch_pin = (
+        "uv pip install --python /opt/build/vibecomfy/.venv/bin/python "
+        "--index-url https://download.pytorch.org/whl/cu128 --force-reinstall "
+        "torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1"
+    )
+    assert body.count(torch_pin) == 2
+    assert "expected VibeComfy torch CUDA 12.8" in body
+    assert "numpy<2.3,>=1.24.4" in body
+    assert "github.com/fblissjr/SageAttention-ada.git" in body
+    assert "SageAttention-ada fast path requires CUDA >= 12.8" in body
+
+
 def test_worker_python_version_probe_shell_enforces_exact_major_minor():
     body = cli._worker_python_version_probe_shell(
         "/opt/reigh-worker-live-test-venv/bin/python",
@@ -289,6 +308,7 @@ def test_prebuilt_extract_installs_required_system_tools():
     assert body.index("apt-get install") < body.index("tar --use-compress-program zstd")
     assert "extra_model_paths.yaml" in body
     assert f"base_path: {contract.models_path}" in body
+    assert "latent_upscale_models: latent_upscale_models" in body
 
 
 def test_prebuilt_manifest_uv_probe_uses_bootstrapped_path():
