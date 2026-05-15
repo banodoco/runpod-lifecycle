@@ -516,6 +516,7 @@ _BUILDER_VOLUME_MOUNT_PATH = "/workspace"
 _REIGH_WORKER_REPO_URL = "https://github.com/banodoco/Reigh-Worker.git"
 _VIBECOMFY_REPO_URL = "https://github.com/peteromallet/VibeComfy.git"
 _RUNPOD_BASE_IMAGE = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
+_SAGE_RUNPOD_BASE_IMAGE = "pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel"
 _VENV_BUNDLE_NAME = "venv.cuda124.tar.zst"
 _VIBECOMFY_BUNDLE_NAME = "vibecomfy.tar.zst"
 _MANIFEST_BUNDLE_FORMAT_VERSION = 1
@@ -558,6 +559,13 @@ def _builder_contract(args: argparse.Namespace) -> PrebuiltEnvContract:
         python_version=args.python_version,
         bundle_format_version=_MANIFEST_BUNDLE_FORMAT_VERSION,
     )
+
+
+def _prebuilt_builder_image(attention_profile: str) -> str:
+    """Return the container image whose system CUDA matches the prebuilt profile."""
+    if attention_profile == "sage":
+        return _SAGE_RUNPOD_BASE_IMAGE
+    return _RUNPOD_BASE_IMAGE
 
 
 def _quote(value: str) -> str:
@@ -1407,7 +1415,7 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
             config = RunPodConfig(
                 api_key=api_key,
                 gpu_type=build_gpu_type,
-                worker_image=_RUNPOD_BASE_IMAGE,
+                worker_image=_prebuilt_builder_image(args.attention_profile),
                 container_disk_gb=args.container_disk_gb,
                 name_prefix=_BUILDER_POD_PREFIX,
                 disk_size_gb=args.volume_disk_gb,

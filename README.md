@@ -206,6 +206,14 @@ Common sequence:
 # Build or refresh a portable volume in a chosen RunPod data center.
 rl prebuilt build --data-center <DATA_CENTER_ID> --attention-profile portable
 
+# LTX guide/Sage validation needs a CUDA 12.8 builder/runtime, not just an
+# importable sageattention package inside the portable CUDA 12.4 image.
+rl prebuilt build \
+  --attention-profile sage \
+  --storage-volumes "Peter,EU-NO-1,EU-CZ-1,EUR-IS-1,Training" \
+  --gpu-type "NVIDIA GeForce RTX 4090" \
+  --capacity-wait-sec 3600
+
 # When cheaper capacity is intermittent, let the builder wait across candidates.
 rl prebuilt build \
   --volume-name EUR-IS-1 \

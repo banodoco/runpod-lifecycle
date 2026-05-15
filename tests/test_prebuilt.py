@@ -189,6 +189,11 @@ def test_vibecomfy_builder_sage_profile_requires_cuda128_fast_path():
     assert "SageAttention-ada fast path requires CUDA >= 12.8" in body
 
 
+def test_sage_prebuilt_builder_uses_cuda128_devel_image():
+    assert cli._prebuilt_builder_image("sage") == "pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel"
+    assert cli._prebuilt_builder_image("portable") == cli._RUNPOD_BASE_IMAGE
+
+
 def test_worker_python_version_probe_shell_enforces_exact_major_minor():
     body = cli._worker_python_version_probe_shell(
         "/opt/reigh-worker-live-test-venv/bin/python",
