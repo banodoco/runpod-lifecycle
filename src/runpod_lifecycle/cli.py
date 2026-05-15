@@ -1424,16 +1424,36 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
                 storage_name=contract.volume_name if not build_storage_volumes else args.volume_name,
                 storage_volumes=build_storage_volumes,
             )
-            if getattr(args, "capacity_wait_sec", 0):
-                pod_obj = await _launch_when_available(
-                    config,
-                    name=pod_name,
-                    max_wait_sec=int(args.capacity_wait_sec),
-                    retry_interval_sec=int(args.capacity_retry_interval_sec),
-                )
-            else:
-                pod_obj = await _launch(config, name=pod_name)
-            await pod_obj.wait_ready(timeout=900)
+            capacity_wait_sec = int(getattr(args, "capacity_wait_sec", 0) or 0)
+            capacity_retry_interval_sec = int(getattr(args, "capacity_retry_interval_sec", 30) or 30)
+            ready_deadline = time.monotonic() + capacity_wait_sec
+            while True:
+                if capacity_wait_sec:
+                    remaining = max(1, int(ready_deadline - time.monotonic()))
+                    pod_obj = await _launch_when_available(
+                        config,
+                        name=pod_name,
+                        max_wait_sec=remaining,
+                        retry_interval_sec=capacity_retry_interval_sec,
+                    )
+                else:
+                    pod_obj = await _launch(config, name=pod_name)
+                try:
+                    await pod_obj.wait_ready(timeout=900)
+                    break
+                except Exception:
+                    failed_pod = pod_obj
+                    pod_obj = None
+                    try:
+                        await failed_pod.terminate()
+                    except Exception as terminate_exc:
+                        print(
+                            f"warning: failed to terminate unready builder pod {failed_pod.id}: {terminate_exc}",
+                            file=sys.stderr,
+                        )
+                    if not capacity_wait_sec or time.monotonic() >= ready_deadline:
+                        raise
+                    await asyncio.sleep(capacity_retry_interval_sec)
             selected_storage_name = getattr(pod_obj, "_storage_name", None)
             if selected_storage_name and selected_storage_name != contract.volume_name:
                 volumes_by_name = {str(v.get("name") or ""): v for v in (volumes or [])}
