@@ -724,22 +724,62 @@ def _bundle_directory_shell(*, source_parent: str, source_name: str, bundle_path
     )
 
 
-async def _connect_builder_ssh(pod: Pod) -> SSHClient:
-    """Block on pod readiness, then return a connected SSHClient instance."""
-    details = await pod._ensure_ssh_details()
-    client = SSHClient(
-        hostname=str(details["ip"]),
-        port=int(details["port"]),
-        username="root",
-        password=details.get("password"),
-        private_key_path=os.environ.get("REIGH_LIVE_TEST_SSH_KEY") or "~/.ssh/id_ed25519",
-    )
+async def _connect_builder_ssh(
+    pod: Pod,
+    *,
+    timeout_sec: int = 300,
+    retry_interval_sec: int = 10,
+) -> SSHClient:
+    """Return a connected SSH client, retrying after RunPod publishes a port.
 
-    def _connect() -> None:
-        client.connect()
+    RunPod can mark a pod RUNNING and expose the SSH port before the forwarded
+    socket is actually accepting connections. Treat that as readiness lag, not
+    as a failed build pod, and keep refreshing SSH details until the bounded
+    timeout expires.
+    """
+    deadline = time.monotonic() + timeout_sec
+    attempt = 0
+    last_error: Exception | None = None
 
-    await asyncio.to_thread(_connect)
-    return client
+    while True:
+        attempt += 1
+        details = await pod._ensure_ssh_details()
+        client = SSHClient(
+            hostname=str(details["ip"]),
+            port=int(details["port"]),
+            username="root",
+            password=details.get("password"),
+            private_key_path=os.environ.get("REIGH_LIVE_TEST_SSH_KEY") or "~/.ssh/id_ed25519",
+        )
+
+        def _connect() -> None:
+            client.connect()
+
+        try:
+            await asyncio.to_thread(_connect)
+            if attempt > 1:
+                print(f"ssh_ready pod_id={pod.id} attempts={attempt}", flush=True)
+            return client
+        except Exception as exc:  # noqa: BLE001 - paramiko/socket errors vary by platform
+            last_error = exc
+            with contextlib.suppress(Exception):
+                client.disconnect()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"SSH did not become reachable for pod {pod.id} within {timeout_sec}s "
+                    f"after {attempt} attempts: {last_error}"
+                ) from last_error
+            if attempt == 1 or attempt % 6 == 0:
+                print(
+                    f"ssh_wait pod_id={pod.id} attempt={attempt} "
+                    f"retry_in_sec={min(retry_interval_sec, max(1, int(remaining)))} "
+                    f"error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            # RunPod may rotate or delay port metadata during startup.
+            pod._ssh_details = None
+            await asyncio.sleep(min(retry_interval_sec, max(0.0, remaining)))
 
 
 async def _cmd_prebuilt(args: argparse.Namespace) -> int:

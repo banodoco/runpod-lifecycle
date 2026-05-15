@@ -142,6 +142,56 @@ def test_prebuilt_phase_accepts_name_field(capsys):
     assert "phase_done name=provision_builder_pod" in out
 
 
+def test_connect_builder_ssh_retries_until_forwarded_socket_is_ready(monkeypatch, capsys):
+    class FakePod:
+        id = "pod-ssh"
+        _ssh_details = None
+
+        def __init__(self):
+            self.detail_calls = 0
+
+        async def _ensure_ssh_details(self):
+            self.detail_calls += 1
+            self._ssh_details = {
+                "ip": "1.2.3.4",
+                "port": 2200 + self.detail_calls,
+                "password": "secret",
+            }
+            return self._ssh_details
+
+    class FakeSSHClient:
+        attempts = 0
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def connect(self):
+            FakeSSHClient.attempts += 1
+            if FakeSSHClient.attempts < 3:
+                raise OSError("connection refused")
+
+        def disconnect(self):
+            pass
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(cli, "SSHClient", FakeSSHClient)
+    monkeypatch.setattr(cli.asyncio, "sleep", no_sleep)
+
+    pod = FakePod()
+    client = asyncio.run(
+        cli._connect_builder_ssh(pod, timeout_sec=30, retry_interval_sec=1)
+    )
+
+    assert isinstance(client, FakeSSHClient)
+    assert FakeSSHClient.attempts == 3
+    assert pod.detail_calls == 3
+    out = capsys.readouterr().out
+    assert "ssh_wait pod_id=pod-ssh attempt=1" in out
+    assert "ssh_ready pod_id=pod-ssh attempts=3" in out
+
+
 def test_vibecomfy_builder_install_uses_separate_python311_venv():
     body = cli._vibecomfy_install_builder_shell(
         "/opt/build/vibecomfy",
