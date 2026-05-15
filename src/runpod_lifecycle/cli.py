@@ -1350,6 +1350,7 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
     build_gpu_type = _resolve_gpu_type(args)
     build_ram_tiers = _parse_csv_ints(getattr(args, "ram_tiers", None)) or cfg.DEFAULT_RAM_TIERS
     build_min_memory_gb = int(getattr(args, "min_memory_gb", 32) or 32)
+    build_storage_volumes = _resolve_storage_volumes(args)
 
     if args.dry_run:
         print(
@@ -1367,6 +1368,7 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
                     "gpu_type": build_gpu_type,
                     "min_memory_gb": build_min_memory_gb,
                     "ram_tiers": list(build_ram_tiers),
+                    "storage_volumes": list(build_storage_volumes),
                     "capacity_wait_sec": int(getattr(args, "capacity_wait_sec", 0) or 0),
                     "container_disk_gb": args.container_disk_gb,
                     "volume_disk_gb": args.volume_disk_gb,
@@ -1388,18 +1390,20 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
             "provision_builder_pod", name=pod_name, gpu_type=build_gpu_type
         ):
             volumes = await asyncio.to_thread(get_network_volumes, api_key)
-            selected_volume = select_prebuilt_volume(
-                volumes or [],
-                profile=contract.attention_profile,
-                data_center_id=contract.data_center_id,
-                volume_name=contract.volume_name,
-            )
-            volume_id = str((selected_volume or {}).get("id") or "")
-            if not volume_id:
-                raise RuntimeError(
-                    f"Network volume {contract.volume_name!r} not found in datacenter "
-                    f"{contract.data_center_id!r}. Use `runpod-lifecycle volumes create` first."
+            selected_volume = None
+            if not build_storage_volumes:
+                selected_volume = select_prebuilt_volume(
+                    volumes or [],
+                    profile=contract.attention_profile,
+                    data_center_id=contract.data_center_id,
+                    volume_name=contract.volume_name,
                 )
+                volume_id = str((selected_volume or {}).get("id") or "")
+                if not volume_id:
+                    raise RuntimeError(
+                        f"Network volume {contract.volume_name!r} not found in datacenter "
+                        f"{contract.data_center_id!r}. Use `runpod-lifecycle volumes create` first."
+                    )
             config = RunPodConfig(
                 api_key=api_key,
                 gpu_type=build_gpu_type,
@@ -1409,7 +1413,8 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
                 disk_size_gb=args.volume_disk_gb,
                 min_memory_gb=build_min_memory_gb,
                 ram_tiers=build_ram_tiers,
-                storage_name=contract.volume_name,
+                storage_name=contract.volume_name if not build_storage_volumes else args.volume_name,
+                storage_volumes=build_storage_volumes,
             )
             if getattr(args, "capacity_wait_sec", 0):
                 pod_obj = await _launch_when_available(
@@ -1421,6 +1426,19 @@ async def _cmd_prebuilt_build(args: argparse.Namespace) -> int:
             else:
                 pod_obj = await _launch(config, name=pod_name)
             await pod_obj.wait_ready(timeout=900)
+            selected_storage_name = getattr(pod_obj, "_storage_name", None)
+            if selected_storage_name and selected_storage_name != contract.volume_name:
+                volumes_by_name = {str(v.get("name") or ""): v for v in (volumes or [])}
+                selected_volume = volumes_by_name.get(str(selected_storage_name))
+                selected_data_center = str((selected_volume or {}).get("dataCenterId") or contract.data_center_id)
+                contract = PrebuiltEnvContract(
+                    volume_name=str(selected_storage_name),
+                    data_center_id=selected_data_center,
+                    attention_profile=args.attention_profile,
+                    comfyui_pin=getattr(args, "comfyui_pin", "fix/latentupscale-model-mmap-residency"),
+                    python_version=args.python_version,
+                    bundle_format_version=_MANIFEST_BUNDLE_FORMAT_VERSION,
+                )
 
         with _prebuilt_phase("open_ssh", pod_id=pod_obj.id):
             ssh = await _connect_builder_ssh(pod_obj)
@@ -2017,6 +2035,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_pb_build.add_argument("--vibecomfy-ref", default="main")
     p_pb_build.add_argument(
         "--gpu-type", default="NVIDIA GeForce RTX 4090", help="GPU type to provision the builder pod with."
+    )
+    p_pb_build.add_argument(
+        "--storage-volumes",
+        help="Comma-separated network volume names to try for the builder pod.",
     )
     p_pb_build.add_argument("--min-memory-gb", type=int, default=32)
     p_pb_build.add_argument(

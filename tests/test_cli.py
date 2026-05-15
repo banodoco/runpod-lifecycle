@@ -363,6 +363,19 @@ def test_launch_probe_only_terminates_claimed_pod(
     assert launched["name"] == "claim-test"
 
 
+def test_prebuilt_build_accepts_storage_volume_candidates() -> None:
+    args = cli.build_parser().parse_args([
+        "prebuilt",
+        "build",
+        "--data-center",
+        "EU-RO-1",
+        "--storage-volumes",
+        "Peter, EUR-IS-1",
+    ])
+
+    assert cli._resolve_storage_volumes(args) == ("Peter", "EUR-IS-1")
+
+
 def test_cli_terminate_yes_skips_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "k")
     monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
