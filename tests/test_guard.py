@@ -151,6 +151,66 @@ async def test_podguard_terminate_re_raises_other_errors() -> None:
 
 
 # ---------------------------------------------------------------------------
+# PodGuard.terminate — verify option
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_podguard_terminate_verify_true_confirms_terminated() -> None:
+    """verify=True with a non-active post-terminate status returns True."""
+    mock_pod = MagicMock()
+    mock_pod.id = "pod-test-verify-1"
+    mock_pod.terminate = AsyncMock()
+    mock_pod.status = AsyncMock(return_value={"desired_status": "TERMINATED"})
+
+    guard = PodGuard(name_prefix="test", auto_terminate=True)
+    guard.pod = mock_pod
+    guard._watchdog = None
+
+    with patch.object(asyncio, "sleep", new_callable=AsyncMock):
+        result = await guard.terminate(verify=True)
+
+    assert result is True
+    mock_pod.status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_podguard_terminate_verify_true_still_running_returns_false() -> None:
+    """verify=True with status still RUNNING/PROVISIONING returns False."""
+    mock_pod = MagicMock()
+    mock_pod.id = "pod-test-verify-2"
+    mock_pod.terminate = AsyncMock()
+    mock_pod.status = AsyncMock(return_value={"desired_status": "RUNNING"})
+
+    guard = PodGuard(name_prefix="test", auto_terminate=True)
+    guard.pod = mock_pod
+    guard._watchdog = None
+
+    with patch.object(asyncio, "sleep", new_callable=AsyncMock):
+        result = await guard.terminate(verify=True)
+
+    assert result is False
+    mock_pod.status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_podguard_terminate_verify_false_skips_status_check() -> None:
+    """verify=False (default) returns True without ever calling pod.status()."""
+    mock_pod = MagicMock()
+    mock_pod.id = "pod-test-verify-3"
+    mock_pod.terminate = AsyncMock()
+    mock_pod.status = AsyncMock(return_value={"desired_status": "RUNNING"})
+
+    guard = PodGuard(name_prefix="test", auto_terminate=True)
+    guard.pod = mock_pod
+    guard._watchdog = None
+
+    result = await guard.terminate()
+
+    assert result is True
+    mock_pod.status.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # guard_factory injection
 # ---------------------------------------------------------------------------
 

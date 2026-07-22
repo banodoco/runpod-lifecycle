@@ -46,19 +46,36 @@ class PodGuard:
         self.pod = pod
         self._start_watchdog()
 
-    async def terminate(self) -> None:
-        """Cancel the watchdog and terminate the bound pod (idempotent)."""
+    async def terminate(self, *, verify: bool = False, verify_delay: float = 3.0) -> bool:
+        """Cancel the watchdog and terminate the bound pod (idempotent).
+
+        When *verify* is True, waits `verify_delay` seconds then re-queries
+        the pod's status and returns whether it's confirmed no longer
+        RUNNING/PROVISIONING, instead of just trusting the terminate call
+        succeeded. Returns True when verified terminated (or, when
+        verify=False, whenever the terminate call itself didn't raise an
+        unhandled exception).
+        """
         if self._watchdog is not None:
             self._watchdog.cancel()
             self._watchdog = None
-        if self.pod is not None:
-            try:
-                await self.pod.terminate()
-            except Exception as exc:
-                if "not found" in str(exc).lower():
-                    print(f"pod_already_terminated={self.pod.id}", flush=True)
-                else:
-                    raise
+        if self.pod is None:
+            return True
+        try:
+            await self.pod.terminate()
+        except Exception as exc:
+            if "not found" in str(exc).lower():
+                print(f"pod_already_terminated={self.pod.id}", flush=True)
+            else:
+                raise
+        if not verify:
+            return True
+        await asyncio.sleep(verify_delay)
+        status = await self.pod.status()
+        return (status is None) or status.get("desired_status") not in {
+            "RUNNING",
+            "PROVISIONING",
+        }
 
     # ------------------------------------------------------------------
     # Internal watchdog
