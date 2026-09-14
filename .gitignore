@@ -1,9 +1,11 @@
 .env*
+astrid.env
 !env.example
 *.pyc
 __pycache__/
 .venv/
 venv/
+.claude/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

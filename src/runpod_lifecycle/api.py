@@ -6,7 +6,8 @@ import contextlib
 import io
 import logging
 import os
-from typing import Any
+import time
+from typing import Any, Callable, Sequence
 
 import httpx
 
@@ -19,6 +20,7 @@ logger = logging.getLogger("runpod_lifecycle.api")
 
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 NETWORK_VOLUMES_URL = "https://rest.runpod.io/v1/networkvolumes"
+PODS_URL = "https://rest.runpod.io/v1/pods"
 
 
 def _get_runpod() -> Any:
@@ -79,6 +81,40 @@ def get_network_volumes(api_key: str) -> list[dict[str, Any]]:
 
     logger.warning("Could not fetch network volumes from SDK, REST, or GraphQL")
     return []
+
+
+def list_pods(api_key: str) -> list[dict[str, Any]]:
+    """Return account pods, tolerating transient SDK GraphQL response gaps.
+
+    The RunPod SDK indexes ``response["data"]`` directly. Immediately after a
+    lifecycle mutation the GraphQL endpoint can transiently return a response
+    without that key, causing an otherwise harmless empty/list refresh to fail
+    with ``KeyError('data')``. The REST collection is the authoritative fallback
+    and also gives termination verification a transport independent of the
+    mutation call.
+    """
+    sdk = _get_runpod()
+    sdk.api_key = api_key
+    try:
+        pods = sdk.get_pods()
+        if isinstance(pods, list):
+            return pods
+        if pods is not None:
+            logger.warning("RunPod SDK returned unexpected pod collection: %r", type(pods).__name__)
+    except Exception as exc:
+        logger.warning("RunPod SDK get_pods failed; falling back to REST: %s", exc)
+
+    response = httpx.get(PODS_URL, headers=_auth_headers(api_key), timeout=30)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"RunPod pod listing failed: HTTP {response.status_code}: {response.text[:500]}"
+        )
+    payload = response.json()
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict) and isinstance(payload.get("pods"), list):
+        return payload["pods"]
+    raise RuntimeError(f"RunPod pod listing returned unexpected {type(payload).__name__} payload")
 
 
 def find_gpu_type(gpu_display_name: str, api_key: str) -> dict[str, Any] | None:
@@ -169,6 +205,162 @@ def create_pod(
         "gpu_type_id": gpu_type_id,
         "created": True,
     }
+
+
+_CAPACITY_ERROR_MARKERS = (
+    "no longer any instances available",
+    "there are no machines available",
+    "no longer have any instances",
+    "not enough capacity",
+    "out of stock",
+)
+
+
+def _is_capacity_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _CAPACITY_ERROR_MARKERS)
+
+
+def create_pod_with_fallbacks(
+    api_key: str,
+    gpu_type_candidates: Sequence[str],
+    image_name: str,
+    *,
+    name_prefix: str = "worker-pod",
+    volume_candidates: Sequence[str] = (),
+    volume_mount_path: str = "/workspace",
+    disk_in_gb: int = 20,
+    container_disk_in_gb: int = 10,
+    public_key_string: str | None = None,
+    env_vars: dict[str, str] | None = None,
+    min_vcpu_count: int = 8,
+    min_memory_in_gb: int = 32,
+    template_id: str | None = None,
+    ports: str | None = None,
+    max_full_passes: int = 5,
+    retry_sleep_seconds: float = 60.0,
+    on_attempt: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Create a pod, iterating (gpu_type, volume) combinations on capacity errors.
+
+    Resolves each candidate gpu_type display name once. Pre-loads the account's
+    network volumes once and matches them by name to volume_candidates. Then
+    iterates the cartesian product (gpu × volume, plus one no-volume slot if
+    nothing matched) until ``create_pod`` succeeds. RunPod capacity errors fall
+    back to the next combo. After a full pass exhausts every combo, sleeps
+    ``retry_sleep_seconds`` and retries the pass — up to ``max_full_passes``
+    times. Non-capacity errors abort immediately.
+
+    Returns the same dict shape as ``create_pod``, enriched with
+    ``selected_gpu_display_name`` and ``selected_volume_name`` so callers can
+    log which combo actually succeeded.
+    """
+    if not gpu_type_candidates:
+        raise ValueError("gpu_type_candidates must contain at least one GPU type")
+
+    resolved_gpus: list[tuple[str, str]] = []  # (display_name, gpu_type_id)
+    for candidate in gpu_type_candidates:
+        candidate_str = str(candidate).strip()
+        if not candidate_str:
+            continue
+        info = find_gpu_type(candidate_str, api_key)
+        if not info or not info.get("id"):
+            logger.warning("create_pod_with_fallbacks: GPU type not found in catalog: %r", candidate_str)
+            continue
+        resolved_gpus.append((str(info.get("displayName") or candidate_str), str(info["id"])))
+    if not resolved_gpus:
+        raise RuntimeError(f"None of the candidate GPU types resolved: {list(gpu_type_candidates)}")
+
+    volume_lookup: list[tuple[str | None, str | None]] = []  # (volume_name, volume_id)
+    if volume_candidates:
+        try:
+            available = get_network_volumes(api_key)
+            by_name = {v.get("name"): v.get("id") for v in available if v.get("name")}
+        except Exception as exc:
+            logger.warning("create_pod_with_fallbacks: could not list network volumes (%s)", exc)
+            by_name = {}
+        seen_volume_names: set[str] = set()
+        for name in volume_candidates:
+            if not name or name in seen_volume_names:
+                continue
+            seen_volume_names.add(name)
+            vid = by_name.get(name)
+            if vid:
+                volume_lookup.append((name, vid))
+    if not volume_lookup:
+        volume_lookup.append((None, None))
+
+    last_capacity_error: BaseException | None = None
+    total_attempts = 0
+    for full_pass in range(1, max_full_passes + 1):
+        for gpu_display, gpu_id in resolved_gpus:
+            for vol_name, vol_id in volume_lookup:
+                total_attempts += 1
+                if on_attempt is not None:
+                    try:
+                        on_attempt({
+                            "attempt": total_attempts,
+                            "pass": full_pass,
+                            "gpu_display_name": gpu_display,
+                            "gpu_type_id": gpu_id,
+                            "volume_name": vol_name,
+                            "volume_id": vol_id,
+                        })
+                    except Exception as exc:
+                        logger.debug("create_pod_with_fallbacks on_attempt callback failed: %s", exc)
+                pod_name = f"{name_prefix}-{int(time.time() * 1000)}"
+                try:
+                    pod = create_pod(
+                        api_key=api_key,
+                        gpu_type_id=gpu_id,
+                        image_name=image_name,
+                        name=pod_name,
+                        network_volume_id=vol_id,
+                        volume_mount_path=volume_mount_path,
+                        disk_in_gb=disk_in_gb,
+                        container_disk_in_gb=container_disk_in_gb,
+                        public_key_string=public_key_string,
+                        env_vars=env_vars,
+                        min_vcpu_count=min_vcpu_count,
+                        min_memory_in_gb=min_memory_in_gb,
+                        template_id=template_id,
+                        ports=ports,
+                    )
+                except Exception as exc:
+                    if _is_capacity_error(exc):
+                        last_capacity_error = exc
+                        logger.info(
+                            "create_pod_with_fallbacks: capacity miss attempt %d (gpu=%s vol=%s); trying next combo",
+                            total_attempts,
+                            gpu_display,
+                            vol_name,
+                        )
+                        continue
+                    raise
+                pod["selected_gpu_display_name"] = gpu_display
+                pod["selected_gpu_type_id"] = gpu_id
+                pod["selected_volume_name"] = vol_name
+                pod["selected_volume_id"] = vol_id
+                pod["attempt"] = total_attempts
+                pod["pass"] = full_pass
+                return pod
+        if full_pass < max_full_passes and retry_sleep_seconds > 0:
+            logger.info(
+                "create_pod_with_fallbacks: pass %d exhausted all %d combos; sleeping %.1fs before retry",
+                full_pass,
+                len(resolved_gpus) * len(volume_lookup),
+                retry_sleep_seconds,
+            )
+            time.sleep(retry_sleep_seconds)
+
+    if last_capacity_error is not None:
+        raise RuntimeError(
+            f"create_pod_with_fallbacks: all {total_attempts} attempts hit capacity errors. "
+            f"Last error: {last_capacity_error}"
+        )
+    raise RuntimeError(
+        f"create_pod_with_fallbacks: exhausted {total_attempts} attempts without success"
+    )
 
 
 def _normalize_pod_status(runpod_id: str, status: dict[str, Any]) -> dict[str, Any]:
@@ -344,11 +536,44 @@ def get_pod_ssh_details(pod_id: str, api_key: str) -> dict[str, Any] | None:
     return None
 
 
-def terminate_pod(pod_id: str, api_key: str) -> None:
-    """Terminate a RunPod pod to stop billing."""
-    sdk = _get_runpod()
-    sdk.api_key = api_key
-    sdk.terminate_pod(pod_id)
+def terminate_pod(
+    pod_id: str,
+    api_key: str,
+    *,
+    verify_timeout_seconds: float = 90.0,
+    poll_interval_seconds: float = 2.0,
+) -> None:
+    """Terminate a pod and return only after provider-side deletion is verified.
+
+    RunPod's supported termination endpoint is REST ``DELETE /v1/pods/{id}``.
+    A successful mutation response is not itself a terminal state receipt, so
+    poll the independent account collection until the pod is absent. HTTP 404
+    is idempotent success. A pod that remains visible past the deadline is an
+    error rather than a false ``terminated`` acknowledgement.
+    """
+    response = httpx.delete(
+        f"{PODS_URL}/{pod_id}",
+        headers=_auth_headers(api_key),
+        timeout=30,
+    )
+    if response.status_code not in (200, 202, 204, 404):
+        raise RuntimeError(
+            f"RunPod pod termination failed: HTTP {response.status_code}: {response.text[:500]}"
+        )
+    if response.status_code == 404:
+        return
+
+    deadline = time.monotonic() + max(0.0, verify_timeout_seconds)
+    while True:
+        pods = list_pods(api_key)
+        if not any(str(pod.get("id") or "") == pod_id for pod in pods if isinstance(pod, dict)):
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"RunPod accepted termination for {pod_id} but the pod remained present "
+                f"after {verify_timeout_seconds:.1f}s"
+            )
+        time.sleep(max(0.0, poll_interval_seconds))
 
 
 def create_network_volume(

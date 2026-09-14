@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -38,7 +39,7 @@ def test_prebuilt_dry_run_commands_do_not_require_api_key(
     monkeypatch: pytest.MonkeyPatch, tmp_path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
     enriched = tmp_path / "enriched.json"
     enriched.write_text(json.dumps({"targets": []}), encoding="utf-8")
 
@@ -69,7 +70,7 @@ def test_prebuilt_reconcile_plain_targets_blocks_before_credentials(
     monkeypatch: pytest.MonkeyPatch, tmp_path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
     targets = tmp_path / "targets.json"
     targets.write_text(json.dumps({"targets": [{"template_id": "image/z_image"}]}), encoding="utf-8")
 
@@ -92,7 +93,7 @@ def test_prebuilt_reconcile_dry_run_local_enrichment_contract(
     monkeypatch: pytest.MonkeyPatch, tmp_path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
     targets = tmp_path / "targets.json"
     targets.write_text(json.dumps({"targets": [{"template_id": "image/z_image"}]}), encoding="utf-8")
 
@@ -131,7 +132,7 @@ def test_prebuilt_cleanup_rejects_unallowlisted_prefix() -> None:
 
 def test_cli_missing_api_key_exits(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
     with pytest.raises(SystemExit) as exc:
         cli.main(["list"])
     assert exc.value.code == 2
@@ -139,7 +140,7 @@ def test_cli_missing_api_key_exits(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_cli_list_json(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "k")
-    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
 
     async def fake_list(api_key, *, name_prefix=None):
         assert api_key == "k"
@@ -156,7 +157,7 @@ def test_cli_find_orphans_reads_known_ids(
     monkeypatch: pytest.MonkeyPatch, tmp_path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "k")
-    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
     ids = tmp_path / "known.txt"
     ids.write_text("a\nb\n\n")
 
@@ -178,7 +179,7 @@ def test_cli_find_orphans_reads_known_ids(
 
 def test_cli_find_orphans_terminate_yes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "k")
-    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
 
     async def fake_find(api_key, known, *, name_prefix=None, older_than_seconds=None):
         return [_summary("orph1"), _summary("orph2")]
@@ -199,7 +200,7 @@ def test_cli_terminate_requires_confirmation(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "k")
-    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
     monkeypatch.setattr("builtins.input", lambda *_a, **_k: "n")
 
     called: list[str] = []
@@ -217,7 +218,7 @@ def test_cli_probe_prints_json(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "k")
-    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
 
     captured: dict = {}
 
@@ -259,7 +260,7 @@ def test_cli_probe_table_format(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "k")
-    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
 
     async def fake_probe(**_kwargs):
         return [
@@ -309,12 +310,102 @@ def test_resolve_config_accepts_storage_volume_candidates(
     assert config.ram_tiers == (32, 24, 16)
 
 
+def test_resolve_config_keeps_complete_environment_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI resolver must not discard fields needed by launch/SSH."""
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *a, **k: None)
+    values = {
+        "RUNPOD_API_KEY": "api-secret",
+        "RUNPOD_GPU_TYPE": "NVIDIA GeForce RTX 5090",
+        "RUNPOD_WORKER_IMAGE": "h3-worker:latest",
+        "RUNPOD_TEMPLATE_ID": "h3-template",
+        "RUNPOD_VOLUME_MOUNT_PATH": "/mnt/peter",
+        "RUNPOD_CONTAINER_DISK_GB": "321",
+        "RUNPOD_DISK_SIZE_GB": "654",
+        "RUNPOD_MIN_VCPU_COUNT": "14",
+        "RUNPOD_MIN_MEMORY_GB": "40",
+        "RUNPOD_STORAGE_NAME": "Peter",
+        "RUNPOD_SSH_PUBLIC_KEY": "ssh-public-secret",
+        "RUNPOD_SSH_PRIVATE_KEY": "ssh-private-secret",
+        "RUNPOD_SSH_PUBLIC_KEY_PATH": "/keys/id.pub",
+        "RUNPOD_SSH_PRIVATE_KEY_PATH": "/keys/id",
+        "RUNPOD_ENV_VARS": '{"HF_TOKEN":"token-secret","MODE":"h3"}',
+        "RUNPOD_PORTS": "8675/http,22/tcp",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+    args = cli.build_parser().parse_args(["launch"])
+    config = cli._resolve_config(args)
+
+    assert config.api_key == "api-secret"
+    assert config.gpu_type == "NVIDIA GeForce RTX 5090"
+    assert config.worker_image == "h3-worker:latest"
+    assert config.template_id == "h3-template"
+    assert config.volume_mount_path == "/mnt/peter"
+    assert config.container_disk_gb == 321
+    assert config.disk_size_gb == 654
+    assert config.min_vcpu_count == 14
+    assert config.min_memory_gb == 40
+    assert config.storage_name == "Peter"
+    assert config.ssh_public_key is None
+    assert config.ssh_private_key is None
+    assert config.ssh_public_key_path == "/keys/id.pub"
+    assert config.ssh_private_key_path == "/keys/id"
+    assert config.env_vars == {"HF_TOKEN": "token-secret", "MODE": "h3"}
+    assert config.ports == "8675/http,22/tcp"
+
+
+def test_launch_probe_only_does_not_print_config_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Probe output is safe even when the resolved config has credentials."""
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *a, **k: None)
+    secrets = {
+        "RUNPOD_API_KEY": "api-secret-not-printable",
+        "RUNPOD_SSH_PUBLIC_KEY": "public-secret-not-printable",
+        "RUNPOD_SSH_PRIVATE_KEY": "private-secret-not-printable",
+        "RUNPOD_ENV_VARS": '{"HF_TOKEN":"env-secret-not-printable"}',
+    }
+    for key, value in secrets.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("RUNPOD_SSH_PRIVATE_KEY_PATH", raising=False)
+    monkeypatch.delenv("RUNPOD_SSH_PUBLIC_KEY_PATH", raising=False)
+
+    class FakePod:
+        id = "pod-probe-safe"
+        name = "probe-safe"
+        _gpu_type = "NVIDIA GeForce RTX 5090"
+        _ram_tier = 32
+        _storage_name = "Peter"
+        _storage_volume = "vol-peter"
+
+        async def terminate(self) -> None:
+            return None
+
+    async def fake_launch(config, *, name=None):
+        assert config.api_key == secrets["RUNPOD_API_KEY"]
+        assert config.ssh_private_key == secrets["RUNPOD_SSH_PRIVATE_KEY"]
+        assert config.env_vars["HF_TOKEN"] == "env-secret-not-printable"
+        return FakePod()
+
+    monkeypatch.setattr("runpod_lifecycle.cli._launch", fake_launch)
+    assert cli.main(["launch", "--probe-only"]) == 0
+    output = capsys.readouterr().out
+    for secret in secrets.values():
+        assert secret not in output
+
+
 def test_launch_probe_only_terminates_claimed_pod(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "k")
-    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
 
     class FakePod:
         id = "pod-probe"
@@ -363,6 +454,149 @@ def test_launch_probe_only_terminates_claimed_pod(
     assert launched["name"] == "claim-test"
 
 
+def test_run_reattaches_to_supplied_pod_and_prints_artifact_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI run must reuse POD_ID and expose detached artifact/teardown state."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "api-key")
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *a, **k: None)
+    script = tmp_path / "job.sh"
+    script.write_text("echo h3\n", encoding="utf-8")
+    supplied_pod = object()
+    seen: dict[str, object] = {}
+
+    async def fake_get_pod(pod_id, config):
+        seen["pod_id"] = pod_id
+        return supplied_pod
+
+    async def fake_run(config, remote_script, **kwargs):
+        seen["pod"] = kwargs["pod"]
+        seen["remote_script"] = remote_script
+        seen["terminate_after_exec"] = kwargs["terminate_after_exec"]
+        seen["local_root"] = kwargs["local_root"]
+        return SimpleNamespace(
+            returncode=0,
+            artifact_root=tmp_path / "artifacts",
+            terminated=True,
+        )
+
+    monkeypatch.setattr("runpod_lifecycle.cli.discovery.get_pod", fake_get_pod)
+    monkeypatch.setattr("runpod_lifecycle.runner.ship_and_run_detached", fake_run)
+
+    rc = cli.main(["run", "pod-existing", "--script", str(script)])
+
+    assert rc == 0
+    assert seen["pod_id"] == "pod-existing"
+    assert seen["pod"] is supplied_pod
+    assert seen["remote_script"] == "echo h3\n"
+    assert seen["terminate_after_exec"] is True
+    assert seen["local_root"] == tmp_path
+    assert json.loads(capsys.readouterr().out) == {
+        "pod_id": "pod-existing",
+        "returncode": 0,
+        "artifact_root": str(tmp_path / "artifacts"),
+        "terminated": True,
+    }
+
+
+def test_run_keep_pod_passes_non_terminating_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "api-key")
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *a, **k: None)
+    script = tmp_path / "job.sh"
+    script.write_text("true\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    async def fake_get_pod(pod_id, config):
+        return object()
+
+    async def fake_run(config, remote_script, **kwargs):
+        seen["terminate_after_exec"] = kwargs["terminate_after_exec"]
+        return SimpleNamespace(returncode=3, artifact_root=None, terminated=False)
+
+    monkeypatch.setattr("runpod_lifecycle.cli.discovery.get_pod", fake_get_pod)
+    monkeypatch.setattr("runpod_lifecycle.runner.ship_and_run_detached", fake_run)
+
+    assert cli.main(["run", "pod-kept", "--script", str(script), "--keep-pod"]) == 3
+    assert seen["terminate_after_exec"] is False
+    assert json.loads(capsys.readouterr().out)["terminated"] is False
+
+
+def test_run_surfaces_remote_output_before_human_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "api-key")
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *a, **k: None)
+    script = tmp_path / "job.sh"
+    script.write_text("echo output\n", encoding="utf-8")
+
+    async def fake_get_pod(pod_id, config):
+        return object()
+
+    async def fake_run(config, remote_script, **kwargs):
+        return SimpleNamespace(
+            returncode=7,
+            stdout="remote stdout\n",
+            stderr="remote stderr\n",
+            artifact_root=None,
+            terminated=True,
+        )
+
+    monkeypatch.setattr("runpod_lifecycle.cli.discovery.get_pod", fake_get_pod)
+    monkeypatch.setattr("runpod_lifecycle.runner.ship_and_run_detached", fake_run)
+
+    assert cli.main(["run", "pod-output", "--script", str(script)]) == 7
+    captured = capsys.readouterr()
+    assert captured.out.startswith("remote stdout\n{")
+    summary = json.loads(captured.out[captured.out.index("{"):])
+    assert summary["returncode"] == 7
+    assert captured.err == "remote stderr\n"
+
+
+def test_run_json_keeps_remote_output_machine_readable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "api-key")
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *a, **k: None)
+    script = tmp_path / "job.sh"
+    script.write_text("echo output\n", encoding="utf-8")
+
+    async def fake_get_pod(pod_id, config):
+        return object()
+
+    async def fake_run(config, remote_script, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout="remote stdout\n",
+            stderr="remote stderr\n",
+            artifact_root=tmp_path / "artifacts",
+            terminated=False,
+        )
+
+    monkeypatch.setattr("runpod_lifecycle.cli.discovery.get_pod", fake_get_pod)
+    monkeypatch.setattr("runpod_lifecycle.runner.ship_and_run_detached", fake_run)
+
+    assert cli.main(["run", "pod-json", "--script", str(script), "--json"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["stdout"] == "remote stdout\n"
+    assert payload["stderr"] == "remote stderr\n"
+    assert captured.err == ""
+
+
 def test_prebuilt_build_accepts_storage_volume_candidates() -> None:
     args = cli.build_parser().parse_args([
         "prebuilt",
@@ -378,7 +612,7 @@ def test_prebuilt_build_accepts_storage_volume_candidates() -> None:
 
 def test_cli_terminate_yes_skips_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "k")
-    monkeypatch.setattr("runpod_lifecycle.cli.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
 
     called: list[str] = []
 

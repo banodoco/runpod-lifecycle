@@ -36,3 +36,10 @@ def volumeless_config() -> RunPodConfig:
         storage_name=None,
         storage_volumes=(),
     )
+
+
+@pytest.fixture(autouse=True)
+def isolate_shared_astrid_env(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """Keep the developer's real per-user credentials out of package tests."""
+
+    monkeypatch.setenv("ASTRID_ENV_FILE", str(tmp_path / "isolated-astrid.env"))

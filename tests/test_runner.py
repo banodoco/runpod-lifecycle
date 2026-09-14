@@ -366,6 +366,56 @@ async def test_ship_and_run_detached_reattach_skips_launch() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ship_and_run_detached_reattach_downloads_fixed_artifacts(
+    tmp_path: Path,
+) -> None:
+    """An attached run downloads both canonical artifact directories."""
+    mock_pod = _make_mock_pod("pod-existing-artifacts")
+    mock_pod.exec_ssh = AsyncMock(side_effect=[
+        (0, "GPU 0: ...", ""),
+        (0, "12345\n", ""),
+        (0, "0", ""),
+    ])
+
+    with patch("runpod_lifecycle.runner._upload_remote_script", new_callable=AsyncMock):
+        with patch(
+            "runpod_lifecycle.runner.download_artifact_archive",
+            new_callable=AsyncMock,
+            return_value=tmp_path / "artifacts",
+        ) as mock_download:
+            result = await ship_and_run_detached(
+                pod=mock_pod,
+                remote_script="echo ok",
+                local_root=tmp_path,
+                remote_root="/workspace",
+                timeout=30,
+                poll_interval=1,
+            )
+
+    assert result.returncode == 0
+    assert result.artifact_root == tmp_path / "artifacts"
+    assert mock_download.await_args.kwargs["artifact_paths"] == ["out", "output"]
+    assert mock_download.await_args.kwargs["local_artifact_root"] == tmp_path / "artifacts"
+
+
+@pytest.mark.asyncio
+async def test_ship_and_run_detached_reattach_terminates_after_failure() -> None:
+    """A supplied pod is still torn down when detached execution fails."""
+    mock_pod = _make_mock_pod("pod-existing-failure")
+    mock_pod.exec_ssh = AsyncMock(side_effect=RuntimeError("remote unavailable"))
+
+    with patch("runpod_lifecycle.runner._upload_remote_script", new_callable=AsyncMock):
+        with pytest.raises(RuntimeError, match="remote unavailable"):
+            await ship_and_run_detached(
+                pod=mock_pod,
+                remote_script="echo ok",
+                terminate_after_exec=True,
+            )
+
+    mock_pod.terminate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_ship_and_run_detached_requires_config_or_pod() -> None:
     """Detached runner needs either provision config or a reattach pod."""
     with pytest.raises(ValueError, match="requires either config or pod"):

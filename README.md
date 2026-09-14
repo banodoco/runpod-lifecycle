@@ -19,6 +19,12 @@ pip install "runpod-lifecycle @ git+https://github.com/banodoco/runpod-lifecycle
 
 `RunPodConfig.from_env()` reads these variables:
 
+For local use, Astrid and VibeComfy load `RUNPOD_API_KEY` from the shared
+`~/.astrid/astrid.env` file (or `ASTRID_ENV_FILE` when set). A project `.env`
+can still provide non-secret lifecycle settings, but its `RUNPOD_API_KEY`
+assignment is ignored. CI and deployed services should inject the key through
+their own process environment.
+
 - `RUNPOD_API_KEY`
 - `RUNPOD_GPU_TYPE`
 - `RUNPOD_WORKER_IMAGE`

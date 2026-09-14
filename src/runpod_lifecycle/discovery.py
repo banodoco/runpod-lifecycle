@@ -55,10 +55,7 @@ def _to_summary(raw: dict[str, Any]) -> PodSummary:
 
 
 def _list_pods_sync(api_key: str) -> list[dict[str, Any]]:
-    sdk = api._get_runpod()
-    sdk.api_key = api_key
-    pods = sdk.get_pods()
-    return list(pods) if pods else []
+    return api.list_pods(api_key)
 
 
 async def list_pods(api_key: str, *, name_prefix: str | None = None) -> list[PodSummary]:

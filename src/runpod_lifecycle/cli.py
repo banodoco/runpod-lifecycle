@@ -16,10 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-
 from . import api, config as cfg, discovery
-from .config import RunPodConfig
+from .config import RunPodConfig, load_runpod_env
 from .guard import PodGuard, install_signal_handlers
 from .lifecycle import find_gpu_type, get_network_volumes, launch as _launch, launch_when_available as _launch_when_available
 from .pod import Pod
@@ -47,7 +45,11 @@ from .ssh import SSHClient
 def _resolve_api_key(args: argparse.Namespace) -> str:
     key = getattr(args, "api_key", None) or os.getenv("RUNPOD_API_KEY")
     if not key:
-        print("error: RUNPOD_API_KEY not set (use --api-key or .env)", file=sys.stderr)
+        print(
+            "error: RUNPOD_API_KEY not set (use --api-key, run `astrid-credential set runpod` locally, "
+            "or inject it through the process environment)",
+            file=sys.stderr,
+        )
         sys.exit(2)
     return key
 
@@ -111,30 +113,47 @@ def _resolve_gpu_type(args: argparse.Namespace) -> str | tuple[str, ...]:
 
 
 def _resolve_config(args: argparse.Namespace) -> RunPodConfig:
+    """Resolve one complete config for every CLI command that talks to a pod.
+
+    Keep environment-backed fields in :meth:`RunPodConfig.from_env` so launch,
+    exec, ship, fetch, and run cannot silently disagree about SSH, storage,
+    mount, template, port, or extra-environment settings. Only values that
+    were explicitly supplied on the command line are passed as overrides;
+    argparse defaults must not mask values from the user's environment.
+    """
     api_key = _resolve_api_key(args)
-    arg_storage = _coalesce_blank(getattr(args, "storage_name", None))
-    env_storage = _coalesce_blank(os.getenv("RUNPOD_STORAGE_NAME"))
-    storage_volumes = _resolve_storage_volumes(args)
-    ram_tiers = _parse_csv_ints(getattr(args, "ram_tiers", None)) or _parse_csv_ints(
-        os.getenv("RUNPOD_RAM_TIERS")
-    ) or cfg.DEFAULT_RAM_TIERS
-    return RunPodConfig(
-        api_key=api_key,
-        gpu_type=_resolve_gpu_type(args),
-        worker_image=getattr(args, "image", None)
-        or os.getenv("RUNPOD_WORKER_IMAGE", cfg.DEFAULT_WORKER_IMAGE),
-        container_disk_gb=getattr(args, "container_disk_gb", None)
-        or int(os.getenv("RUNPOD_CONTAINER_DISK_GB", "200")),
-        name_prefix=getattr(args, "name_prefix", None)
-        or os.getenv("RUNPOD_NAME_PREFIX", "pod"),
-        disk_size_gb=getattr(args, "disk_size_gb", None)
-        or int(os.getenv("RUNPOD_DISK_SIZE_GB", "200")),
-        min_memory_gb=getattr(args, "min_memory_gb", None)
-        or int(os.getenv("RUNPOD_MIN_MEMORY_GB", "32")),
-        ram_tiers=ram_tiers,
-        storage_name=arg_storage or env_storage,
-        storage_volumes=storage_volumes,
-    )
+    overrides: dict[str, Any] = {"api_key": api_key}
+
+    # These are the CLI's explicit config overrides. ``None`` means the
+    # option was not supplied and therefore must be left to from_env().
+    option_fields = {
+        "gpu_type": "gpu_type",
+        "worker_image": "image",
+        "container_disk_gb": "container_disk_gb",
+        "disk_size_gb": "disk_size_gb",
+        "min_memory_gb": "min_memory_gb",
+        "name_prefix": "name_prefix",
+        "storage_name": "storage_name",
+    }
+    for config_field, arg_name in option_fields.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            if config_field == "gpu_type":
+                value = _resolve_gpu_type(args)
+            overrides[config_field] = value
+
+    # These options are comma-separated on the CLI and are parsed identically
+    # to their environment counterparts. Leave them out when absent so the
+    # complete from_env() implementation remains the sole fallback path.
+    ram_tiers_arg = getattr(args, "ram_tiers", None)
+    if ram_tiers_arg is not None and str(ram_tiers_arg).strip():
+        overrides["ram_tiers"] = _parse_csv_ints(ram_tiers_arg)
+
+    storage_volumes_arg = getattr(args, "storage_volumes", None)
+    if storage_volumes_arg is not None and str(storage_volumes_arg).strip():
+        overrides["storage_volumes"] = _parse_csv_values(storage_volumes_arg)
+
+    return RunPodConfig.from_env(**overrides)
 
 
 def _parse_duration(text: str) -> int:
@@ -371,21 +390,30 @@ async def _cmd_fetch(args: argparse.Namespace) -> int:
 
 
 async def _cmd_run(args: argparse.Namespace) -> int:
-    """Ship a script and run it on a pod (sync composite)."""
-    from .runner import ship_and_run
+    """Ship a script and run it on the explicitly supplied pod.
+
+    ``run POD_ID`` is an attach operation.  The older implementation called
+    ``ship_and_run`` and silently provisioned a different pod, which made the
+    positional id misleading and could strand the supplied pod.  The detached
+    runner owns the fixed ``out``/``output`` artifact download and its
+    terminate-in-finally behavior for both success and failure.
+    """
+    from .runner import ship_and_run_detached
 
     config = _resolve_config(args)
     script_path = Path(args.script).resolve()
     if not script_path.exists():
         print(f"error: script not found: {args.script}", file=sys.stderr)
         return 1
+    pod = await discovery.get_pod(args.pod_id, config)
     remote_script = script_path.read_text()
     local_root = script_path.parent
     remote_root = getattr(args, "remote_root", "/workspace")
 
-    result = await ship_and_run(
+    result = await ship_and_run_detached(
         config,
         remote_script,
+        pod=pod,
         local_root=local_root,
         remote_root=remote_root,
         exclude=set(),
@@ -394,10 +422,26 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         name_prefix=getattr(args, "name_prefix", None) or config.name_prefix,
         terminate_after_exec=not getattr(args, "keep_pod", False),
     )
-    if result.stdout:
-        print(result.stdout, end="")
-    if result.stderr:
-        print(result.stderr, end="", file=sys.stderr)
+    summary = {
+        "pod_id": args.pod_id,
+        "returncode": result.returncode,
+        "artifact_root": str(result.artifact_root) if result.artifact_root else None,
+        "terminated": result.terminated,
+    }
+    if getattr(args, "json", False):
+        # Keep stdout parseable for automation.  Remote output is captured as
+        # JSON fields rather than being mixed into the machine-readable stream.
+        summary["stdout"] = getattr(result, "stdout", "")
+        summary["stderr"] = getattr(result, "stderr", "")
+        print(json.dumps(summary, indent=2))
+    else:
+        stdout = getattr(result, "stdout", "")
+        stderr = getattr(result, "stderr", "")
+        if stdout:
+            print(stdout, end="")
+        if stderr:
+            print(stderr, end="", file=sys.stderr)
+        print(json.dumps(summary, indent=2))
     return result.returncode
 
 
@@ -1953,8 +1997,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_launch.add_argument("--name", help="Pod name (default: auto-generated).")
     p_launch.add_argument("--gpu-type", help="GPU type (default: RTX 4090).")
     p_launch.add_argument("--image", help="Docker image (default: pytorch devel).")
-    p_launch.add_argument("--container-disk-gb", type=int, default=200, help="Container disk size GB.")
-    p_launch.add_argument("--disk-size-gb", type=int, default=200, help="Pod disk size GB.")
+    p_launch.add_argument("--container-disk-gb", type=int, help="Container disk size GB.")
+    p_launch.add_argument("--disk-size-gb", type=int, help="Pod disk size GB.")
     p_launch.add_argument("--min-memory-gb", type=int, help="Minimum host RAM GB for launch fallback.")
     p_launch.add_argument(
         "--ram-tiers",
@@ -2017,6 +2061,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--keep-pod", action="store_true", help="Leave pod alive after script completes.")
     p_run.add_argument("--gpu-type", help="GPU type override.")
     p_run.add_argument("--image", help="Docker image override.")
+    p_run.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit one machine-readable JSON result including captured stdout/stderr.",
+    )
 
     p_vols_ls = sub.add_parser("volumes", help="RunPod network volume operations.")
     vol_sub = p_vols_ls.add_subparsers(dest="volumes_cmd", required=True)
@@ -2309,7 +2358,7 @@ _VOLUMES_HANDLERS: dict[str, Any] = {
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_dotenv()
+    load_runpod_env()
     args = build_parser().parse_args(argv)
 
     if args.cmd == "volumes":

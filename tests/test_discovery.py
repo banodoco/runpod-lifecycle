@@ -104,19 +104,27 @@ def test_get_pod_missing_raises(runpod_sdk_mock, base_config) -> None:
         asyncio.run(discovery.get_pod("missing", base_config))
 
 
-def test_module_terminate_happy_path(runpod_sdk_mock) -> None:
+def test_module_terminate_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[tuple[str, str | None]] = []
 
     async def on_state(event) -> None:
         events.append((event.state.value, event.pod_id))
 
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "runpod_lifecycle.discovery.api.terminate_pod",
+        lambda pod_id, api_key: calls.append((pod_id, api_key)),
+    )
     asyncio.run(discovery.terminate("p1", "test", hooks=EventHooks(on_state_change=on_state)))
-    runpod_sdk_mock.terminate_pod.assert_called_once_with("p1")
+    assert calls == [("p1", "test")]
     assert events == [(PodState.TERMINATED.value, "p1")]
 
 
-def test_module_terminate_failure_emits_error_and_raises(runpod_sdk_mock) -> None:
-    runpod_sdk_mock.terminate_pod.side_effect = RuntimeError("boom")
+def test_module_terminate_failure_emits_error_and_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(_pod_id: str, _api_key: str) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("runpod_lifecycle.discovery.api.terminate_pod", fail)
     errors: list[str] = []
 
     def on_error(err: Exception, detail: dict) -> None:

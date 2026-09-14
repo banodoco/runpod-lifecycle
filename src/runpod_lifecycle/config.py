@@ -5,9 +5,54 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Iterable
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
+
+
+def astrid_env_file_path(environ: dict[str, str] | None = None) -> Path:
+    """Return the shared Astrid dotenv path without importing Astrid itself."""
+
+    env = os.environ if environ is None else environ
+    astrid_home = env.get("ASTRID_HOME", "").strip()
+    root = (Path(astrid_home).expanduser() if astrid_home else Path.home() / ".astrid").resolve()
+    override = env.get("ASTRID_ENV_FILE", "").strip()
+    if override:
+        override_path = Path(override).expanduser()
+        return override_path if override_path.is_absolute() else root / override_path
+    return root / "astrid.env"
+
+
+def load_runpod_env(env_file: Path | str | None = None) -> None:
+    """Load shared Astrid credentials before tool-local dotenv settings.
+
+    The shared file wins over the process environment and project-local
+    dotenv copies. Environment-only operation remains available when the
+    shared file is absent, as on CI and service hosts.
+    """
+
+    process_credential = os.environ.get("RUNPOD_API_KEY", "").strip()
+    shared_file = astrid_env_file_path()
+    shared_credential = ""
+    if shared_file.is_file():
+        shared_values = dotenv_values(shared_file, interpolate=False)
+        shared_credential = str(shared_values.get("RUNPOD_API_KEY") or "").strip()
+        # Shared API keys are literal strings; do not interpolate ${...}.
+        load_dotenv(shared_file, override=True, interpolate=False)
+    if env_file is None:
+        load_dotenv(override=False)
+    else:
+        load_dotenv(env_file, override=False)
+    # Project dotenv files remain useful for non-secret lifecycle settings,
+    # but never act as a second local source for the RunPod credential. Keep a
+    # pre-existing process injection or the shared-file value intact.
+    if shared_credential:
+        os.environ["RUNPOD_API_KEY"] = shared_credential
+    elif process_credential:
+        os.environ["RUNPOD_API_KEY"] = process_credential
+    else:
+        os.environ.pop("RUNPOD_API_KEY", None)
 
 DEFAULT_GPU_TYPE = "NVIDIA GeForce RTX 4090"
 DEFAULT_WORKER_IMAGE = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
@@ -139,7 +184,10 @@ class RunPodConfig:
 
     @classmethod
     def from_env(cls, **overrides: Any) -> "RunPodConfig":
-        load_dotenv()
+        load_runpod_env()
+
+        ssh_public_key_path = os.getenv("RUNPOD_SSH_PUBLIC_KEY_PATH")
+        ssh_private_key_path = os.getenv("RUNPOD_SSH_PRIVATE_KEY_PATH")
 
         data: dict[str, Any] = {
             "api_key": os.getenv("RUNPOD_API_KEY"),
@@ -158,17 +206,28 @@ class RunPodConfig:
             "ram_tiers": _parse_int_tuple(os.getenv("RUNPOD_RAM_TIERS"), DEFAULT_RAM_TIERS),
             "storage_volumes": _parse_csv_tuple(os.getenv("RUNPOD_STORAGE_VOLUMES")),
             "storage_name": _parse_optional_string(os.getenv("RUNPOD_STORAGE_NAME")),
-            "ssh_public_key": os.getenv("RUNPOD_SSH_PUBLIC_KEY"),
-            "ssh_private_key": os.getenv("RUNPOD_SSH_PRIVATE_KEY"),
-            "ssh_public_key_path": os.getenv("RUNPOD_SSH_PUBLIC_KEY_PATH"),
-            "ssh_private_key_path": os.getenv("RUNPOD_SSH_PRIVATE_KEY_PATH"),
+            # Prefer scoped filesystem identities over any stale inline material
+            # inherited from another dotenv file or parent process. Explicit
+            # keyword overrides below continue to have final precedence.
+            "ssh_public_key": None
+            if ssh_public_key_path
+            else os.getenv("RUNPOD_SSH_PUBLIC_KEY"),
+            "ssh_private_key": None
+            if ssh_private_key_path
+            else os.getenv("RUNPOD_SSH_PRIVATE_KEY"),
+            "ssh_public_key_path": ssh_public_key_path,
+            "ssh_private_key_path": ssh_private_key_path,
             "env_vars": _parse_env_vars(os.getenv("RUNPOD_ENV_VARS")),
             "name_prefix": os.getenv("RUNPOD_NAME_PREFIX", "pod"),
+            "ports": _parse_optional_string(os.getenv("RUNPOD_PORTS")),
         }
         data.update(overrides)
 
         if not data.get("api_key"):
-            raise ValueError("RUNPOD_API_KEY environment variable is required")
+            raise ValueError(
+                "RUNPOD_API_KEY is required (run `astrid-credential set runpod` locally, "
+                "or inject it through the process environment)"
+            )
 
         return cls(**data)
 

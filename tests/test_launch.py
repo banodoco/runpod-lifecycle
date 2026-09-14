@@ -250,6 +250,27 @@ def test_launch_raises_before_create_when_gpu_missing(
     assert runpod_sdk_mock.create_pod.call_count == 0
 
 
+def test_launch_storage_failure_report_deduplicates_preferred_volume(
+    base_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A volume named in both preferred and fallback slots appears once in errors."""
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.find_gpu_type",
+        lambda gpu_type, api_key: {"id": "gpu-1", "displayName": gpu_type},
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.lifecycle.get_storage_volume_id",
+        lambda api_key, storage_name: None,
+    )
+
+    cfg = base_config.merge(storage_name="Peter", storage_volumes=("Peter",))
+    with pytest.raises(LaunchFailure) as excinfo:
+        asyncio.run(launch(cfg, name="duplicate-volume"))
+
+    assert str(excinfo.value).count("Peter") == 1
+
+
 def test_launch_accepts_single_string_gpu_type(
     base_config,
     monkeypatch: pytest.MonkeyPatch,

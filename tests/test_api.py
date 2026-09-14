@@ -17,6 +17,92 @@ class FakeResponse:
         return self._payload
 
 
+def test_list_pods_falls_back_to_rest_when_sdk_graphql_response_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    runpod_sdk_mock.get_pods.side_effect = KeyError("data")
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(
+            get=lambda *args, **kwargs: FakeResponse(
+                200,
+                [{"id": "p1", "desiredStatus": "RUNNING"}],
+            )
+        ),
+    )
+
+    assert api.list_pods("test") == [{"id": "p1", "desiredStatus": "RUNNING"}]
+
+
+def test_terminate_pod_waits_for_provider_side_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = iter(
+        [
+            [{"id": "p1", "desiredStatus": "RUNNING"}],
+            [],
+        ]
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(delete=lambda *args, **kwargs: FakeResponse(204, {})),
+    )
+    monkeypatch.setattr("runpod_lifecycle.api.list_pods", lambda _key: next(responses))
+    monkeypatch.setattr("runpod_lifecycle.api.time.sleep", lambda _seconds: None)
+
+    api.terminate_pod("p1", "test", poll_interval_seconds=0)
+
+
+def test_terminate_pod_rejects_false_terminal_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(delete=lambda *args, **kwargs: FakeResponse(202, {})),
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.list_pods",
+        lambda _key: [{"id": "p1", "desiredStatus": "RUNNING"}],
+    )
+
+    with pytest.raises(RuntimeError, match="remained present"):
+        api.terminate_pod("p1", "test", verify_timeout_seconds=0)
+
+
+def test_create_pod_with_fallbacks_deduplicates_volume_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A preferred volume repeated in fallback inputs is attempted once."""
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.find_gpu_type",
+        lambda _gpu_type, _api_key: {"id": "gpu-1", "displayName": "RTX 5090"},
+    )
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.get_network_volumes",
+        lambda _api_key: [{"name": "Peter", "id": "vol-peter"}],
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_create_pod(**kwargs):
+        calls.append(kwargs)
+        return {"id": "pod-1"}
+
+    monkeypatch.setattr("runpod_lifecycle.api.create_pod", fake_create_pod)
+
+    result = api.create_pod_with_fallbacks(
+        "api-key",
+        ["NVIDIA GeForce RTX 5090"],
+        "image:h3",
+        volume_candidates=["Peter", "Peter"],
+        retry_sleep_seconds=0,
+    )
+
+    assert result["selected_volume_name"] == "Peter"
+    assert len(calls) == 1
+    assert calls[0]["network_volume_id"] == "vol-peter"
+
+
 def test_create_pod_suppresses_sdk_stdout_with_env_values(runpod_sdk_mock, capsys) -> None:
     runpod_sdk_mock.create_pod.side_effect = lambda **_kwargs: print(
         "raw_response: {'env': ['SUPABASE_SERVICE_ROLE_KEY=secret']}"

@@ -2,7 +2,20 @@ from __future__ import annotations
 
 import pytest
 
-from runpod_lifecycle.config import RunPodConfig
+from runpod_lifecycle.config import RunPodConfig, load_runpod_env
+
+
+def test_shared_key_is_read_literally_without_interpolation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    shared_file = tmp_path / "astrid.env"
+    shared_file.write_text("RUNPOD_API_KEY='literal-${HOME}-key'\n", encoding="utf-8")
+    monkeypatch.setenv("ASTRID_ENV_FILE", str(shared_file))
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+
+    load_runpod_env(env_file=tmp_path / "missing-project.env")
+
+    assert __import__("os").environ["RUNPOD_API_KEY"] == "literal-${HOME}-key"
 
 
 def test_from_env_reads_documented_runpod_variables(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -20,11 +33,10 @@ def test_from_env_reads_documented_runpod_variables(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("RUNPOD_RAM_TIERS", "80,64,48")
     monkeypatch.setenv("RUNPOD_STORAGE_VOLUMES", "vol-a, vol-b")
     monkeypatch.setenv("RUNPOD_STORAGE_NAME", "primary")
-    monkeypatch.setenv("RUNPOD_SSH_PUBLIC_KEY", "ssh-ed25519 AAAA test")
-    monkeypatch.setenv("RUNPOD_SSH_PRIVATE_KEY", "private-key")
     monkeypatch.setenv("RUNPOD_SSH_PUBLIC_KEY_PATH", "~/.ssh/test.pub")
     monkeypatch.setenv("RUNPOD_SSH_PRIVATE_KEY_PATH", "~/.ssh/test")
     monkeypatch.setenv("RUNPOD_ENV_VARS", "{\"HELLO\": \"world\"}")
+    monkeypatch.setenv("RUNPOD_PORTS", "8675/http,22/tcp")
     monkeypatch.setenv("RUNPOD_NAME_PREFIX", "worker")
 
     config = RunPodConfig.from_env()
@@ -42,12 +54,55 @@ def test_from_env_reads_documented_runpod_variables(monkeypatch: pytest.MonkeyPa
     assert config.ram_tiers == (80, 64, 48)
     assert config.storage_volumes == ("vol-a", "vol-b")
     assert config.storage_name == "primary"
-    assert config.ssh_public_key == "ssh-ed25519 AAAA test"
-    assert config.ssh_private_key == "private-key"
+    assert config.ssh_public_key is None
+    assert config.ssh_private_key is None
     assert config.ssh_public_key_path == "~/.ssh/test.pub"
     assert config.ssh_private_key_path == "~/.ssh/test"
     assert config.env_vars == {"HELLO": "world"}
+    assert config.ports == "8675/http,22/tcp"
     assert config.name_prefix == "worker"
+
+
+def test_from_env_blank_ports_coalesces_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("RUNPOD_API_KEY", "api-key")
+    monkeypatch.setenv("RUNPOD_PORTS", "   ")
+
+    assert RunPodConfig.from_env().ports is None
+
+
+def test_from_env_reads_inline_ssh_keys_without_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("RUNPOD_API_KEY", "api-key")
+    monkeypatch.setenv("RUNPOD_SSH_PRIVATE_KEY", "inline-private-key")
+    monkeypatch.setenv("RUNPOD_SSH_PUBLIC_KEY", "inline-public-key")
+    monkeypatch.delenv("RUNPOD_SSH_PRIVATE_KEY_PATH", raising=False)
+    monkeypatch.delenv("RUNPOD_SSH_PUBLIC_KEY_PATH", raising=False)
+
+    config = RunPodConfig.from_env()
+
+    assert config.ssh_private_key == "inline-private-key"
+    assert config.ssh_public_key == "inline-public-key"
+
+
+def test_from_env_prefers_scoped_ssh_paths_over_inherited_inline_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("RUNPOD_API_KEY", "api-key")
+    monkeypatch.setenv("RUNPOD_SSH_PRIVATE_KEY", "retired-private-key")
+    monkeypatch.setenv("RUNPOD_SSH_PUBLIC_KEY", "retired-public-key")
+    monkeypatch.setenv("RUNPOD_SSH_PRIVATE_KEY_PATH", "/keys/scoped-runpod")
+    monkeypatch.setenv("RUNPOD_SSH_PUBLIC_KEY_PATH", "/keys/scoped-runpod.pub")
+
+    config = RunPodConfig.from_env()
+
+    assert config.ssh_private_key is None
+    assert config.ssh_public_key is None
+    assert config.ssh_private_key_path == "/keys/scoped-runpod"
+    assert config.ssh_public_key_path == "/keys/scoped-runpod.pub"
 
 
 def test_storage_volumes_are_comma_split(monkeypatch: pytest.MonkeyPatch) -> None:

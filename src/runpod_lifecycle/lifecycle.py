@@ -226,7 +226,10 @@ async def launch(
     ram_tiers = _build_ram_tiers(config)
     storage_targets = await _resolve_storage_targets(config)
 
-    input_storages = [value for value in [config.storage_name, *config.storage_volumes] if value]
+    input_storages: list[str] = []
+    for value in [config.storage_name, *config.storage_volumes]:
+        if value and value not in input_storages:
+            input_storages.append(value)
     if input_storages and not storage_targets:
         error = LaunchFailure(
             f"Configured storage volumes could not be resolved: {', '.join(input_storages)}"
