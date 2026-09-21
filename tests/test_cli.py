@@ -23,7 +23,27 @@ def test_cli_help_runs(capsys: pytest.CaptureFixture[str]) -> None:
         cli.build_parser().parse_args(["--help"])
     assert exc.value.code == 0
     out = capsys.readouterr().out
-    assert "list" in out and "find-orphans" in out and "terminate" in out
+    assert "list" in out and "find-orphans" in out and "terminate" in out and "resume" in out
+
+
+def test_resume_cli_accepts_capacity_wait_options() -> None:
+    args = cli.build_parser().parse_args(
+        [
+            "resume",
+            "pod-1",
+            "--wait-capacity",
+            "900",
+            "--retry-interval",
+            "60",
+            "--wait-ready",
+        ]
+    )
+
+    assert args.cmd == "resume"
+    assert args.pod_id == "pod-1"
+    assert args.wait_capacity == 900
+    assert args.retry_interval == 60
+    assert args.wait_ready is True
 
 
 def test_prebuilt_help_lists_validation_subcommands(capsys: pytest.CaptureFixture[str]) -> None:

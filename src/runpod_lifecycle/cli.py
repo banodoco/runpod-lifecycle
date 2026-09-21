@@ -19,7 +19,13 @@ from typing import Any
 from . import api, config as cfg, discovery
 from .config import RunPodConfig, load_runpod_env
 from .guard import PodGuard, install_signal_handlers
-from .lifecycle import find_gpu_type, get_network_volumes, launch as _launch, launch_when_available as _launch_when_available
+from .lifecycle import (
+    find_gpu_type,
+    get_network_volumes,
+    launch as _launch,
+    launch_when_available as _launch_when_available,
+    resume_when_available as _resume_when_available,
+)
 from .pod import Pod
 from .prebuilt import (
     PrebuiltEnvContract,
@@ -84,6 +90,18 @@ def _parse_csv_ints(value: str | None) -> tuple[int, ...]:
         if stripped:
             values.append(int(stripped))
     return tuple(values)
+
+
+def _resolve_cli_cuda_versions(args: argparse.Namespace) -> tuple[str, ...] | None:
+    raw = getattr(args, "allowed_cuda_versions", None)
+    source = raw if raw is not None else os.getenv("RUNPOD_ALLOWED_CUDA_VERSIONS")
+    if source is None:
+        return None
+    values = _parse_csv_values(source)
+    if not values:
+        flag = "--allowed-cuda-versions" if raw is not None else "RUNPOD_ALLOWED_CUDA_VERSIONS"
+        raise ValueError(f"{flag} must contain at least one version")
+    return values
 
 
 def _unique_values(values: list[str | None] | tuple[str | None, ...]) -> list[str]:
@@ -153,6 +171,13 @@ def _resolve_config(args: argparse.Namespace) -> RunPodConfig:
     if storage_volumes_arg is not None and str(storage_volumes_arg).strip():
         overrides["storage_volumes"] = _parse_csv_values(storage_volumes_arg)
 
+    cuda_versions_arg = getattr(args, "allowed_cuda_versions", None)
+    if cuda_versions_arg is not None:
+        parsed_cuda_versions = _parse_csv_values(cuda_versions_arg)
+        if not parsed_cuda_versions:
+            raise ValueError("--allowed-cuda-versions must contain at least one version")
+        overrides["allowed_cuda_versions"] = parsed_cuda_versions
+
     return RunPodConfig.from_env(**overrides)
 
 
@@ -221,6 +246,23 @@ async def _cmd_status(args: argparse.Namespace) -> int:
         print(f"pod {args.pod_id} not found", file=sys.stderr)
         return 1
     print(json.dumps(status, default=str, indent=2))
+    return 0
+
+
+async def _cmd_resume(args: argparse.Namespace) -> int:
+    api_key = _resolve_api_key(args)
+    pod = Pod(
+        args.pod_id,
+        args.pod_id,
+        RunPodConfig(api_key=api_key),
+    )
+    await _resume_when_available(
+        pod,
+        max_wait_sec=args.wait_capacity,
+        retry_interval_sec=args.retry_interval,
+    )
+    status = await pod.wait_ready(timeout=args.timeout) if args.wait_ready else await pod.status()
+    print(json.dumps({"pod_id": args.pod_id, "status": status}, default=str, indent=2))
     return 0
 
 
@@ -510,6 +552,7 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
         max_price_per_hour=args.max_price,
         require_secure_cloud=not args.allow_community_cloud,
         exclude_blackwell=args.exclude_blackwell,
+        allowed_cuda_versions=_resolve_cli_cuda_versions(args),
         container_disk_gb=args.container_disk_gb,
         datacenter_ids=datacenter_ids,
     )
@@ -1968,6 +2011,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="Show normalized status for a pod.")
     p_status.add_argument("pod_id")
 
+    p_resume = sub.add_parser(
+        "resume",
+        help="Resume an existing stopped Pod, waiting for its original GPU capacity.",
+    )
+    p_resume.add_argument("pod_id")
+    p_resume.add_argument(
+        "--wait-capacity",
+        type=int,
+        default=900,
+        help="Seconds to retry the existing Pod's start request (default: 900).",
+    )
+    p_resume.add_argument(
+        "--retry-interval",
+        type=int,
+        default=30,
+        help="Seconds between resume attempts (default: 30).",
+    )
+    p_resume.add_argument(
+        "--wait-ready",
+        action="store_true",
+        help="Wait for the Pod to expose SSH before returning.",
+    )
+    p_resume.add_argument(
+        "--timeout",
+        type=int,
+        default=600,
+        help="Seconds to wait for readiness when --wait-ready is set.",
+    )
+
     p_term = sub.add_parser("terminate", help="Terminate a pod.")
     p_term.add_argument("pod_id")
     p_term.add_argument("--yes", "-y", action="store_true", help="Skip confirmation.")
@@ -1997,6 +2069,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_launch.add_argument("--name", help="Pod name (default: auto-generated).")
     p_launch.add_argument("--gpu-type", help="GPU type (default: RTX 4090).")
     p_launch.add_argument("--image", help="Docker image (default: pytorch devel).")
+    p_launch.add_argument(
+        "--allowed-cuda-versions",
+        dest="allowed_cuda_versions",
+        help="Comma-separated CUDA host versions to pass to RunPod (e.g. 12.4,12.6).",
+    )
     p_launch.add_argument("--container-disk-gb", type=int, help="Container disk size GB.")
     p_launch.add_argument("--disk-size-gb", type=int, help="Pod disk size GB.")
     p_launch.add_argument("--min-memory-gb", type=int, help="Minimum host RAM GB for launch fallback.")
@@ -2109,6 +2186,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--exclude-blackwell",
         action="store_true",
         help="Drop Blackwell variants (hivemind reports training-quality regression).",
+    )
+    p_probe.add_argument(
+        "--allowed-cuda-versions",
+        dest="allowed_cuda_versions",
+        help="Comma-separated CUDA host versions for the availability query (e.g. 12.4,12.6).",
     )
     p_probe.add_argument(
         "--container-disk-gb",
@@ -2337,6 +2419,7 @@ def build_parser() -> argparse.ArgumentParser:
 _HANDLERS: dict[str, Any] = {
     "list": _cmd_list,
     "status": _cmd_status,
+    "resume": _cmd_resume,
     "terminate": _cmd_terminate,
     "find-orphans": _cmd_find_orphans,
     "gpu-types": _cmd_gpu_types,

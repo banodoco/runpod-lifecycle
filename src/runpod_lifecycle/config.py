@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
@@ -86,6 +87,22 @@ def _parse_int_tuple(value: str | None, default: tuple[int, ...]) -> tuple[int, 
     return tuple(int(part) for part in parts)
 
 
+def _normalize_cuda_versions(value: str | Iterable[str] | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    parts = (value,) if isinstance(value, str) else tuple(value)
+    result: list[str] = []
+    for part in parts:
+        if not isinstance(part, str):
+            raise TypeError("allowed_cuda_versions entries must be strings")
+        version = part.strip()
+        if not version or not re.fullmatch(r"\d+\.\d+", version):
+            raise ValueError("allowed_cuda_versions entries must be non-empty CUDA versions like '12.4'")
+        if version not in result:
+            result.append(version)
+    return tuple(result)
+
+
 def _normalize_gpu_type(
     value: str | Iterable[str] | None,
 ) -> tuple[str, ...]:
@@ -166,6 +183,7 @@ class RunPodConfig:
     env_vars: dict[str, str] = field(default_factory=dict)
     name_prefix: str = "pod"
     ports: str | None = None
+    allowed_cuda_versions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # Normalize list inputs to a tuple while preserving str inputs as-is.
@@ -174,6 +192,7 @@ class RunPodConfig:
         elif isinstance(self.gpu_type, tuple):
             # Re-normalize tuples to strip empties / whitespace consistently.
             object.__setattr__(self, "gpu_type", _normalize_gpu_type(self.gpu_type))
+        object.__setattr__(self, "allowed_cuda_versions", _normalize_cuda_versions(self.allowed_cuda_versions))
 
     @property
     def gpu_type_candidates(self) -> tuple[str, ...]:
@@ -186,8 +205,25 @@ class RunPodConfig:
     def from_env(cls, **overrides: Any) -> "RunPodConfig":
         load_runpod_env()
 
-        ssh_public_key_path = os.getenv("RUNPOD_SSH_PUBLIC_KEY_PATH")
-        ssh_private_key_path = os.getenv("RUNPOD_SSH_PRIVATE_KEY_PATH")
+        raw_cuda_versions = os.getenv("RUNPOD_ALLOWED_CUDA_VERSIONS")
+        if "allowed_cuda_versions" not in overrides and raw_cuda_versions is not None and not raw_cuda_versions.strip():
+            raise ValueError("RUNPOD_ALLOWED_CUDA_VERSIONS must contain at least one version")
+        if "allowed_cuda_versions" not in overrides and raw_cuda_versions is not None and not _parse_csv_tuple(raw_cuda_versions):
+            raise ValueError("RUNPOD_ALLOWED_CUDA_VERSIONS must contain at least one version")
+
+        # Astrid's subprocess environment policy treats names containing
+        # ``PRIVATE_KEY``/``PUBLIC_KEY`` as secret-like, even when the value
+        # is only a path.  The identity aliases are path-only names used at
+        # that boundary; the documented variables remain canonical for
+        # direct lifecycle-library callers.
+        ssh_public_key_path = (
+            os.getenv("RUNPOD_SSH_PUBLIC_KEY_PATH")
+            or os.getenv("RUNPOD_SSH_IDENTITY_PUBLIC_PATH")
+        )
+        ssh_private_key_path = (
+            os.getenv("RUNPOD_SSH_PRIVATE_KEY_PATH")
+            or os.getenv("RUNPOD_SSH_IDENTITY_PATH")
+        )
 
         data: dict[str, Any] = {
             "api_key": os.getenv("RUNPOD_API_KEY"),
@@ -220,6 +256,7 @@ class RunPodConfig:
             "env_vars": _parse_env_vars(os.getenv("RUNPOD_ENV_VARS")),
             "name_prefix": os.getenv("RUNPOD_NAME_PREFIX", "pod"),
             "ports": _parse_optional_string(os.getenv("RUNPOD_PORTS")),
+            "allowed_cuda_versions": _parse_csv_tuple(raw_cuda_versions),
         }
         data.update(overrides)
 

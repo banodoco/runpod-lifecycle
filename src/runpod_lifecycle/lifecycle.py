@@ -8,7 +8,8 @@ import os
 import time
 from typing import Any
 
-from .api import create_pod, find_gpu_type, get_network_volumes
+from . import api
+from .api import create_pod, find_gpu_type, get_network_volumes, start_pod
 from .config import RunPodConfig
 from .errors import LaunchFailure
 from .events import EventHooks, PodState, _emit_error, _emit_state
@@ -145,6 +146,7 @@ async def _try_launch_one_gpu(
                     min_memory_in_gb=ram_tier,
                     template_id=config.template_id,
                     ports=config.ports,
+                    allowed_cuda_versions=config.allowed_cuda_versions or None,
                 )
             except Exception as exc:
                 last_error = exc
@@ -175,6 +177,7 @@ async def _try_launch_one_gpu(
                 storage_volume=storage_volume_id,
             )
             pod._gpu_type = gpu_type
+            pod._allowed_cuda_versions = config.allowed_cuda_versions
             pod._storage_name = storage_name
             await _emit_state(
                 hooks,
@@ -359,4 +362,100 @@ async def launch_when_available(
             await asyncio.sleep(sleep_for)
 
 
-__all__ = ["find_gpu_type", "get_network_volumes", "launch", "launch_when_available"]
+async def resume_when_available(
+    pod: Pod,
+    *,
+    max_wait_sec: int = 900,
+    retry_interval_sec: int = 30,
+    hooks: EventHooks | None = None,
+) -> Pod:
+    """Resume an existing stopped Pod once its original host has capacity.
+
+    Unlike :func:`launch_when_available`, this never creates a replacement Pod
+    and never changes the Pod's GPU or storage. It retries the provider's
+    start request only for capacity failures, so the Pod's local ``/workspace``
+    volume remains the one being resumed.
+    """
+    if max_wait_sec < 0:
+        raise ValueError("max_wait_sec must be non-negative")
+    if retry_interval_sec <= 0:
+        raise ValueError("retry_interval_sec must be positive")
+
+    hooks = hooks or pod.hooks
+    deadline = time.monotonic() + max_wait_sec
+    attempt = 0
+
+    while True:
+        status = await pod.status()
+        desired_status = status.get("desired_status") if status else None
+        if desired_status == "RUNNING":
+            return pod
+        if desired_status in {"FAILED", "TERMINATED"}:
+            error = LaunchFailure(
+                f"Pod {pod.id} cannot be resumed from terminal state {desired_status}"
+            )
+            await _emit_error(hooks, error, {"pod_id": pod.id, "status": status or {}})
+            raise error
+
+        attempt += 1
+        try:
+            await asyncio.to_thread(start_pod, pod.id, pod.config.api_key)
+            await _emit_state(
+                hooks,
+                pod.id,
+                PodState.STARTING,
+                {"attempt": attempt, "pod_id": pod.id},
+            )
+            return pod
+        except Exception as exc:
+            if not api._is_capacity_error(exc):
+                error = LaunchFailure(f"Failed to resume pod {pod.id}: {exc}")
+                await _emit_error(hooks, error, {"pod_id": pod.id, "attempt": attempt})
+                raise error from exc
+
+            remaining = deadline - time.monotonic()
+            if max_wait_sec <= 0 or remaining <= 0:
+                error = LaunchFailure(
+                    f"Capacity did not become available to resume pod {pod.id} "
+                    f"after {attempt} attempts over {max_wait_sec}s: {exc}"
+                )
+                await _emit_error(
+                    hooks,
+                    error,
+                    {
+                        "pod_id": pod.id,
+                        "attempts": attempt,
+                        "max_wait_sec": max_wait_sec,
+                        "retry_interval_sec": retry_interval_sec,
+                    },
+                )
+                raise error from exc
+
+            sleep_for = min(retry_interval_sec, max(0.0, remaining))
+            logger.warning(
+                "Resume attempt %s failed; retrying in %.1fs before failing: %s",
+                attempt,
+                sleep_for,
+                exc,
+            )
+            await _emit_state(
+                hooks,
+                pod.id,
+                PodState.STARTING,
+                {
+                    "attempt": attempt,
+                    "retry_in_sec": sleep_for,
+                    "max_wait_sec": max_wait_sec,
+                    "last_error": str(exc),
+                },
+            )
+            await asyncio.sleep(sleep_for)
+
+
+__all__ = [
+    "find_gpu_type",
+    "get_network_volumes",
+    "launch",
+    "launch_when_available",
+    "resume_when_available",
+]

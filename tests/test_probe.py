@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -171,6 +172,26 @@ async def test_probe_query_uses_secure_cloud_flag(monkeypatch: pytest.MonkeyPatc
     captured2 = _patch_response(monkeypatch, [])
     await probe(api_key="k", require_secure_cloud=False)
     assert "secureCloud: false" in captured2["json"]["query"]
+
+
+def test_probe_query_passes_allowed_cuda_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    queries: list[str] = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"data": {"gpuTypes": []}}
+
+    def fake_post(_url, *, json, **_kwargs):
+        queries.append(json["query"])
+        return Response()
+
+    monkeypatch.setattr(probe_module.httpx, "post", fake_post)
+    asyncio.run(probe(api_key="k", allowed_cuda_versions=["12.4", "12.6"]))
+
+    assert "allowedCudaVersions: [\"12.4\", \"12.6\"]" in queries[0]
 
 
 @pytest.mark.asyncio

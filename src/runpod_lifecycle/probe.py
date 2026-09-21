@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 
-from .api import GRAPHQL_URL, _auth_headers
+from .api import GRAPHQL_URL, _auth_headers, normalize_allowed_cuda_versions
 
 logger = logging.getLogger("runpod_lifecycle.probe")
 
@@ -30,7 +30,7 @@ query GpuTypesProbe {
     memoryInGb
     secureCloud
     communityCloud
-    lowestPrice(input: {gpuCount: 1, secureCloud: __SECURE__}) {
+    lowestPrice(input: {gpuCount: 1, secureCloud: __SECURE____CUDA__}) {
       uninterruptablePrice
     }
   }
@@ -38,10 +38,16 @@ query GpuTypesProbe {
 """
 
 
-def _build_query(require_secure_cloud: bool) -> str:
+def _build_query(
+    require_secure_cloud: bool,
+    allowed_cuda_versions: tuple[str, ...] | None = None,
+) -> str:
+    cuda = ""
+    if allowed_cuda_versions:
+        cuda = ", allowedCudaVersions: [" + ", ".join(f'\"{v}\"' for v in allowed_cuda_versions) + "]"
     return _PROBE_QUERY_TEMPLATE.replace(
         "__SECURE__", "true" if require_secure_cloud else "false"
-    )
+    ).replace("__CUDA__", cuda)
 
 
 def _is_blackwell(gpu_id: str | None, display_name: str | None) -> bool:
@@ -50,9 +56,11 @@ def _is_blackwell(gpu_id: str | None, display_name: str | None) -> bool:
 
 
 async def _fetch_gpu_types(
-    api_key: str, require_secure_cloud: bool
+    api_key: str,
+    require_secure_cloud: bool,
+    allowed_cuda_versions: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    query = _build_query(require_secure_cloud)
+    query = _build_query(require_secure_cloud, allowed_cuda_versions)
 
     def _post() -> httpx.Response:
         return httpx.post(
@@ -91,6 +99,7 @@ async def probe(
     exclude_blackwell: bool = False,
     container_disk_gb: int = 100,
     datacenter_ids: list[str] | None = None,
+    allowed_cuda_versions: list[str] | tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Return a price-ranked list of viable pod configurations.
 
@@ -153,7 +162,8 @@ async def probe(
     # the first cut — see TODO above.
     del container_disk_gb
 
-    raw = await _fetch_gpu_types(api_key, require_secure_cloud)
+    normalized_cuda_versions = normalize_allowed_cuda_versions(allowed_cuda_versions)
+    raw = await _fetch_gpu_types(api_key, require_secure_cloud, normalized_cuda_versions)
 
     gpu_type_allowlist: set[str] | None = (
         set(gpu_types) if gpu_types is not None else None
@@ -203,6 +213,7 @@ async def probe(
                 "secure_cloud": bool(require_secure_cloud),
                 "is_blackwell": blackwell,
                 "datacenters_available": [],  # TODO: see docstring.
+                **({"allowed_cuda_versions": list(normalized_cuda_versions)} if normalized_cuda_versions else {}),
             }
         )
 

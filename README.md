@@ -142,6 +142,44 @@ runpod-lifecycle launch \
   --probe-only
 ```
 
+### Resuming a stopped Pod
+
+To require compatible host drivers, pass the CUDA versions supported by the
+image. The same filter is sent to RunPod's `allowedCudaVersions` placement
+input on every RAM/storage/GPU fallback attempt (and to `probe`'s
+`lowestPrice` availability query):
+
+```bash
+runpod-lifecycle launch --allowed-cuda-versions 12.4,12.6
+runpod-lifecycle probe --allowed-cuda-versions 12.4,12.6
+```
+
+The Python API accepts `allowed_cuda_versions=("12.4", "12.6")` on
+`create_pod`, `create_pod_with_fallbacks`, and `probe`. Omitting it preserves
+the provider's normal placement behavior. Values must be non-empty numeric
+CUDA versions such as `12.4`.
+
+`resume_when_available()` retries the start request for an existing stopped Pod
+when RunPod temporarily cannot put a GPU back on its original host. It does
+not create a replacement Pod or change the Pod's local volume.
+
+```python
+from runpod_lifecycle import resume_when_available
+
+pod = await resume_when_available(
+    stopped_pod,
+    max_wait_sec=900,
+    retry_interval_sec=30,
+)
+await pod.wait_ready(timeout=600)
+```
+
+The CLI equivalent is:
+
+```bash
+runpod-lifecycle resume POD_ID --wait-capacity 900 --retry-interval 30 --wait-ready
+```
+
 For direct file transport or other low-level SSH work, `Pod.open_ssh_client()` returns a connected `paramiko`-compatible client. Callers are responsible for closing the returned client when they are done with it.
 
 ### Detached runs on an existing pod

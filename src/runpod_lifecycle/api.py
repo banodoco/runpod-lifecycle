@@ -6,17 +6,44 @@ import contextlib
 import io
 import logging
 import os
+import re
 import time
 from typing import Any, Callable, Sequence
 
 import httpx
 
-try:
-    import runpod
-except ImportError:  # pragma: no cover - exercised indirectly before deps install.
-    runpod = None  # type: ignore[assignment]
+# Keep the provider SDK behind the call sites.  The Astrid executor sandbox
+# permits the declared HTTP/SSH transport but can deny platform probes made by
+# optional SDK dependencies during import (notably aiohttp -> os.uname).  The
+# REST/GraphQL paths remain sufficient for attach/status/SSH discovery and the
+# SDK is still loaded for launch-only operations when the host permits it.
+runpod = None  # type: ignore[assignment]
 
 logger = logging.getLogger("runpod_lifecycle.api")
+
+
+def normalize_allowed_cuda_versions(
+    versions: Sequence[str] | None,
+) -> tuple[str, ...] | None:
+    """Validate and normalize RunPod's allowed CUDA host versions."""
+    if versions is None:
+        return None
+    if isinstance(versions, str):
+        raise TypeError("allowed_cuda_versions must be a sequence of version strings")
+    normalized: list[str] = []
+    for version in versions:
+        if not isinstance(version, str):
+            raise TypeError("allowed_cuda_versions entries must be strings")
+        value = version.strip()
+        if not value or not re.fullmatch(r"\d+\.\d+", value):
+            raise ValueError(
+                "allowed_cuda_versions entries must be non-empty CUDA versions like '12.4'"
+            )
+        if value not in normalized:
+            normalized.append(value)
+    if not normalized:
+        raise ValueError("allowed_cuda_versions must contain at least one version")
+    return tuple(normalized)
 
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 NETWORK_VOLUMES_URL = "https://rest.runpod.io/v1/networkvolumes"
@@ -24,6 +51,14 @@ PODS_URL = "https://rest.runpod.io/v1/pods"
 
 
 def _get_runpod() -> Any:
+    global runpod
+    if runpod is None:
+        try:
+            import runpod as provider_sdk
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("RunPod SDK unavailable; using HTTP fallbacks: %s", exc)
+            return None
+        runpod = provider_sdk
     if runpod is None:
         raise RuntimeError("runpod package is required for RunPod API calls")
     return runpod
@@ -36,10 +71,11 @@ def _auth_headers(api_key: str) -> dict[str, str]:
 def get_network_volumes(api_key: str) -> list[dict[str, Any]]:
     """Return the account's RunPod network volumes."""
     sdk = _get_runpod()
-    sdk.api_key = api_key
+    if sdk is not None:
+        sdk.api_key = api_key
 
     try:
-        if hasattr(sdk, "get_network_volumes"):
+        if sdk is not None and hasattr(sdk, "get_network_volumes"):
             volumes = sdk.get_network_volumes()
             return volumes if isinstance(volumes, list) else []
     except Exception as exc:
@@ -94,9 +130,10 @@ def list_pods(api_key: str) -> list[dict[str, Any]]:
     mutation call.
     """
     sdk = _get_runpod()
-    sdk.api_key = api_key
+    if sdk is not None:
+        sdk.api_key = api_key
     try:
-        pods = sdk.get_pods()
+        pods = sdk.get_pods() if sdk is not None else None
         if isinstance(pods, list):
             return pods
         if pods is not None:
@@ -120,6 +157,8 @@ def list_pods(api_key: str) -> list[dict[str, Any]]:
 def find_gpu_type(gpu_display_name: str, api_key: str) -> dict[str, Any] | None:
     """Find a GPU type by display name or ID."""
     sdk = _get_runpod()
+    if sdk is None:
+        return None
     sdk.api_key = api_key
 
     try:
@@ -149,9 +188,14 @@ def create_pod(
     min_memory_in_gb: int = 32,
     template_id: str | None = None,
     ports: str | None = None,
+    allowed_cuda_versions: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Create a RunPod pod and return provision metadata immediately."""
     sdk = _get_runpod()
+    if sdk is None:
+        raise RuntimeError(
+            "RunPod SDK is unavailable in this runtime; pod provisioning requires the provider SDK"
+        )
     sdk.api_key = api_key
 
     cloud_type = os.getenv("RUNPOD_CLOUD_TYPE", "SECURE").strip().upper() or "SECURE"
@@ -169,11 +213,20 @@ def create_pod(
         "network_volume_id": network_volume_id,
     }
 
+    normalized_cuda_versions = normalize_allowed_cuda_versions(allowed_cuda_versions)
+    if normalized_cuda_versions is not None:
+        # The SDK maps this snake_case argument to GraphQL's
+        # ``allowedCudaVersions`` input on podFindAndDeployOnDemand.
+        params["allowed_cuda_versions"] = list(normalized_cuda_versions)
+
     if template_id:
         params["template_id"] = template_id
 
-    if network_volume_id:
-        params["volume_mount_path"] = volume_mount_path
+    # RunPod uses ``volume_in_gb`` for the pod-local volume when no network
+    # volume is attached.  The mount path still has to be sent explicitly;
+    # omitting it leaves the requested local volume unmounted and makes
+    # ``/workspace`` fall back to the container disk.
+    params["volume_mount_path"] = volume_mount_path
 
     pod_env: dict[str, str] = {}
     if env_vars:
@@ -204,6 +257,7 @@ def create_pod(
         "name": name,
         "gpu_type_id": gpu_type_id,
         "created": True,
+        **({"allowed_cuda_versions": list(normalized_cuda_versions)} if normalized_cuda_versions else {}),
     }
 
 
@@ -212,6 +266,8 @@ _CAPACITY_ERROR_MARKERS = (
     "there are no machines available",
     "no longer have any instances",
     "not enough capacity",
+    "not enough free gpu",
+    "no free gpu",
     "out of stock",
 )
 
@@ -237,6 +293,7 @@ def create_pod_with_fallbacks(
     min_memory_in_gb: int = 32,
     template_id: str | None = None,
     ports: str | None = None,
+    allowed_cuda_versions: Sequence[str] | None = None,
     max_full_passes: int = 5,
     retry_sleep_seconds: float = 60.0,
     on_attempt: Callable[[dict[str, Any]], None] | None = None,
@@ -257,6 +314,7 @@ def create_pod_with_fallbacks(
     """
     if not gpu_type_candidates:
         raise ValueError("gpu_type_candidates must contain at least one GPU type")
+    normalized_cuda_versions = normalize_allowed_cuda_versions(allowed_cuda_versions)
 
     resolved_gpus: list[tuple[str, str]] = []  # (display_name, gpu_type_id)
     for candidate in gpu_type_candidates:
@@ -325,6 +383,7 @@ def create_pod_with_fallbacks(
                         min_memory_in_gb=min_memory_in_gb,
                         template_id=template_id,
                         ports=ports,
+                        allowed_cuda_versions=normalized_cuda_versions,
                     )
                 except Exception as exc:
                     if _is_capacity_error(exc):
@@ -343,6 +402,8 @@ def create_pod_with_fallbacks(
                 pod["selected_volume_id"] = vol_id
                 pod["attempt"] = total_attempts
                 pod["pass"] = full_pass
+                if normalized_cuda_versions is not None:
+                    pod["allowed_cuda_versions"] = list(normalized_cuda_versions)
                 return pod
         if full_pass < max_full_passes and retry_sleep_seconds > 0:
             logger.info(
@@ -366,12 +427,32 @@ def create_pod_with_fallbacks(
 def _normalize_pod_status(runpod_id: str, status: dict[str, Any]) -> dict[str, Any]:
     runtime = status.get("runtime") if isinstance(status, dict) else None
     runtime = runtime if isinstance(runtime, dict) else {}
-    ports = runtime.get("ports", [])
+    ports = runtime.get("ports") or status.get("ports", [])
     ports = ports if isinstance(ports, list) else []
-    ip = runtime.get("ip") or next(
+    ip = runtime.get("ip") or status.get("publicIp") or next(
         (port.get("ip") for port in ports if isinstance(port, dict) and port.get("ip")),
         None,
     )
+    # REST currently returns compact port strings plus a separate mapping,
+    # while GraphQL/SDK return runtime port objects. Normalize the REST shape
+    # into the same object form consumed by SSH route and handle code.
+    if ports and all(isinstance(port, str) for port in ports):
+        mappings = status.get("portMappings")
+        mappings = mappings if isinstance(mappings, dict) else {}
+        normalized_ports: list[dict[str, Any]] = []
+        for port in ports:
+            match = re.match(r"^(\d+)/(tcp|http|https)$", port)
+            if not match:
+                continue
+            private_port = int(match.group(1))
+            public_port = mappings.get(str(private_port))
+            normalized_ports.append({
+                "ip": ip,
+                "privatePort": private_port,
+                "publicPort": public_port,
+                "type": match.group(2),
+            })
+        ports = normalized_ports
     return {
         "runpod_id": runpod_id,
         "desired_status": status.get("desiredStatus"),
@@ -460,14 +541,32 @@ def get_pod_status(runpod_id: str, api_key: str) -> dict[str, Any] | None:
     """Return normalized pod status details using snake_case keys."""
     try:
         sdk = _get_runpod()
-        sdk.api_key = api_key
-        status = sdk.get_pod(runpod_id)
-        if isinstance(status, dict) and status:
-            return _normalize_pod_status(runpod_id, status)
-        if status:
-            logger.warning("RunPod SDK returned unexpected pod status for %s: %r", runpod_id, status)
+        if sdk is not None:
+            sdk.api_key = api_key
+            status = sdk.get_pod(runpod_id)
+            if isinstance(status, dict) and status:
+                return _normalize_pod_status(runpod_id, status)
+            if status:
+                logger.warning("RunPod SDK returned unexpected pod status for %s: %r", runpod_id, status)
     except Exception as exc:
         logger.warning("RunPod SDK pod status lookup failed for %s: %s", runpod_id, exc)
+
+    # REST retains cost_per_hr when the GraphQL compatibility query has to
+    # fall back to its reduced schema. This is important for claim-handle
+    # normalization: missing provider pricing must fail closed, never become a
+    # guessed rate.
+    try:
+        response = httpx.get(
+            f"{PODS_URL}/{runpod_id}",
+            headers=_auth_headers(api_key),
+            timeout=30,
+        )
+        if response.status_code == 200:
+            payload = response.json()
+            if isinstance(payload, dict) and payload:
+                return _normalize_pod_status(runpod_id, payload)
+    except Exception as exc:
+        logger.warning("RunPod REST pod status lookup failed for %s: %s", runpod_id, exc)
 
     return _get_pod_status_graphql(runpod_id, api_key)
 
@@ -475,10 +574,11 @@ def get_pod_status(runpod_id: str, api_key: str) -> dict[str, Any] | None:
 def get_pod_ssh_details(pod_id: str, api_key: str) -> dict[str, Any] | None:
     """Return SSH details (ip, port, password) for a running pod."""
     sdk = _get_runpod()
-    sdk.api_key = api_key
+    if sdk is not None:
+        sdk.api_key = api_key
 
     try:
-        status = sdk.get_pod(pod_id)
+        status = sdk.get_pod(pod_id) if sdk is not None else None
         if isinstance(status, dict):
             runtime = status.get("runtime", {})
             if isinstance(runtime, dict):
@@ -491,6 +591,26 @@ def get_pod_ssh_details(pod_id: str, api_key: str) -> dict[str, Any] | None:
                         }
     except Exception as exc:
         logger.warning("RunPod SDK get_pod failed for %s: %s", pod_id, exc)
+
+    # The SDK is optional in the Astrid worker sandbox.  REST pod status
+    # includes the live runtime sshPassword on accounts/providers that expose
+    # it, whereas the reduced GraphQL compatibility query does not.  Resolve
+    # this before falling back to the historical ``runpod`` default; otherwise
+    # reattaching to a claim handle can reach the right endpoint with a stale
+    # password and fail authentication.
+    try:
+        status = get_pod_status(pod_id, api_key)
+        if isinstance(status, dict):
+            password = status.get("ssh_password") or "runpod"
+            for port_map in status.get("ports", []):
+                if isinstance(port_map, dict) and port_map.get("privatePort") == 22:
+                    return {
+                        "ip": port_map.get("ip") or status.get("ip"),
+                        "port": port_map.get("publicPort"),
+                        "password": password,
+                    }
+    except Exception as exc:
+        logger.warning("RunPod REST SSH detail lookup failed for %s: %s", pod_id, exc)
 
     query = """
     query PodSshDetails($podId: String!) {
@@ -534,6 +654,27 @@ def get_pod_ssh_details(pod_id: str, api_key: str) -> dict[str, Any] | None:
 
     logger.warning("Could not get SSH details for pod %s via SDK or GraphQL API", pod_id)
     return None
+
+
+def start_pod(pod_id: str, api_key: str) -> dict[str, Any]:
+    """Request that a stopped Pod be started.
+
+    RunPod exposes Pod start only through the REST API. The response is
+    intentionally returned without logging it because provider payloads can
+    contain environment and connection metadata.
+    """
+    response = httpx.post(
+        f"{PODS_URL}/{pod_id}/start",
+        headers=_auth_headers(api_key),
+        timeout=30,
+    )
+    if response.status_code not in (200, 202):
+        raise RuntimeError(
+            f"RunPod pod start failed for {pod_id}: "
+            f"HTTP {response.status_code}: {response.text[:500]}"
+        )
+    payload = response.json()
+    return payload if isinstance(payload, dict) else {"response": payload}
 
 
 def terminate_pod(
@@ -618,5 +759,6 @@ __all__ = [
     "get_network_volumes",
     "get_pod_ssh_details",
     "get_pod_status",
+    "start_pod",
     "terminate_pod",
 ]

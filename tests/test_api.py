@@ -70,6 +70,38 @@ def test_terminate_pod_rejects_false_terminal_acknowledgement(
         api.terminate_pod("p1", "test", verify_timeout_seconds=0)
 
 
+def test_start_pod_posts_to_provider_start_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append({"url": url, **kwargs})
+        return FakeResponse(202, {"id": "p1", "desiredStatus": "RUNNING"})
+
+    monkeypatch.setattr("runpod_lifecycle.api.httpx", SimpleNamespace(post=fake_post))
+
+    result = api.start_pod("p1", "test")
+
+    assert result["id"] == "p1"
+    assert calls[0]["url"] == "https://rest.runpod.io/v1/pods/p1/start"
+    assert calls[0]["headers"] == {"Authorization": "Bearer test"}
+
+
+def test_start_pod_surfaces_capacity_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(
+            post=lambda *args, **kwargs: FakeResponse(
+                500,
+                {"error": "There are not enough free GPUs on the host machine"},
+                text='{"error":"There are not enough free GPUs on the host machine"}',
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="not enough free GPUs"):
+        api.start_pod("p1", "test")
+
+
 def test_create_pod_with_fallbacks_deduplicates_volume_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -103,6 +135,25 @@ def test_create_pod_with_fallbacks_deduplicates_volume_candidates(
     assert calls[0]["network_volume_id"] == "vol-peter"
 
 
+def test_create_pod_with_fallbacks_preserves_cuda_filter_on_every_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("runpod_lifecycle.api.find_gpu_type", lambda name, key: {"id": name})
+    calls: list[dict[str, object]] = []
+
+    def fake_create_pod(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeError("not enough capacity")
+        return {"id": "pod-cuda"}
+
+    monkeypatch.setattr("runpod_lifecycle.api.create_pod", fake_create_pod)
+    result = api.create_pod_with_fallbacks(
+        "key", ["gpu-a", "gpu-b"], "image", retry_sleep_seconds=0,
+        allowed_cuda_versions=("13.0",),
+    )
+    assert result["allowed_cuda_versions"] == ["13.0"]
+    assert [call["allowed_cuda_versions"] for call in calls] == [("13.0",), ("13.0",)]
+
+
 def test_create_pod_suppresses_sdk_stdout_with_env_values(runpod_sdk_mock, capsys) -> None:
     runpod_sdk_mock.create_pod.side_effect = lambda **_kwargs: print(
         "raw_response: {'env': ['SUPABASE_SERVICE_ROLE_KEY=secret']}"
@@ -117,6 +168,26 @@ def test_create_pod_suppresses_sdk_stdout_with_env_values(runpod_sdk_mock, capsy
 
     assert pod["id"] == "pod-1"
     assert "secret" not in capsys.readouterr().out
+
+
+def test_create_pod_passes_allowed_cuda_versions_to_provider(runpod_sdk_mock) -> None:
+    runpod_sdk_mock.create_pod.return_value = {"id": "pod-cuda"}
+
+    pod = api.create_pod(
+        api_key="api-key",
+        gpu_type_id="gpu-1",
+        image_name="image",
+        allowed_cuda_versions=(" 12.4", "12.6", "12.4"),
+    )
+
+    assert pod["allowed_cuda_versions"] == ["12.4", "12.6"]
+    assert runpod_sdk_mock.create_pod.call_args.kwargs["allowed_cuda_versions"] == ["12.4", "12.6"]
+
+
+@pytest.mark.parametrize("value", [(), ("",), ("cuda12",), (12.4,)])
+def test_create_pod_rejects_invalid_allowed_cuda_versions(runpod_sdk_mock, value) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        api.create_pod("api-key", "gpu-1", "image", allowed_cuda_versions=value)
 
 
 def test_get_pod_status_handles_explicit_none_runtime(runpod_sdk_mock) -> None:
@@ -457,3 +528,34 @@ def test_get_pod_status_normalizes_keys(runpod_sdk_mock) -> None:
         "uptime_seconds": 60,
         "cost_per_hr": 0.69,
     }
+
+
+def test_get_pod_status_normalizes_current_rest_port_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    runpod_sdk_mock.get_pod.side_effect = RuntimeError("sdk unavailable")
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(
+            get=lambda *args, **kwargs: FakeResponse(
+                200,
+                {
+                    "id": "pod-123",
+                    "desiredStatus": "RUNNING",
+                    "publicIp": "203.0.113.10",
+                    "ports": ["22/tcp", "8888/http"],
+                    "portMappings": {"22": 53603, "8888": 58123},
+                },
+            ),
+            post=pytest.fail,
+        ),
+    )
+
+    status = api.get_pod_status("pod-123", "api-key")
+
+    assert status["ip"] == "203.0.113.10"
+    assert status["ports"] == [
+        {"ip": "203.0.113.10", "privatePort": 22, "publicPort": 53603, "type": "tcp"},
+        {"ip": "203.0.113.10", "privatePort": 8888, "publicPort": 58123, "type": "http"},
+    ]

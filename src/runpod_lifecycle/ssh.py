@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 import time
+from urllib.parse import urlsplit
 
 try:
     import paramiko
@@ -12,6 +14,43 @@ except ImportError:  # pragma: no cover - exercised indirectly before deps insta
     paramiko = None  # type: ignore[assignment]
 
 logger = logging.getLogger("runpod_lifecycle.ssh")
+
+
+def open_broker_socket(
+    proxy_url: str,
+    target_host: str,
+    target_port: int,
+    *,
+    timeout: int = 10,
+) -> socket.socket:
+    """Open a raw TCP stream through Astrid's host-owned CONNECT broker."""
+
+    parsed = urlsplit(proxy_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.port is None:
+        raise RuntimeError("broker proxy must be an explicit http(s)://host:port URL")
+    target = str(target_host).strip("[]")
+    authority = f"[{target}]:{int(target_port)}" if ":" in target else f"{target}:{int(target_port)}"
+    connection = socket.create_connection((parsed.hostname, parsed.port), timeout=timeout)
+    try:
+        connection.sendall(
+            f"CONNECT {authority} HTTP/1.1\r\n"
+            f"Host: {authority}\r\n"
+            "Proxy-Connection: Keep-Alive\r\n\r\n".encode("ascii")
+        )
+        response = b""
+        while b"\r\n\r\n" not in response and len(response) < 8192:
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        first_line = response.split(b"\r\n", 1)[0].decode("ascii", "replace")
+        if not first_line.startswith("HTTP/") or " 200 " not in first_line:
+            raise RuntimeError(f"broker CONNECT failed: {first_line or 'empty response'}")
+        connection.settimeout(None)
+        return connection
+    except Exception:
+        connection.close()
+        raise
 
 
 class SSHClient:
@@ -26,6 +65,7 @@ class SSHClient:
         private_key_path: str | None = None,
         private_key_content: str | None = None,
         timeout: int = 10,
+        proxy_url: str | None = None,
     ):
         self.hostname = hostname
         self.port = port
@@ -34,6 +74,7 @@ class SSHClient:
         self.private_key_path = private_key_path
         self.private_key_content = private_key_content
         self.timeout = timeout
+        self.proxy_url = proxy_url if proxy_url is not None else os.environ.get("ASTRID_BROKER_PROXY")
         self.client: paramiko.SSHClient | None = None
 
     def connect(self) -> None:
@@ -87,7 +128,31 @@ class SSHClient:
         if pkey is not None:
             connect_kwargs["pkey"] = pkey
 
-        self.client.connect(**connect_kwargs)
+        broker_socket = None
+        if self.proxy_url:
+            broker_socket = open_broker_socket(
+                self.proxy_url,
+                self.hostname,
+                self.port,
+                timeout=self.timeout,
+            )
+            connect_kwargs["sock"] = broker_socket
+        try:
+            self.client.connect(**connect_kwargs)
+            transport = self.client.get_transport()
+            if transport is not None:
+                # The host broker has a bounded idle select window.  Paramiko
+                # keepalives keep long GPU jobs from losing an otherwise quiet
+                # SSH tunnel without broadening the route grant.
+                transport.set_keepalive(
+                    max(1, int(os.environ.get("RUNPOD_SSH_KEEPALIVE_SECONDS", "5")))
+                )
+        except Exception:
+            if broker_socket is not None:
+                broker_socket.close()
+            self.client.close()
+            self.client = None
+            raise
 
     def execute_command(self, command: str, timeout: int = 600) -> tuple[int, str, str]:
         if not self.client:
@@ -131,4 +196,4 @@ class SSHClient:
             self.client = None
 
 
-__all__ = ["SSHClient"]
+__all__ = ["SSHClient", "open_broker_socket"]

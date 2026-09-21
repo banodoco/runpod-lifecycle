@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from runpod_lifecycle.errors import LaunchFailure
 from runpod_lifecycle.events import EventHooks, PodState
-from runpod_lifecycle.lifecycle import launch, launch_when_available
+from runpod_lifecycle.lifecycle import launch, launch_when_available, resume_when_available
 from runpod_lifecycle.pod import Pod
 
 
@@ -175,6 +175,76 @@ def test_launch_when_available_times_out_after_bounded_retries(
 
     assert sleeps == [10, 5]
     assert create_pod_mock.call_count == 3
+
+
+def test_resume_when_available_retries_existing_pod_start_until_capacity(
+    volumeless_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pod = Pod("pod-stopped", "pod-stopped", volumeless_config)
+    pod.status = AsyncMock(return_value={"desired_status": "EXITED"})
+    start_pod_mock = MagicMock(
+        side_effect=[
+            RuntimeError("There are not enough free GPUs on the host machine"),
+            RuntimeError("There are not enough free GPUs on the host machine"),
+            {"id": "pod-stopped", "desiredStatus": "RUNNING"},
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.start_pod", start_pod_mock)
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.asyncio.sleep", fake_sleep)
+
+    resumed = asyncio.run(
+        resume_when_available(
+            pod,
+            max_wait_sec=120,
+            retry_interval_sec=10,
+        )
+    )
+
+    assert resumed is pod
+    assert start_pod_mock.call_count == 3
+    assert sleeps == [10, 10]
+
+
+def test_resume_when_available_times_out_without_replacing_pod(
+    volumeless_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pod = Pod("pod-stopped", "pod-stopped", volumeless_config)
+    pod.status = AsyncMock(return_value={"desired_status": "EXITED"})
+    start_pod_mock = MagicMock(
+        side_effect=RuntimeError("There are not enough free GPUs on the host machine")
+    )
+    clock = {"value": 0.0}
+    sleeps: list[float] = []
+
+    def fake_monotonic() -> float:
+        return clock["value"]
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["value"] += seconds
+
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.start_pod", start_pod_mock)
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(LaunchFailure, match="Capacity did not become available to resume"):
+        asyncio.run(
+            resume_when_available(
+                pod,
+                max_wait_sec=15,
+                retry_interval_sec=10,
+            )
+        )
+
+    assert sleeps == [10, 5]
+    assert start_pod_mock.call_count == 3
 
 
 def test_launch_falls_back_to_second_storage_within_tier(

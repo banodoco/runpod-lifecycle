@@ -105,6 +105,22 @@ def test_from_env_prefers_scoped_ssh_paths_over_inherited_inline_keys(
     assert config.ssh_public_key_path == "/keys/scoped-runpod.pub"
 
 
+def test_from_env_accepts_astrid_identity_path_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setenv("RUNPOD_API_KEY", "api-key")
+    monkeypatch.delenv("RUNPOD_SSH_PRIVATE_KEY_PATH", raising=False)
+    monkeypatch.delenv("RUNPOD_SSH_PUBLIC_KEY_PATH", raising=False)
+    monkeypatch.setenv("RUNPOD_SSH_IDENTITY_PATH", "/keys/runpod")
+    monkeypatch.setenv("RUNPOD_SSH_IDENTITY_PUBLIC_PATH", "/keys/runpod.pub")
+
+    config = RunPodConfig.from_env()
+
+    assert config.ssh_private_key_path == "/keys/runpod"
+    assert config.ssh_public_key_path == "/keys/runpod.pub"
+
+
 def test_storage_volumes_are_comma_split(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("runpod_lifecycle.config.load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.setenv("RUNPOD_API_KEY", "api-key")

@@ -40,6 +40,36 @@ def test_get_pod_ssh_details_uses_sdk_path_without_http(
     assert details == {"ip": "1.2.3.4", "port": 2201, "password": "secret"}
 
 
+def test_get_pod_ssh_details_uses_rest_runtime_password(
+    monkeypatch: pytest.MonkeyPatch,
+    runpod_sdk_mock,
+) -> None:
+    runpod_sdk_mock.get_pod.side_effect = RuntimeError("sdk unavailable")
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(
+            get=lambda *args, **kwargs: FakeResponse(
+                200,
+                {
+                    "id": "pod-123",
+                    "desiredStatus": "RUNNING",
+                    "runtime": {
+                        "sshPassword": "rest-secret",
+                        "ports": [
+                            {"privatePort": 22, "publicPort": 2203, "ip": "9.8.7.6"},
+                        ],
+                    },
+                },
+            ),
+            post=pytest.fail,
+        ),
+    )
+
+    details = get_pod_ssh_details("pod-123", "api-key")
+
+    assert details == {"ip": "9.8.7.6", "port": 2203, "password": "rest-secret"}
+
+
 def test_get_pod_ssh_details_falls_back_to_graphql(
     monkeypatch: pytest.MonkeyPatch,
     runpod_sdk_mock,
