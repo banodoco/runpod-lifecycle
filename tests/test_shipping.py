@@ -8,10 +8,13 @@ Coverage:
 
 from __future__ import annotations
 
+import asyncio
 import os
+import io
 import shutil
 import tarfile
 import tempfile
+from unittest.mock import AsyncMock, MagicMock
 from pathlib import Path
 
 import pytest
@@ -19,6 +22,9 @@ import pytest
 from runpod_lifecycle.shipping import (
     _build_upload_tarball,
     _preflight_upload_disk,
+    _safe_extract_tar,
+    _scoped_token,
+    _upload_tarball,
     should_skip,
 )
 
@@ -115,6 +121,36 @@ class TestBuildUploadTarball:
         finally:
             tar_path.unlink(missing_ok=True)
 
+    def test_upload_tarball_quotes_remote_root(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        archive = tmp_path / "payload.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            info = tarfile.TarInfo("payload.txt")
+            info.size = 1
+            tar.addfile(info, io.BytesIO(b"x"))
+        monkeypatch.setattr(
+            "runpod_lifecycle.shipping._build_upload_tarball",
+            lambda _exclude, *, root: archive,
+        )
+        sftp = MagicMock()
+        client = MagicMock()
+        client.open_sftp.return_value = sftp
+        pod = MagicMock()
+        pod.open_ssh_client.return_value = client
+        pod.exec_ssh = AsyncMock(return_value=(0, "", ""))
+
+        asyncio.run(
+            _upload_tarball(
+                pod,
+                set(),
+                local_root=tmp_path,
+                remote_root="/tmp/root with spaces; echo injected",
+            )
+        )
+
+        command = pod.exec_ssh.await_args.args[0]
+        assert "rm -rf '/tmp/root with spaces; echo injected'" in command
+        assert "-C '/tmp/root with spaces; echo injected'" in command
+
     def test_creates_valid_tarball(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """_build_upload_tarball produces a valid gzipped tar file."""
         root = tmp_path / "payload2"
@@ -166,3 +202,68 @@ class TestPreflightUploadDisk:
 
         # Should not raise
         _preflight_upload_disk(temp_dir, 1024)  # tiny estimate
+
+
+class TestSafeArtifactExtraction:
+
+    def test_scoped_token_retains_nonce_for_long_scopes(self) -> None:
+        token = _scoped_token("scope-" + "x" * 200)
+        assert len(token) <= 64
+        assert len(token.rsplit("-", 1)[-1]) == 12
+
+    def _write_archive(self, path: Path, members: list[tarfile.TarInfo | tuple[str, bytes]]) -> None:
+        with tarfile.open(path, "w:gz") as archive:
+            for member in members:
+                if isinstance(member, tuple):
+                    name, payload = member
+                    info = tarfile.TarInfo(name)
+                    info.size = len(payload)
+                    archive.addfile(info, io.BytesIO(payload))
+                else:
+                    archive.addfile(member)
+
+    def test_extracts_result_envelope_and_declared_output_inside_custody(
+        self, tmp_path: Path
+    ) -> None:
+        archive = tmp_path / "bundle.tar.gz"
+        self._write_archive(
+            archive,
+            [
+                ("managed-generation-result.json", b'{"kind":"managed-generation-result.v1"}'),
+                ("outputs/final.mp4", b"video-bytes"),
+            ],
+        )
+        destination = tmp_path / "retrieved"
+        _safe_extract_tar(archive, destination)
+        assert (destination / "managed-generation-result.json").read_text() == (
+            '{"kind":"managed-generation-result.v1"}'
+        )
+        assert (destination / "outputs/final.mp4").read_bytes() == b"video-bytes"
+
+    @pytest.mark.parametrize(
+        "member",
+        ["/tmp/escaped", "../escaped", "nested/../../escaped"],
+    )
+    def test_rejects_path_escape_before_writing(self, tmp_path: Path, member: str) -> None:
+        archive = tmp_path / "unsafe.tar.gz"
+        self._write_archive(archive, [(member, b"no")])
+        destination = tmp_path / "retrieved"
+        with pytest.raises(RuntimeError, match="unsafe|escapes"):
+            _safe_extract_tar(archive, destination)
+        assert not (tmp_path / "escaped").exists()
+
+    def test_rejects_links_and_special_members(self, tmp_path: Path) -> None:
+        for kind in ("symlink", "hardlink", "fifo"):
+            archive = tmp_path / f"{kind}.tar.gz"
+            info = tarfile.TarInfo("output")
+            if kind == "symlink":
+                info.type = tarfile.SYMTYPE
+                info.linkname = "/tmp/escape"
+            elif kind == "hardlink":
+                info.type = tarfile.LNKTYPE
+                info.linkname = "other"
+            else:
+                info.type = tarfile.FIFOTYPE
+            self._write_archive(archive, [info])
+            with pytest.raises(RuntimeError, match="unsafe"):
+                _safe_extract_tar(archive, tmp_path / kind)

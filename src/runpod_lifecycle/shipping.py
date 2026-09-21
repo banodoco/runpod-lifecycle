@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import os
 import posixpath
+import re
+import shlex
 import shutil
 import tarfile
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -32,6 +35,59 @@ def _format_bytes(value: int) -> str:
 def _log_phase(name: str, detail: str = "") -> None:
     suffix = f" {detail}" if detail else ""
     print(f"phase={name}{suffix}", flush=True)
+
+
+def _scoped_token(value: str | None) -> str:
+    """Return a short shell-safe token for one transport attempt."""
+    raw = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "")).strip("-")
+    nonce = uuid.uuid4().hex[:12]
+    prefix = raw[: max(1, 64 - len(nonce) - 1)]
+    return f"{prefix}-{nonce}" if prefix else nonce
+
+
+def _safe_extract_tar(archive: Path, destination: Path) -> None:
+    """Extract only regular files/directories contained by *destination*.
+
+    Validation is completed for every member before the first write. Symlinks,
+    hardlinks, device nodes, absolute paths, parent traversal, and duplicate
+    destinations are rejected because the archive is remote input.
+    """
+    root = destination.resolve(strict=False)
+    root.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive, "r:gz") as tar:
+        members = tar.getmembers()
+        validated: list[tuple[tarfile.TarInfo, Path]] = []
+        seen: set[Path] = set()
+        for member in members:
+            name = member.name
+            relative = Path(name)
+            if (
+                not name
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or member.issym()
+                or member.islnk()
+                or not (member.isdir() or member.isfile())
+            ):
+                raise RuntimeError(f"unsafe artifact archive member: {name!r}")
+            target = (root / relative).resolve(strict=False)
+            if target != root and not target.is_relative_to(root):
+                raise RuntimeError(f"artifact archive member escapes custody: {name!r}")
+            if target in seen:
+                raise RuntimeError(f"duplicate artifact archive member: {name!r}")
+            seen.add(target)
+            validated.append((member, target))
+
+        for member, target in validated:
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = tar.extractfile(member)
+            if source is None:
+                raise RuntimeError(f"artifact archive member is unreadable: {member.name!r}")
+            with source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
 
 
 # ---------------------------------------------------------------------------
@@ -277,9 +333,10 @@ async def _upload_tarball(
         finally:
             client.close()
         _log_phase("extracting", f"remote_root={remote_root}")
+        quoted_remote_root = shlex.quote(remote_root)
         code, stdout, stderr = await pod.exec_ssh(
-            f"rm -rf {remote_root} && mkdir -p {remote_root} && "
-            f"tar --no-same-owner -xzf {remote_archive} -C {remote_root}",
+            f"rm -rf {quoted_remote_root} && mkdir -p {quoted_remote_root} && "
+            f"tar --no-same-owner -xzf {remote_archive} -C {quoted_remote_root}",
             timeout=300,
         )
         if code != 0:
@@ -335,7 +392,8 @@ async def download_artifact_archive(
     remote_root: str,
     artifact_paths: list[str],
     local_artifact_root: Path,
-    remote_archive_path: str = "/tmp/runpod-lifecycle-artifacts.tar.gz",
+    remote_archive_path: str | None = None,
+    scope: str | None = None,
     exit_code: int | None = None,
     remote_command: str | None = None,
     upload: dict[str, Any] | None = None,
@@ -346,21 +404,28 @@ async def download_artifact_archive(
     Returns *local_artifact_root* on success, ``None`` on failure.
     """
     local_artifact_root.mkdir(parents=True, exist_ok=True)
+    token = _scoped_token(scope or f"{local_artifact_root.name}-{uuid.uuid4().hex[:12]}")
+    remote_archive_path = remote_archive_path or f"/tmp/runpod-lifecycle-artifacts-{token}.tar.gz"
+    remote_error_path = f"/tmp/runpod-lifecycle-artifacts-{token}.err"
     _log_phase(
         "downloading_artifacts",
         f"local={local_artifact_root} remote_root={remote_root} paths={artifact_paths}",
     )
 
     # Build remote archive command
-    paths_str = " ".join(artifact_paths)
+    paths_str = " ".join(shlex.quote(path) for path in artifact_paths) or "''"
+    quoted_root = shlex.quote(remote_root)
+    quoted_archive = shlex.quote(remote_archive_path)
+    quoted_error = shlex.quote(remote_error_path)
+    empty_root = shlex.quote(f"/tmp/runpod-lifecycle-empty-artifacts-{token}")
     cmd = (
-        f"cd {remote_root} || exit $?; "
-        f"paths=''; "
-        f"for path in {paths_str}; do if [ -e \"$path\" ]; then paths=\"$paths $path\"; fi; done; "
-        f"if [ -z \"$paths\" ]; then mkdir -p /tmp/runpod-lifecycle-empty-artifacts && "
-        f"tar -czf {remote_archive_path} -C /tmp/runpod-lifecycle-empty-artifacts .; "
-        f"elif ! tar -czf {remote_archive_path} $paths 2>/tmp/runpod-lifecycle-artifact-tar.err; then "
-        f"cat /tmp/runpod-lifecycle-artifact-tar.err; exit 1; fi"
+        f"cd {quoted_root} || exit $?; "
+        f"set --; "
+        f"for path in {paths_str}; do if [ -e \"$path\" ]; then set -- \"$@\" \"$path\"; fi; done; "
+        f"if [ \"$#\" -eq 0 ]; then mkdir -p {empty_root} && "
+        f"tar -czf {quoted_archive} -C {empty_root} .; "
+        f"elif ! tar -czf {quoted_archive} -- \"$@\" 2>{quoted_error}; then "
+        f"cat {quoted_error}; exit 1; fi"
     )
 
     code, stdout, stderr = await pod.exec_ssh(cmd, timeout=300)
@@ -385,8 +450,11 @@ async def download_artifact_archive(
     finally:
         client.close()
 
-    with tarfile.open(local_artifact_root / "artifacts.tar.gz", "r:gz") as tar:
-        tar.extractall(local_artifact_root)
+    try:
+        _safe_extract_tar(local_artifact_root / "artifacts.tar.gz", local_artifact_root)
+    except (OSError, RuntimeError, tarfile.TarError) as exc:
+        print(f"artifact_download_failed={exc}", flush=True)
+        return None
 
     print(f"artifact_downloaded={local_artifact_root}", flush=True)
     return local_artifact_root
