@@ -10,7 +10,7 @@ from .discovery import (
     list_pods,
     terminate,
 )
-from .errors import LaunchFailure, NotReadyTimeout, RunPodError, SSHError, TerminateError
+from .errors import AllocationUnknown, LaunchFailure, NotReadyTimeout, RunPodError, SSHError, TerminateError
 from .events import EventHooks, PodEvent, PodState
 from .guard import (
     PodGuard,
@@ -68,6 +68,7 @@ from .shipping import (
 
 __all__ = [
     "RunPodConfig",
+    "AllocationUnknown",
     "Pod",
     "PodState",
     "PodEvent",

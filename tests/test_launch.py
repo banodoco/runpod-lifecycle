@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from runpod_lifecycle.errors import LaunchFailure
+from runpod_lifecycle.errors import AllocationUnknown, LaunchFailure
 from runpod_lifecycle.events import EventHooks, PodState
 from runpod_lifecycle.lifecycle import launch, launch_when_available, resume_when_available
 from runpod_lifecycle.pod import Pod
@@ -83,6 +83,44 @@ def test_launch_uses_ram_tier_fallback(base_config, monkeypatch: pytest.MonkeyPa
 
     assert pod._ram_tier == 32
     assert [call.kwargs["min_memory_in_gb"] for call in create_pod_mock.call_args_list] == [64, 64, 32]
+
+
+@pytest.mark.parametrize("response", [TimeoutError("ambiguous response"), RuntimeError("Pod creation failed (no pod ID returned)"), {}])
+def test_ambiguous_create_stops_after_one_call(base_config, monkeypatch: pytest.MonkeyPatch, response: object) -> None:
+    create = MagicMock(side_effect=response if isinstance(response, Exception) else None,
+                       return_value=response if isinstance(response, dict) else None)
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.find_gpu_type", lambda *_: {"id": "gpu-1"})
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.get_storage_volume_id", lambda _, name: f"id-{name}")
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.check_and_expand_storage", MagicMock())
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", create)
+
+    with pytest.raises(AllocationUnknown) as caught:
+        asyncio.run(launch_when_available(base_config, name="reconcile-me", max_wait_sec=10, retry_interval_sec=1))
+
+    assert create.call_count == 1
+    assert caught.value.status == "allocation_unknown"
+    assert caught.value.reconciliation_required is True
+    assert caught.value.request_name == "reconcile-me"
+    assert caught.value.storage_volume_id == "id-vol-a"
+
+
+def test_attach_only_existing_small_volume_never_resizes(base_config, monkeypatch: pytest.MonkeyPatch) -> None:
+    from runpod_lifecycle import storage
+
+    create = MagicMock(return_value={"id": "attached-pod"})
+    resize = MagicMock(side_effect=AssertionError("unexpected PATCH"))
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.find_gpu_type", lambda *_: {"id": "gpu-1"})
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.get_storage_volume_id", lambda *_: "vol-id")
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", create)
+    monkeypatch.setattr(storage.requests, "patch", resize)
+    monkeypatch.setattr(storage, "get_network_volumes", lambda *_: [{"id": "vol-id", "size": 20}])
+
+    pod = asyncio.run(launch(base_config.merge(storage_volumes=(), storage_name="existing", disk_size_gb=0, attach_only=True)))
+
+    assert pod.id == "attached-pod"
+    assert create.call_args.kwargs["network_volume_id"] == "vol-id"
+    assert create.call_args.kwargs["disk_in_gb"] == 0
+    resize.assert_not_called()
 
 
 def test_launch_when_available_retries_until_capacity_appears(
@@ -251,7 +289,7 @@ def test_launch_falls_back_to_second_storage_within_tier(
     base_config,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    create_pod_mock = MagicMock(side_effect=[RuntimeError("boom"), {"id": "pod-123"}])
+    create_pod_mock = MagicMock(side_effect=[RuntimeError("no longer any instances available"), {"id": "pod-123"}])
 
     monkeypatch.setattr(
         "runpod_lifecycle.lifecycle.find_gpu_type",
@@ -283,7 +321,7 @@ def test_launch_exhausted_fallback_emits_on_error_once(
     def on_error(error: Exception, detail: dict[str, object]) -> None:
         error_calls.append((str(error), detail))
 
-    create_pod_mock = MagicMock(side_effect=RuntimeError("all launch attempts failed"))
+    create_pod_mock = MagicMock(side_effect=RuntimeError("no longer any instances available"))
 
     monkeypatch.setattr(
         "runpod_lifecycle.lifecycle.find_gpu_type",
@@ -304,7 +342,7 @@ def test_launch_exhausted_fallback_emits_on_error_once(
 
     assert create_pod_mock.call_count == 4
     assert len(error_calls) == 1
-    assert error_calls[0][1]["last_error"] == "all launch attempts failed"
+    assert error_calls[0][1]["last_error"] == "no longer any instances available"
 
 
 def test_launch_raises_before_create_when_gpu_missing(
@@ -501,7 +539,7 @@ def test_launch_volumeless_uses_one_create_per_ram_tier_and_skips_storage_checks
     volumeless_config,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    create_pod_mock = MagicMock(side_effect=RuntimeError("volumeless failure"))
+    create_pod_mock = MagicMock(side_effect=RuntimeError("no longer any instances available"))
     expand_mock = MagicMock()
 
     monkeypatch.setattr(

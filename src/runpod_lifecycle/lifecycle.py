@@ -9,9 +9,9 @@ import time
 from typing import Any
 
 from . import api
-from .api import create_pod, find_gpu_type, get_network_volumes, start_pod
+from .api import _is_capacity_error, create_pod, find_gpu_type, get_network_volumes, start_pod
 from .config import RunPodConfig
-from .errors import LaunchFailure
+from .errors import AllocationUnknown, LaunchFailure
 from .events import EventHooks, PodState, _emit_error, _emit_state
 from .pod import Pod
 from .storage import check_and_expand_storage, get_storage_volume_id
@@ -118,7 +118,7 @@ async def _try_launch_one_gpu(
                 }
             )
 
-            if storage_volume_id and storage_volume_id not in expanded_storage_ids:
+            if storage_volume_id and not config.attach_only and storage_volume_id not in expanded_storage_ids:
                 await asyncio.to_thread(
                     check_and_expand_storage,
                     config.api_key,
@@ -149,24 +149,21 @@ async def _try_launch_one_gpu(
                     allowed_cuda_versions=config.allowed_cuda_versions or None,
                 )
             except Exception as exc:
-                last_error = exc
-                error_message = str(exc).lower()
-                if "no longer any instances available" in error_message:
-                    logger.warning(
-                        "No instances available for gpu=%s storage=%s ram=%sGB",
-                        gpu_type,
-                        storage_name,
-                        ram_tier,
-                    )
-                else:
-                    logger.warning(
-                        "Pod creation failed for gpu=%s storage=%s ram=%sGB: %s",
-                        gpu_type,
-                        storage_name,
-                        ram_tier,
-                        exc,
-                    )
-                continue
+                # Only a definite capacity rejection permits another create.
+                # Timeouts, transport errors, and malformed responses can mean
+                # the provider allocated a pod without returning its ID.
+                if not isinstance(exc, (TimeoutError, ConnectionError, OSError)) and _is_capacity_error(exc):
+                    last_error = exc
+                    logger.warning("Capacity rejected create for gpu=%s storage=%s ram=%sGB: %s", gpu_type, storage_name, ram_tier, exc)
+                    continue
+                raise AllocationUnknown(
+                    pod_name, gpu_type, ram_tier, storage_name, storage_volume_id,
+                ) from exc
+
+            if not isinstance(pod_details, dict) or not pod_details.get("id"):
+                raise AllocationUnknown(
+                    pod_name, gpu_type, ram_tier, storage_name, storage_volume_id,
+                )
 
             pod = Pod(
                 pod_id=pod_details["id"],
@@ -233,8 +230,10 @@ async def launch(
     for value in [config.storage_name, *config.storage_volumes]:
         if value and value not in input_storages:
             input_storages.append(value)
-    if input_storages and not storage_targets:
+    if (input_storages and not storage_targets) or (config.attach_only and not input_storages):
         error = LaunchFailure(
+            f"Attach-only requires a resolved existing storage volume: {', '.join(input_storages)}"
+            if config.attach_only else
             f"Configured storage volumes could not be resolved: {', '.join(input_storages)}"
         )
         await _emit_error(
@@ -265,6 +264,17 @@ async def launch(
                 storage_targets=storage_targets,
                 expanded_storage_ids=expanded_storage_ids,
             )
+        except AllocationUnknown as error:
+            await _emit_error(hooks, error, {
+                "name": error.request_name,
+                "status": error.status,
+                "reconciliation_required": True,
+                "gpu_type": error.gpu_type,
+                "ram_tier": error.ram_tier,
+                "storage_name": error.storage_name,
+                "storage_volume_id": error.storage_volume_id,
+            })
+            raise
         except _GpuCandidateFailure as failure:
             candidate_failures.append(failure)
             continue
@@ -323,6 +333,8 @@ async def launch_when_available(
         attempt += 1
         try:
             return await launch(config, name=name, hooks=hooks)
+        except AllocationUnknown:
+            raise
         except LaunchFailure as exc:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
