@@ -176,6 +176,7 @@ class RunPodConfig:
     ram_tiers: tuple[int, ...] = DEFAULT_RAM_TIERS
     storage_volumes: tuple[str, ...] = ()
     storage_name: str | None = None
+    attach_only: bool = False
     ssh_public_key: str | None = None
     ssh_private_key: str | None = None
     ssh_public_key_path: str | None = None
@@ -242,6 +243,7 @@ class RunPodConfig:
             "ram_tiers": _parse_int_tuple(os.getenv("RUNPOD_RAM_TIERS"), DEFAULT_RAM_TIERS),
             "storage_volumes": _parse_csv_tuple(os.getenv("RUNPOD_STORAGE_VOLUMES")),
             "storage_name": _parse_optional_string(os.getenv("RUNPOD_STORAGE_NAME")),
+            "attach_only": _parse_bool(os.getenv("RUNPOD_ATTACH_ONLY"), False),
             # Prefer scoped filesystem identities over any stale inline material
             # inherited from another dotenv file or parent process. Explicit
             # keyword overrides below continue to have final precedence.
