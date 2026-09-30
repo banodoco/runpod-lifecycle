@@ -11,7 +11,7 @@ from typing import Any
 
 from . import api
 from .config import RunPodConfig
-from .errors import LaunchFailure, NotReadyTimeout, SSHError, TerminateError
+from .errors import CleanupPendingError, LaunchFailure, NotReadyTimeout, SSHError, TerminateError
 from .events import EventHooks, PodState, _emit_error, _emit_state
 from .ssh import SSHClient
 from .storage import STORAGE_CHECK_COMMAND, evaluate_storage_health, parse_df_output
@@ -121,6 +121,13 @@ class Pod:
     async def terminate(self) -> None:
         try:
             await asyncio.to_thread(api.terminate_pod, self.id, self.config.api_key)
+        except CleanupPendingError as exc:
+            await _emit_error(
+                self.hooks,
+                exc,
+                {"pod_id": self.id, "status": exc.status, "cleanup_pending": True},
+            )
+            raise
         except Exception as exc:
             await _emit_error(self.hooks, exc, {"pod_id": self.id})
             raise TerminateError(f"Failed to terminate pod {self.id}: {exc}") from exc

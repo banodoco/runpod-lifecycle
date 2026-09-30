@@ -12,6 +12,8 @@ from typing import Any, Callable, Sequence
 
 import httpx
 
+from .errors import CleanupPendingError
+
 # Keep the provider SDK behind the call sites.  The Astrid executor sandbox
 # permits the declared HTTP/SSH transport but can deny platform probes made by
 # optional SDK dependencies during import (notably aiohttp -> os.uname).  The
@@ -677,6 +679,48 @@ def start_pod(pod_id: str, api_key: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {"response": payload}
 
 
+def _wait_for_pod_absence(
+    pod_id: str,
+    api_key: str,
+    *,
+    verify_timeout_seconds: float,
+    poll_interval_seconds: float,
+) -> None:
+    """Wait for this exact provider ID to disappear from account discovery."""
+    deadline = time.monotonic() + max(0.0, verify_timeout_seconds)
+    while True:
+        pods = list_pods(api_key)
+        if not any(str(pod.get("id") or "") == pod_id for pod in pods if isinstance(pod, dict)):
+            return
+        if time.monotonic() >= deadline:
+            raise CleanupPendingError(
+                pod_id,
+                f"pod remained present after {verify_timeout_seconds:.1f}s",
+            )
+        time.sleep(max(0.0, poll_interval_seconds))
+
+
+def reconcile_pod_cleanup(
+    pod_id: str,
+    api_key: str,
+    *,
+    verify_timeout_seconds: float = 90.0,
+    poll_interval_seconds: float = 2.0,
+) -> None:
+    """Reconcile cleanup for an exact pod ID without issuing another delete.
+
+    Callers may use this after :func:`terminate_pod` raises
+    :class:`CleanupPendingError`.  A later confirmed absence returns normally;
+    an unresolved resource remains explicitly ``cleanup_pending``.
+    """
+    _wait_for_pod_absence(
+        pod_id,
+        api_key,
+        verify_timeout_seconds=verify_timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+
+
 def terminate_pod(
     pod_id: str,
     api_key: str,
@@ -704,17 +748,12 @@ def terminate_pod(
     if response.status_code == 404:
         return
 
-    deadline = time.monotonic() + max(0.0, verify_timeout_seconds)
-    while True:
-        pods = list_pods(api_key)
-        if not any(str(pod.get("id") or "") == pod_id for pod in pods if isinstance(pod, dict)):
-            return
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                f"RunPod accepted termination for {pod_id} but the pod remained present "
-                f"after {verify_timeout_seconds:.1f}s"
-            )
-        time.sleep(max(0.0, poll_interval_seconds))
+    reconcile_pod_cleanup(
+        pod_id,
+        api_key,
+        verify_timeout_seconds=verify_timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+    )
 
 
 def create_network_volume(
@@ -759,6 +798,7 @@ __all__ = [
     "get_network_volumes",
     "get_pod_ssh_details",
     "get_pod_status",
+    "reconcile_pod_cleanup",
     "start_pod",
     "terminate_pod",
 ]

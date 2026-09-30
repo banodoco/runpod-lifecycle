@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from runpod_lifecycle import api
+from runpod_lifecycle.errors import CleanupPendingError
 
 
 class FakeResponse:
@@ -66,8 +67,33 @@ def test_terminate_pod_rejects_false_terminal_acknowledgement(
         lambda _key: [{"id": "p1", "desiredStatus": "RUNNING"}],
     )
 
-    with pytest.raises(RuntimeError, match="remained present"):
+    with pytest.raises(CleanupPendingError, match="cleanup_pending") as caught:
         api.terminate_pod("p1", "test", verify_timeout_seconds=0)
+    assert caught.value.pod_id == "p1"
+    assert caught.value.status == "cleanup_pending"
+
+
+def test_cleanup_pending_reconciles_exact_id_without_deleting_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delete_calls: list[str] = []
+    observed = iter([[{"id": "p1"}], []])
+    monkeypatch.setattr(
+        "runpod_lifecycle.api.httpx",
+        SimpleNamespace(
+            delete=lambda url, **kwargs: (delete_calls.append(url), FakeResponse(204, {}))[1],
+        ),
+    )
+    monkeypatch.setattr("runpod_lifecycle.api.list_pods", lambda _key: next(observed))
+    monkeypatch.setattr("runpod_lifecycle.api.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(CleanupPendingError) as caught:
+        api.terminate_pod("p1", "test", verify_timeout_seconds=0)
+    assert caught.value.pod_id == "p1"
+    assert len(delete_calls) == 1
+
+    api.reconcile_pod_cleanup("p1", "test", verify_timeout_seconds=0)
+    assert len(delete_calls) == 1
 
 
 def test_start_pod_posts_to_provider_start_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
