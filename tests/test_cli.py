@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -171,6 +172,121 @@ def test_cli_list_json(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFi
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert [p["id"] for p in payload] == ["a", "b"]
+
+
+def test_cli_status_redacts_credentials_without_changing_status_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "operator-api-key")
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
+    status = {
+        "runpod_id": "pod-1",
+        "desired_status": "RUNNING",
+        "ssh_password": "ssh-password-sentinel",
+        "runtime": {
+            "apiKey": "api-key-sentinel",
+            "RUNPOD_API_KEY": "runpod-api-key-sentinel",
+            "HF_TOKEN": "hf-token-sentinel",
+            "PASSWORD": "password-sentinel",
+            "runpod_api_key": "composite-api-key-sentinel",
+            "ssh_private_key": "private-key-sentinel",
+            "private_key": "private-key-sentinel",
+            "token": "token-sentinel",
+            "ports": [{"privatePort": 22, "publicPort": 2201}],
+        },
+        "ip": "203.0.113.10",
+    }
+    original_status = deepcopy(status)
+    monkeypatch.setattr("runpod_lifecycle.cli.api.get_pod_status", lambda *_: status)
+
+    assert cli.main(["status", "pod-1"]) == 0
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert "sentinel" not in captured.out
+    assert payload["desired_status"] == "RUNNING"
+    assert payload["ip"] == "203.0.113.10"
+    assert payload["ssh_password"] == "[REDACTED]"
+    assert payload["runtime"] == {
+        "apiKey": "[REDACTED]",
+        "RUNPOD_API_KEY": "[REDACTED]",
+        "HF_TOKEN": "[REDACTED]",
+        "PASSWORD": "[REDACTED]",
+        "runpod_api_key": "[REDACTED]",
+        "ssh_private_key": "[REDACTED]",
+        "private_key": "[REDACTED]",
+        "token": "[REDACTED]",
+        "ports": [{"privatePort": 22, "publicPort": 2201}],
+    }
+    assert status == original_status
+
+
+def test_cli_resume_redacts_credentials_from_operator_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "operator-api-key")
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
+    status = {
+        "desired_status": "RUNNING",
+        "ssh_password": "resume-password-sentinel",
+        "access_token": "resume-token-sentinel",
+        "nested": [
+            {
+                "RUNPOD_API_KEY": "resume-runpod-api-key-sentinel",
+                "HF_TOKEN": "resume-hf-token-sentinel",
+                "PASSWORD": "resume-password-sentinel",
+                "runpod_api_key": "resume-composite-api-key-sentinel",
+                "ssh_private_key": "resume-private-key-sentinel",
+                "privatePort": 22,
+                "publicPort": 2201,
+            }
+        ],
+    }
+    original_status = deepcopy(status)
+
+    class FakePod:
+        def __init__(self, pod_id, name, config):
+            assert pod_id == name == "pod-1"
+            assert config.api_key == "operator-api-key"
+
+        async def status(self):
+            return status
+
+        async def wait_ready(self, timeout: int):
+            assert timeout == 17
+            return status
+
+    async def fake_resume(pod, **kwargs):
+        assert isinstance(pod, FakePod)
+        assert kwargs == {"max_wait_sec": 900, "retry_interval_sec": 30}
+        return pod
+
+    monkeypatch.setattr("runpod_lifecycle.cli.Pod", FakePod)
+    monkeypatch.setattr("runpod_lifecycle.cli._resume_when_available", fake_resume)
+
+    assert cli.main(["resume", "pod-1", "--wait-ready", "--timeout", "17"]) == 0
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert "sentinel" not in captured.out
+    assert payload["pod_id"] == "pod-1"
+    assert payload["status"]["desired_status"] == "RUNNING"
+    assert payload["status"]["ssh_password"] == "[REDACTED]"
+    assert payload["status"]["access_token"] == "[REDACTED]"
+    assert payload["status"]["nested"] == [
+        {
+            "RUNPOD_API_KEY": "[REDACTED]",
+            "HF_TOKEN": "[REDACTED]",
+            "PASSWORD": "[REDACTED]",
+            "runpod_api_key": "[REDACTED]",
+            "ssh_private_key": "[REDACTED]",
+            "privatePort": 22,
+            "publicPort": 2201,
+        }
+    ]
+    assert status == original_status
 
 
 def test_cli_find_orphans_reads_known_ids(

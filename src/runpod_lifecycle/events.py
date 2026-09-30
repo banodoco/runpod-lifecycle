@@ -35,7 +35,7 @@ class EventHooks:
 
 
 async def _maybe_await(result: object) -> None:
-    if inspect.iscoroutine(result):
+    if inspect.isawaitable(result):
         await result
 
 

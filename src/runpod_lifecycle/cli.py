@@ -220,6 +220,58 @@ def _print_cost(summaries: list[discovery.PodSummary]) -> None:
     )
 
 
+_REDACTED_STATUS_VALUE = "[REDACTED]"
+_CREDENTIAL_STATUS_KEY_MARKERS = {
+    "access_key",
+    "api_key",
+    "apikey",
+    "auth",
+    "authorization",
+    "bearer",
+    "client_secret",
+    "cookie",
+    "credential",
+    "credentials",
+    "password",
+    "passwd",
+    "private_key",
+    "secret",
+    "token",
+}
+
+
+def _is_credential_status_key(key: object) -> bool:
+    if not isinstance(key, str):
+        return False
+    normalized = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", key)
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", normalized)
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").casefold()
+    parts = set(normalized.split("_"))
+    if parts & _CREDENTIAL_STATUS_KEY_MARKERS:
+        return True
+    padded = f"_{normalized}_"
+    return any(
+        f"_{marker}_" in padded
+        for marker in ("access_key", "api_key", "client_secret", "private_key")
+    )
+
+
+def _redact_operator_status(value: Any) -> Any:
+    """Copy a status payload while masking credential-like fields for JSON output."""
+    if isinstance(value, dict):
+        return {
+            key: _REDACTED_STATUS_VALUE
+            if _is_credential_status_key(key)
+            else _redact_operator_status(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_operator_status(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_operator_status(item) for item in value)
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Async handlers for each subcommand
 # ---------------------------------------------------------------------------
@@ -245,7 +297,7 @@ async def _cmd_status(args: argparse.Namespace) -> int:
     if not status:
         print(f"pod {args.pod_id} not found", file=sys.stderr)
         return 1
-    print(json.dumps(status, default=str, indent=2))
+    print(json.dumps(_redact_operator_status(status), default=str, indent=2))
     return 0
 
 
@@ -262,7 +314,13 @@ async def _cmd_resume(args: argparse.Namespace) -> int:
         retry_interval_sec=args.retry_interval,
     )
     status = await pod.wait_ready(timeout=args.timeout) if args.wait_ready else await pod.status()
-    print(json.dumps({"pod_id": args.pod_id, "status": status}, default=str, indent=2))
+    print(
+        json.dumps(
+            _redact_operator_status({"pod_id": args.pod_id, "status": status}),
+            default=str,
+            indent=2,
+        )
+    )
     return 0
 
 
