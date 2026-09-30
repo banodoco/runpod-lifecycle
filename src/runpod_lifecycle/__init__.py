@@ -12,6 +12,7 @@ from .discovery import (
 )
 from .errors import (
     AllocationUnknown,
+    CleanupPendingError,
     LaunchFailure,
     NotReadyTimeout,
     PostCreateHookFailure,
@@ -26,7 +27,7 @@ from .guard import (
     install_signal_handlers,
     prune_pods_by_prefix,
 )
-from .api import create_network_volume
+from .api import create_network_volume, reconcile_pod_cleanup
 from .prebuilt import (
     PREBUILT_HEALTH_SCHEMA_VERSION,
     PrebuiltEnvContract,
@@ -77,6 +78,7 @@ from .shipping import (
 __all__ = [
     "RunPodConfig",
     "AllocationUnknown",
+    "CleanupPendingError",
     "PostCreateHookFailure",
     "Pod",
     "PodState",
@@ -94,6 +96,7 @@ __all__ = [
     "find_gpu_type",
     "get_network_volumes",
     "create_network_volume",
+    "reconcile_pod_cleanup",
     "list_pods",
     "find_pods",
     "find_orphans",

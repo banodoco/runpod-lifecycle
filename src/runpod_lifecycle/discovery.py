@@ -9,7 +9,7 @@ from typing import Any, Callable, Iterable
 
 from . import api
 from .config import RunPodConfig
-from .errors import LaunchFailure, TerminateError
+from .errors import CleanupPendingError, LaunchFailure, TerminateError
 from .events import EventHooks, PodState, _emit_error, _emit_state
 from .pod import Pod
 
@@ -136,6 +136,13 @@ async def terminate(
     """Terminate a pod by id without needing a Pod handle. Raises TerminateError on failure."""
     try:
         await asyncio.to_thread(api.terminate_pod, pod_id, api_key)
+    except CleanupPendingError as exc:
+        await _emit_error(
+            hooks,
+            exc,
+            {"pod_id": pod_id, "status": exc.status, "cleanup_pending": True},
+        )
+        raise
     except Exception as exc:
         await _emit_error(hooks, exc, {"pod_id": pod_id, "operation": "terminate"})
         raise TerminateError(f"Failed to terminate pod {pod_id}: {exc}") from exc

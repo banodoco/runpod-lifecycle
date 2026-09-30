@@ -71,3 +71,24 @@ class SSHError(RunPodError):
 
 class TerminateError(RunPodError):
     """Raised when pod termination fails."""
+
+
+class CleanupPendingError(TerminateError):
+    """Termination was accepted, but exact provider-side absence is unresolved.
+
+    The pod ID is retained so a caller can reconcile the same resource later.
+    This is deliberately not a launch-retry signal: issuing a new create while
+    cleanup is unresolved would violate provider-resource custody.
+    """
+
+    status = "cleanup_pending"
+    cleanup_pending = True
+    retryable = False
+
+    def __init__(self, pod_id: str, detail: str) -> None:
+        self.pod_id = pod_id
+        self.detail = detail
+        super().__init__(
+            f"cleanup_pending for pod {pod_id!r}; exact provider-side absence "
+            f"is unresolved: {detail}"
+        )

@@ -78,6 +78,12 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+Termination is verified against the exact pod ID. If RunPod accepts the delete
+but the ID is still visible when verification expires, `CleanupPendingError`
+retains that ID and reports `cleanup_pending`; call
+`reconcile_pod_cleanup(pod_id, api_key)` later to poll the same resource
+without issuing another delete or creating a replacement.
+
 If `storage_name` is unset and `storage_volumes` is empty, `launch()` creates a volumeless pod by passing `network_volume_id=None`. That is intentional new behavior in this package.
 
 ### Multi-GPU fallback
