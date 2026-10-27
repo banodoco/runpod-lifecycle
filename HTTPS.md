@@ -79,10 +79,60 @@ original token; never construct a new random token for an existing claim.
 Tokens are not recoverable from public proxy URLs. Do not put them in shell
 arguments, logs, patches, or ordinary handles.
 
+## Module bootstrap observation policy
+
+Trusted startup code can restrict the single-file agent through the optional
+keyword on `runpod_lifecycle.https.agent_bootstrap`:
+
+```python
+from runpod_lifecycle.https import agent_bootstrap
+
+boot = agent_bootstrap(token, observation_policy={
+    "schema": "astrid.pod-observation.v1",
+    "roots": ["/workspace/astrid/startup/attempt/observations"],
+    "files": ["/workspace/h3-golden/releases/release/.astrid-engine/install.json"],
+})
+```
+
+The exact fields are `schema`, `roots` (up to 8 curated absolute directories),
+and `files` (up to 32 exact public file paths). Unknown fields, duplicate paths
+(including across the arrays), empty combined allowlists, `/`, relative paths,
+dot/traversal or empty components, backslashes and NUL are rejected. Paths may
+be absent at startup. Only safe regular files can subsequently be downloaded;
+symlinks in any component, hardlinked files and nonregular files are refused.
+Directory traversal and the final open use directory descriptors with
+`O_NOFOLLOW`; reads and metadata checks use the same opened file.
+
+The bootstrap validates before producing boot material and passes public JSON
+in `ASTRID_POD_OBSERVATION_B64`. The complete base64 value is limited to 16384
+ASCII bytes (at most 12288 decoded bytes). Startup removes this variable along
+with the existing token/source variables and validates before binding a listener.
+Policy fields contain no credentials; the existing bearer stays in agent memory.
+These are application limits, not provider payload qualification.
+
+Observation mode authenticates before routing and allows only `GET /health`,
+`POST /download-chunk` and `GET /files` for the configured files/descendants.
+Other routes and methods return a generic refusal, including jobs, polling,
+cancellation and uploads. Requests cannot register new paths or change policy.
+Health remains `{"ok": true, "protocol": 1}` and describes agent readiness.
+Existing JSON/range framing, representation identity and chunk SHA checks apply.
+Use `HttpsPodTransport.connect()` and `get()`; observation needs no command or
+upload operations. The default `observation_policy=None` retains the general
+agent behavior described below.
+
+The startup publisher must sanitize and close public log segments before
+publication and keep private state outside every allowlisted root. The intended
+publisher limits are 1 MiB per closed log segment and 8 MiB retained per stream
+per attempt; this file-access policy does not implement log rotation/retention.
+Startup supervisor/installer wiring remains separate. This keyword is only a
+module bootstrap interface; provider-create/config/CLI observation options are
+not implemented here.
+
 ## Wire protocol and limits
 
 Every endpoint requires `Authorization: Bearer <claim-token>` and uses
-constant-time authentication. Health returns protocol version 1.
+constant-time authentication. Health returns protocol version 1. The full table
+below describes the default general agent; observation restricts it as above.
 
 | Request | Operation |
 | --- | --- |
@@ -133,8 +183,9 @@ that bound. It has no multi-user isolation, file quota, or log quota.
 ## Security and rollout status
 
 Knowing a pod URL alone permits no command, file or health access. A stolen
-claim token grants arbitrary commands and file access as the pod user (normally
-root), equivalent to the SSH credential it replaces. It is not a read-only API.
+claim token in default general mode grants arbitrary commands and file access as
+the pod user (normally root), equivalent to the SSH credential it replaces.
+Observation mode restricts that token to the configured read-only operations.
 RunPod terminates public TLS and forwards HTTP to the pod; RunPod, trusted egress
 proxies and account administrators who can inspect pod env must be trusted.
 Do not expose the origin port through an additional raw TCP mapping. The agent

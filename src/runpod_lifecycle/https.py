@@ -27,22 +27,33 @@ class PodTransportError(RuntimeError):
     """Deliberately contains no request bodies, headers or token material."""
 
 
-def agent_bootstrap(token: str, port: int = PORT) -> dict:
+def agent_bootstrap(token: str, port: int = PORT, *, observation_policy=None) -> dict:
     """Create SDK/REST-independent boot material. The token is only in env.
 
     Inlining the compressed single-file agent avoids mutable download URLs and
     any package installs on stock runpod/base images.
+
+    observation_policy is an optional public astrid.pod-observation.v1 mapping
+    with roots (up to 8 curated directories) and files (up to 32 exact paths).
+    It restricts the agent to authenticated health/downloads. Its base64 JSON
+    env value is capped at 16384 ASCII bytes and consumed at agent startup.
+    None preserves the general command/file agent.
     """
     import zlib
     if len(token) < 32 or not token.isascii():
         raise ValueError("claim token must have at least 32 ASCII characters")
+    policy = (None if observation_policy is None
+              else pod_agent.ObservationPolicy(observation_policy))
     source = Path(pod_agent.__file__).read_bytes()
     payload = base64.b64encode(zlib.compress(source, 9)).decode()
     loader = ("import os,base64,zlib; "
               "exec(compile(zlib.decompress(base64.b64decode(os.environ.pop('ASTRID_POD_AGENT_B64'))),"
               "'<astrid-pod-agent>','exec'))")
     command = "python3 -u -c " + shlex.quote(loader)
-    return {"env": {TOKEN_ENV: token, "ASTRID_POD_AGENT_B64": payload, "ASTRID_POD_PORT": str(port)},
+    environment = {TOKEN_ENV: token, "ASTRID_POD_AGENT_B64": payload, "ASTRID_POD_PORT": str(port)}
+    if policy is not None:
+        environment[pod_agent.OBSERVATION_ENV] = policy.encoded
+    return {"env": environment,
             "ports": f"{port}/http", "docker_args": "bash -lc " + shlex.quote("exec " + command),
             "docker_entrypoint": ["/bin/bash", "-lc"], "docker_start_cmd": ["exec " + command]}
 
