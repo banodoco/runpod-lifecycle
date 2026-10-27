@@ -148,7 +148,7 @@ async def probe(
     constraints = _constraints(require_secure_cloud, container_disk_gb, allowed_cuda_versions)
     normalized_cuda_versions = normalize_allowed_cuda_versions(allowed_cuda_versions)
     if datacenter_ids is not None:
-        catalogue = await _query(api_key, "query GpuTypesProbe { gpuTypes { id displayName memoryInGb } }", {})
+        catalogue = await _query(api_key, "query GpuCatalogue { gpuTypes { id displayName memoryInGb } }", {})
         raw = catalogue.get("gpuTypes") or []
     else:
         raw = await _fetch_gpu_types(api_key, require_secure_cloud, normalized_cuda_versions)
