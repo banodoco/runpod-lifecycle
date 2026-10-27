@@ -37,15 +37,21 @@ def open_broker_socket(
             f"Host: {authority}\r\n"
             "Proxy-Connection: Keep-Alive\r\n\r\n".encode("ascii")
         )
-        response = b""
-        while b"\r\n\r\n" not in response and len(response) < 8192:
-            chunk = connection.recv(4096)
+        response = bytearray()
+        while not response.endswith(b"\r\n\r\n"):
+            if len(response) == 8192:
+                raise RuntimeError("broker CONNECT failed: response headers exceed 8192 bytes")
+            # Return the original socket, with every application byte still in
+            # its receive buffer. A chunk read can swallow an SSH banner sent
+            # together with the CONNECT response; no bytes may be read past
+            # the delimiter without a buffering wrapper for all socket APIs.
+            chunk = connection.recv(1)
             if not chunk:
-                break
-            response += chunk
-        first_line = response.split(b"\r\n", 1)[0].decode("ascii", "replace")
-        if not first_line.startswith("HTTP/") or " 200 " not in first_line:
-            raise RuntimeError(f"broker CONNECT failed: {first_line or 'empty response'}")
+                raise RuntimeError("broker CONNECT failed: incomplete response headers")
+            response.extend(chunk)
+        status = response.split(b"\r\n", 1)[0].split(b" ", 2)
+        if len(status) < 2 or status[0] not in (b"HTTP/1.0", b"HTTP/1.1") or status[1] != b"200":
+            raise RuntimeError("broker CONNECT failed: invalid or unsuccessful HTTP status")
         connection.settimeout(None)
         return connection
     except Exception:
