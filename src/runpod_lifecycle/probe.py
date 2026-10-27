@@ -13,6 +13,8 @@ from dataclasses import asdict
 from typing import Any
 
 import httpx
+import os
+import sys
 
 from .api import GRAPHQL_URL, _auth_headers, normalize_allowed_cuda_versions
 from .availability import _QueryUnavailable, _constraints, _fetch_datacenters, _for_gpu, _query
@@ -158,6 +160,8 @@ async def probe(
     )
 
     results: list[dict[str, Any]] = []
+    if os.environ.get("RUNPOD_PROBE_DIAGNOSTICS"):
+        print(f"probe catalogue rows: {len(raw)}", file=sys.stderr)
     for entry in raw:
         if not isinstance(entry, dict):
             continue
@@ -218,6 +222,8 @@ async def probe(
                 available = [dc for dc in dcs if dc.status == "available" and
                              (max_price_per_hour is None or dc.price_per_hour <= max_price_per_hour)]
                 result["datacenter_availability"] = [asdict(dc) for dc in dcs]
+                if os.environ.get("RUNPOD_PROBE_DIAGNOSTICS") and any(dc.status != "unavailable" for dc in dcs):
+                    print(result["gpu_type_id"], result["datacenter_availability"], file=sys.stderr)
                 result["datacenters_available"] = [dc.datacenter_id for dc in available]
                 result["availability_status"] = (
                     "available" if available else "unknown" if any(dc.status == "unknown" for dc in dcs) else "unavailable"
