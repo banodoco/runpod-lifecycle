@@ -12,7 +12,7 @@ from typing import Any, Callable, Sequence
 
 import httpx
 
-from .errors import CleanupPendingError
+from .errors import CleanupPendingError, ProviderRequestRejected, ProviderCapacityUnavailable
 
 # Keep the provider SDK behind the call sites.  The Astrid executor sandbox
 # permits the declared HTTP/SSH transport but can deny platform probes made by
@@ -177,7 +177,7 @@ def find_gpu_type(gpu_display_name: str, api_key: str) -> dict[str, Any] | None:
 
 def create_pod(
     api_key: str,
-    gpu_type_id: str,
+    gpu_type_id: str | None,
     image_name: str,
     name: str = "worker-pod",
     network_volume_id: str | None = None,
@@ -191,8 +191,59 @@ def create_pod(
     template_id: str | None = None,
     ports: str | None = None,
     allowed_cuda_versions: Sequence[str] | None = None,
+    compute_type: str = "GPU",
+    cpu_flavor_ids: Sequence[str] = ("cpu3c", "cpu5c"),
+    cpu_flavor_priority: str = "custom",
+    vcpu_count: int = 2,
+    data_center_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a RunPod pod and return provision metadata immediately."""
+    pod_env = dict(env_vars or {})
+    if public_key_string:
+        pod_env["PUBLIC_KEY"] = public_key_string
+    if compute_type == "CPU":
+        if cpu_flavor_priority not in {"availability", "custom"}:
+            raise ValueError("CPU flavor priority must be availability or custom")
+        payload = {"name": name, "imageName": image_name, "computeType": "CPU",
+                   "cloudType": "SECURE", "vcpuCount": vcpu_count,
+                   "cpuFlavorIds": list(cpu_flavor_ids), "cpuFlavorPriority": cpu_flavor_priority,
+                   "containerDiskInGb": container_disk_in_gb, "volumeInGb": 0,
+                   "volumeMountPath": volume_mount_path, "networkVolumeId": network_volume_id,
+                   "ports": (ports or "22/tcp").split(","), "supportPublicIp": True, "env": pod_env}
+        if data_center_id:
+            payload["dataCenterIds"] = [data_center_id]
+        response = httpx.post(PODS_URL, headers=_auth_headers(api_key), json=payload, timeout=30)
+        if response.status_code not in {200, 201}:
+            try:
+                body = response.json()
+            except ValueError:
+                body = {"message": "non-JSON provider response"}
+            def messages(value):
+                if isinstance(value, str):
+                    return [value]
+                if isinstance(value, list):
+                    return [message for item in value for message in messages(item)]
+                if isinstance(value, dict):
+                    return [message for field in ("message", "error", "errors", "detail", "details", "issues")
+                            if field in value for message in messages(value[field])]
+                return []
+            message = "; ".join(messages(body))
+            for secret in (api_key, public_key_string):
+                if secret:
+                    message = message.replace(secret, "[redacted]")
+            message = message[:1000] or "no provider error detail"
+            lower = message.lower()
+            capacity = (response.status_code in {500, 503}
+                        and "there are no longer any instances available with the requested specifications" in lower
+                        and not any(marker in lower for marker in ("invalid", "validation", "unsupported", "extra input", "expected")))
+            error = ProviderCapacityUnavailable if capacity else ProviderRequestRejected
+            raise error(response.status_code, message)
+        pod = response.json()
+        if not isinstance(pod, dict) or not pod.get("id"):
+            raise RuntimeError("CPU create response has no pod ID; reconcile allocation")
+        return {"id": pod["id"], "name": name, "created": True, "compute_type": "CPU"}
+    if compute_type != "GPU":
+        raise ValueError("compute_type must be CPU or GPU")
     sdk = _get_runpod()
     if sdk is None:
         raise RuntimeError(
@@ -214,6 +265,8 @@ def create_pod(
         "ports": ports or "22/tcp,8888/http",
         "network_volume_id": network_volume_id,
     }
+    if data_center_id:
+        params["data_center_id"] = data_center_id
 
     normalized_cuda_versions = normalize_allowed_cuda_versions(allowed_cuda_versions)
     if normalized_cuda_versions is not None:
@@ -230,11 +283,6 @@ def create_pod(
     # ``/workspace`` fall back to the container disk.
     params["volume_mount_path"] = volume_mount_path
 
-    pod_env: dict[str, str] = {}
-    if env_vars:
-        pod_env.update(env_vars)
-    if public_key_string:
-        pod_env["PUBLIC_KEY"] = public_key_string
     if pod_env:
         params["env"] = pod_env
 

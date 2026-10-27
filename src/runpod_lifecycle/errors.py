@@ -7,6 +7,18 @@ class RunPodError(Exception):
     """Base class for package-level RunPod lifecycle failures."""
 
 
+class ProviderRequestRejected(RunPodError):
+    """Provider rejected a create request; never an automatic capacity retry."""
+
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        super().__init__(f"RunPod create HTTP {status_code}: {message}")
+
+
+class ProviderCapacityUnavailable(ProviderRequestRejected):
+    """A valid request received an explicit provider no-instances response."""
+
+
 class LaunchFailure(RunPodError):
     """Raised when a pod cannot be provisioned or becomes unusable while starting."""
 

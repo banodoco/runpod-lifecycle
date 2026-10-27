@@ -585,3 +585,33 @@ def test_get_pod_status_normalizes_current_rest_port_shape(
         {"ip": "203.0.113.10", "privatePort": 22, "publicPort": 53603, "type": "tcp"},
         {"ip": "203.0.113.10", "privatePort": 8888, "publicPort": 58123, "type": "http"},
     ]
+
+
+def test_cpu_create_uses_supported_priority_and_public_key(monkeypatch):
+    calls=[]
+    def post(_url, **kwargs):
+        calls.append(kwargs)
+        return FakeResponse(201, {"id":"cpu-pod"})
+    monkeypatch.setattr(api.httpx,"post",post)
+    result=api.create_pod("test",None,"image",compute_type="CPU",public_key_string="public-test",
+                          data_center_id="EUR-NO-1",network_volume_id="vol")
+    body=calls[0]["json"]
+    assert body["cpuFlavorPriority"]=="custom"
+    assert body["cpuFlavorIds"]==["cpu3c","cpu5c"]
+    assert body["env"]["PUBLIC_KEY"]=="public-test"
+    assert result["id"]=="cpu-pod"
+
+
+@pytest.mark.parametrize("status,message,capacity",[
+    (400,"Invalid cpuFlavorPriority; no available value",False),
+    (401,"There are no longer any instances available with the requested specifications.",False),
+    (500,"There are no longer any instances available with the requested specifications.",True),
+    (500,"Invalid input: There are no longer any instances available with the requested specifications.",False),
+])
+def test_cpu_create_never_treats_rejection_as_capacity(monkeypatch,status,message,capacity):
+    from runpod_lifecycle.errors import ProviderCapacityUnavailable,ProviderRequestRejected
+    monkeypatch.setattr(api.httpx,"post",lambda *args,**kwargs: FakeResponse(status,{"error":message}))
+    with pytest.raises(ProviderRequestRejected) as caught:
+        api.create_pod("test",None,"image",compute_type="CPU")
+    assert isinstance(caught.value,ProviderCapacityUnavailable)==capacity
+    assert message in str(caught.value)
