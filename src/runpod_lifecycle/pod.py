@@ -67,7 +67,9 @@ class Pod:
             if desired_status == "RUNNING" and self.config.transport == "https":
                 client = self.https_transport()
                 try:
-                    await asyncio.to_thread(client.connect)
+                    # Settled readiness (consecutive health replies), bounded per
+                    # iteration so provider FAILED/TERMINATED states are still seen.
+                    await asyncio.to_thread(client.wait_ready, min(15, max(1, timeout - elapsed)))
                 except Exception as exc:
                     from .https import PodTransportError
                     if not isinstance(exc, PodTransportError) or "HTTP 401" in str(exc) or "HTTP 403" in str(exc):

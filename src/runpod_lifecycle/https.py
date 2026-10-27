@@ -20,6 +20,13 @@ from . import pod_agent
 TOKEN_ENV = "ASTRID_POD_TOKEN"
 PORT = 8000
 CHUNK = pod_agent.CHUNK
+# RunPod's public proxy answers an EMPTY-bodied 404 when it has no route to the
+# pod port. Right after a pod starts, that route appears and can still drop out
+# intermittently for several seconds (observed live: 200, 200, 404, 200, 404...).
+# The agent never sends an empty 404 (its 404s are JSON), so an empty 404 means
+# the request did not reach the agent and is safe to retry within this bound.
+ROUTE_GRACE_SECONDS = 90
+READY_CONSECUTIVE = 3
 logger = logging.getLogger(__name__)
 
 
@@ -94,22 +101,33 @@ class HttpsPodTransport:
     """Command, job, file and readiness operations with bounded HTTP requests."""
 
     def __init__(self, pod_id: str, token: str, *, port: int = PORT, base_url: str | None = None,
-                 request_timeout: float = 20, poll_interval: float = 0.5):
+                 request_timeout: float = 20, poll_interval: float = 0.5,
+                 route_grace: float = ROUTE_GRACE_SECONDS):
         url = _transport_url(pod_id, port, base_url)
         if len(token) < 32 or not token.isascii():
             raise ValueError("missing random pod token")
         self.poll_interval = poll_interval
+        self.route_grace = route_grace
         self.http = httpx.Client(base_url=url, headers={"Authorization": "Bearer " + token},
                                  timeout=min(request_timeout, 30), follow_redirects=False)
 
-    def _request(self, method, path, *, _download=None, **kwargs):
+    @staticmethod
+    def route_unavailable(response) -> bool:
+        """True for the provider proxy's no-route reply, never for an agent reply."""
+        return response.status_code == 404 and not response.content
+
+    def _request(self, method, path, *, _download=None, _route_grace=None, **kwargs):
         # All operations are idempotent: command IDs and upload offsets make
         # retry after a lost response safe. Never follow redirects with auth.
-        for attempt in range(3):
+        grace = self.route_grace if _route_grace is None else _route_grace
+        route_deadline = None
+        attempt = 0
+        while True:
             try:
                 response = self.http.request(method, path, **kwargs)
             except httpx.RequestError:
                 if attempt < 2:
+                    attempt += 1
                     time.sleep(self.poll_interval)
                     continue
                 message = "pod HTTPS request failed"
@@ -118,7 +136,17 @@ class HttpsPodTransport:
                     message += f" (operation=download framing={framing} offset={offset} HTTP unavailable)"
                 self._log_upload_failure(method, path)
                 raise PodTransportError(message) from None
-            if response.status_code in {502, 503, 504} and attempt < 2:
+            if self.route_unavailable(response) and grace > 0:
+                # The request never reached the agent; wait for the route.
+                now = time.monotonic()
+                if route_deadline is None:
+                    route_deadline = now + grace
+                    logger.warning("pod HTTPS route unavailable (HTTP 404 without agent body); retrying")
+                if now < route_deadline:
+                    time.sleep(min(max(self.poll_interval, 0.05), max(0, route_deadline - now)))
+                    continue
+            elif response.status_code in {502, 503, 504} and attempt < 2:
+                attempt += 1
                 time.sleep(self.poll_interval)
                 continue
             if not response.is_success:
@@ -128,7 +156,6 @@ class HttpsPodTransport:
                     raise self._download_error("request rejected", response, framing, offset)
                 raise PodTransportError(f"pod HTTPS request rejected (HTTP {response.status_code})")
             return response
-        raise AssertionError("unreachable")
 
     @staticmethod
     def _log_upload_failure(method, path, status=None):
@@ -152,23 +179,39 @@ class HttpsPodTransport:
             detail += f" received_bytes={received}"
         return PodTransportError(f"{reason} ({detail})")
 
-    def connect(self):
-        data = self._request("GET", "/health").json()
+    def connect(self, *, _route_grace=None):
+        data = self._request("GET", "/health", _route_grace=_route_grace).json()
         if data != {"ok": True, "protocol": 1}:
             raise PodTransportError("incompatible pod agent")
 
     def wait_ready(self, timeout: float = 600):
+        """Return after READY_CONSECUTIVE successive authenticated health replies.
+
+        A single 200 does not mean the provider route is settled; later requests
+        still ride out brief no-route gaps via route_grace in _request.
+        """
         deadline = time.monotonic() + timeout
+        healthy = 0
         while True:
             try:
-                self.connect()
-                return
+                self.connect(_route_grace=0)
+                healthy += 1
+                if healthy >= READY_CONSECUTIVE:
+                    return
             except PodTransportError as exc:
                 if "HTTP 401" in str(exc) or "HTTP 403" in str(exc):
                     raise
+                healthy = 0
                 if time.monotonic() >= deadline:
+                    # Fixed labels only: was the provider route missing, the
+                    # connection failing, or did something else answer?
+                    status = re.search(r"\(HTTP ([0-9]{3})\)", str(exc))
+                    last = ("route_unavailable" if status and status[1] == "404"
+                            else f"HTTP {status[1]}" if status
+                            else "request_failed" if "request failed" in str(exc) else "incompatible")
+                    logger.warning("pod HTTPS readiness timed out (last=%s)", last)
                     raise PodTransportError("pod HTTPS readiness timed out") from None
-                time.sleep(min(self.poll_interval, max(0, deadline - time.monotonic())))
+            time.sleep(min(self.poll_interval, max(0, deadline - time.monotonic())))
 
     def start(self, command: str, *, job_id: str | None = None) -> str:
         job_id = job_id or uuid.uuid4().hex

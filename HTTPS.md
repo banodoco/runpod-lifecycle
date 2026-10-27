@@ -161,8 +161,8 @@ Download failures report `operation=download`, the HTTP status (or
 byte offset; Range validation failures also report the received byte count.
 These diagnostics omit remote paths, response bodies, header values, file
 identities and tokens. They describe the failed operation, not its root cause.
-The original live Range failure predates these diagnostics and remains
-unexplained; local JSON success does not resolve that live qualification gap.
+The original live Range failure is explained below (Range header not delivered
+intact through the provider proxy); JSON envelopes are the default.
 
 Upload failures additionally emit a warning from `runpod_lifecycle.https` with
 the fixed stage `initiate`, `chunk`, `verify` or `status`, and the HTTP status
@@ -172,6 +172,32 @@ ordinary smoke receipt: its v1 upload fields identify only the phase and status,
 so an upload-phase 404 alone cannot distinguish the failing request or its cause.
 If chunk reconciliation also fails, the client preserves the original chunk
 exception and stops; it does not switch methods, routes or origins.
+
+### Provider route settling (empty 404)
+
+RunPod's proxy answers `404` with an **empty body** when it has no route to the
+pod port. Live probes (2026-10-27) showed the route appearing 20-40 s after the
+agent was already listening, then still dropping out intermittently for several
+seconds after the first successful health reply (`200, 200, 404, 200, 404...` on
+one connection, while the agent's own access log never saw the 404 requests).
+The agent never sends an empty 404; its 404s are JSON (`unknown job`,
+`unknown upload`, `unknown route`). Therefore:
+
+- `wait_ready` returns only after 3 consecutive authenticated health replies;
+  on timeout it logs `pod HTTPS readiness timed out (last=route_unavailable|HTTP n|request_failed|incompatible)`.
+  `Pod.wait_ready` (HTTPS) uses the same settled check, bounded to 15 s per
+  provider-status iteration.
+- Every other request retries an empty 404 in place for up to `route_grace`
+  seconds (default 90), logging `pod HTTPS route unavailable (HTTP 404 without
+  agent body); retrying` once per affected request. It never retries an agent
+  JSON 404 and never changes method, route or origin. After the grace the v1
+  error `pod HTTPS request rejected (HTTP 404)` is raised as before.
+- `runpod-lifecycle transport-smoke` writes these fixed-label warnings (and the
+  upload stage warnings) to stderr; provider SDK calls remain muted.
+
+Range requests are not used by default: on the live proxy a `Range` request
+header did not reach the agent intact (agent answered 400 "bounded byte Range
+required"), which explains the first live smoke's Range download failure.
 
 No command or full-file hashing blocks a request. HTTP calls time out within
 30 seconds each; command timeouts cancel the process group. Upload verification

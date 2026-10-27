@@ -153,6 +153,27 @@ def _quiet_provider():
         logging.disable(previous)
 
 
+@contextlib.contextmanager
+def _https_diagnostics_to_stderr():
+    # Only the HTTPS client's fixed-label warnings (stage/status/route labels;
+    # never paths, IDs, headers, bodies or tokens) are emitted, on stderr.
+    https_logger = logging.getLogger("runpod_lifecycle.https")
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.WARNING)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    previous = https_logger.propagate, https_logger.level
+    https_logger.addHandler(handler)
+    https_logger.propagate = False
+    if https_logger.level == logging.NOTSET or https_logger.level > logging.WARNING:
+        https_logger.setLevel(logging.WARNING)
+    try:
+        yield
+    finally:
+        https_logger.removeHandler(handler)
+        https_logger.propagate, level = previous
+        https_logger.setLevel(level)
+
+
 class Provider:
     """Existing lifecycle mutations plus strict read-only REST verification."""
 
@@ -535,7 +556,11 @@ async def command(args):
         key = getattr(args, "api_key", None) or os.environ.get("RUNPOD_API_KEY")
         if not key:
             raise SmokeError("RUNPOD_API_KEY is required")
-        with _quiet_provider():
+        # Provider/SDK calls are individually quieted inside Provider. Do not
+        # disable logging for the whole run: the HTTPS client's fixed-label
+        # stage/route warnings are the only per-request failure evidence and
+        # must reach stderr. Keep stdout reserved for the JSON receipt.
+        with _https_diagnostics_to_stderr(), contextlib.redirect_stdout(io.StringIO()):
             record = run_smoke(handle=args.handle, api_key=key, max_hourly=args.max_hourly,
                                max_seconds=args.max_seconds, payload_bytes=args.payload_bytes,
                                cleanup_only=args.cleanup_only)
