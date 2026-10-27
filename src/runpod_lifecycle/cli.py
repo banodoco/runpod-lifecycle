@@ -146,6 +146,7 @@ def _resolve_config(args: argparse.Namespace) -> RunPodConfig:
     # These are the CLI's explicit config overrides. ``None`` means the
     # option was not supplied and therefore must be left to from_env().
     option_fields = {
+        "transport": "transport",
         "gpu_type": "gpu_type",
         "worker_image": "image",
         "container_disk_gb": "container_disk_gb",
@@ -179,7 +180,11 @@ def _resolve_config(args: argparse.Namespace) -> RunPodConfig:
             raise ValueError("--allowed-cuda-versions must contain at least one version")
         overrides["allowed_cuda_versions"] = parsed_cuda_versions
 
-    return RunPodConfig.from_env(**overrides)
+    config = RunPodConfig.from_env(**overrides)
+    if config.transport == "https":
+        if not os.environ.get("RUNPOD_HTTPS_TOKEN_FILE") and not os.environ.get("RUNPOD_HTTPS_TOKEN"):
+            raise ValueError("HTTPS CLI requires RUNPOD_HTTPS_TOKEN_FILE (owned 0600 file); generate once per claim")
+    return config
 
 
 def _parse_duration(text: str) -> int:
@@ -424,13 +429,13 @@ async def _cmd_launch(args: argparse.Namespace) -> int:
 
     await pod.wait_ready(timeout=getattr(args, "timeout", 600))
 
-    ssh_details = await pod._ensure_ssh_details()
-    info = {
-        "pod_id": pod.id,
-        "name": pod.name,
-        "ssh": f"root@{ssh_details['ip']} -p {ssh_details['port']}",
-        "gpu_type": config.gpu_type,
-    }
+    if config.transport == "https":
+        from .https import pod_url
+        route = {"https": pod_url(pod.id), "transport": "https"}
+    else:
+        ssh_details = await pod._ensure_ssh_details()
+        route = {"ssh": f"root@{ssh_details['ip']} -p {ssh_details['port']}"}
+    info = {"pod_id": pod.id, "name": pod.name, "gpu_type": config.gpu_type, **route}
     print(json.dumps(info, indent=2))
 
     if not getattr(args, "detach", False):
@@ -2079,8 +2084,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="runpod-lifecycle",
         description="RunPod pod lifecycle CLI.",
     )
+    parser.add_argument("--transport", choices=("ssh", "https"), default=None)
     parser.add_argument("--api-key", help="Override RUNPOD_API_KEY env var.")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    from .transport_smoke import register_parser
+    register_parser(sub)
 
     # --- legacy verbs (unchanged from v0.1) ---------------------------------
 
@@ -2547,6 +2556,10 @@ _VOLUMES_HANDLERS: dict[str, Any] = {
 def main(argv: list[str] | None = None) -> int:
     load_runpod_env()
     args = build_parser().parse_args(argv)
+
+    if args.cmd == "transport-smoke":
+        from .transport_smoke import command
+        return asyncio.run(command(args))
 
     if args.cmd == "volumes":
         handler = _VOLUMES_HANDLERS[args.volumes_cmd]

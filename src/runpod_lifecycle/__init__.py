@@ -78,6 +78,7 @@ from .shipping import (
 
 __all__ = [
     "RunPodConfig",
+    "HttpsPodTransport",
     "AllocationUnknown",
     "CleanupPendingError",
     "PostCreateHookFailure",
@@ -148,3 +149,5 @@ __all__ = [
     "write_health_report",
     "write_manifest",
 ]
+
+from .https import HttpsPodTransport

@@ -389,3 +389,9 @@ The existing `probe` also includes DC evidence and now enforces `--datacenter-id
 using confirmed stock; an unrestricted probe may retain catalogue candidates
 with explicit unknown/unavailable status. Use `availability` for typed negative
 results when no matching stock is confirmed.
+
+## HTTPS-only clients
+
+Use `--transport https` or `RunPodConfig(transport="https")` for the pod agent
+transport. See [HTTPS transport](HTTPS.md) for token custody, supported paths,
+limits and the current live-test qualification.

@@ -64,8 +64,22 @@ class Pod:
                 await _emit_state(self.hooks, self.id, failed_state, {"status": status or {}})
                 raise LaunchFailure(f"Pod {self.id} entered terminal state {desired_status}")
 
+            if desired_status == "RUNNING" and self.config.transport == "https":
+                client = self.https_transport()
+                try:
+                    await asyncio.to_thread(client.connect)
+                except Exception as exc:
+                    from .https import PodTransportError
+                    if not isinstance(exc, PodTransportError) or "HTTP 401" in str(exc) or "HTTP 403" in str(exc):
+                        raise
+                else:
+                    await _emit_state(self.hooks, self.id, PodState.READY, {"status": status})
+                    return status
+                finally:
+                    client.disconnect()
+
             has_ssh_port = any(port.get("privatePort") == 22 for port in ports)
-            if desired_status == "RUNNING" and has_ssh_port:
+            if self.config.transport == "ssh" and desired_status == "RUNNING" and has_ssh_port:
                 if current_state is not PodState.READY:
                     self._ssh_details = await self._ensure_ssh_details()
                     current_state = PodState.READY
@@ -81,7 +95,22 @@ class Pod:
     async def status(self) -> dict[str, Any] | None:
         return await asyncio.to_thread(api.get_pod_status, self.id, self.config.api_key)
 
+    def https_transport(self):
+        from .https import HttpsPodTransport
+        if self.config.transport != "https":
+            raise ValueError("pod does not use HTTPS")
+        return HttpsPodTransport(self.id, self.config.https_token or "")
+
     async def exec_ssh(self, cmd: str, timeout: int = 600) -> tuple[int, str, str]:
+        """Execute through the configured transport (legacy method name)."""
+        if self.config.transport == "https":
+            client = self.https_transport()
+            try:
+                result = await asyncio.to_thread(client.execute_command, cmd, timeout)
+                self._last_exec_at = time.monotonic()
+                return result
+            finally:
+                client.disconnect()
         ssh_details = await self._ensure_ssh_details()
         ssh_client = self._build_ssh_client(ssh_details)
 
@@ -152,6 +181,8 @@ class Pod:
 
     def open_ssh_client(self) -> Any:
         """Open and return the underlying connected paramiko SSH client."""
+        if self.config.transport == "https":
+            raise ValueError("raw SSH unavailable for HTTPS pod; use put_file/get_file")
         ssh_details = self._ensure_ssh_details_sync()
         ssh_client = self._build_ssh_client(ssh_details)
         ssh_client.connect()
@@ -179,6 +210,27 @@ class Pod:
         from .shipping import _build_upload_tarball, _upload_remote_script, _upload_tarball, upload_dir
 
         exclude_set = exclude or set()
+        if self.config.transport == "https":
+            import shlex
+            client = self.https_transport()
+            try:
+                local = Path(local)
+                if local.is_file():
+                    await asyncio.to_thread(client.put, local, remote)
+                else:
+                    code, _, _ = await asyncio.to_thread(client.execute_command, "mkdir -p " + shlex.quote(remote))
+                    if code:
+                        raise RuntimeError("remote directory creation failed")
+                    for directory, dirs, files in os.walk(local):
+                        relative = Path(directory).relative_to(local)
+                        dirs[:] = [d for d in dirs if d not in exclude_set and not (Path(directory) / d).is_symlink()]
+                        for name in files:
+                            source = Path(directory) / name
+                            if name not in exclude_set and not source.is_symlink():
+                                await asyncio.to_thread(client.put, source, str(Path(remote) / relative / name))
+                return
+            finally:
+                client.disconnect()
         if mode == "tarball":
             await _upload_tarball(
                 self,
@@ -196,6 +248,53 @@ class Pod:
                     sftp.close()
             finally:
                 client.close()
+
+    async def put_file(self, local: Path, remote: str, *, reserved: bool = False) -> None:
+        """Write a single file; reserved preserves a pre-created private inode."""
+        if self.config.transport == "https":
+            client = self.https_transport()
+            try:
+                await asyncio.to_thread(client.put, local, remote, reserved=reserved)
+            finally:
+                client.disconnect()
+            return
+        def upload():
+            client = self.open_ssh_client()
+            try:
+                sftp = client.open_sftp()
+                try:
+                    if reserved:
+                        with sftp.open(remote, "r+b") as dst, local.open("rb") as src:
+                            for chunk in iter(lambda: src.read(65536), b""):
+                                dst.write(chunk)
+                            dst.flush()
+                    else:
+                        sftp.put(str(local), remote)
+                finally:
+                    sftp.close()
+            finally:
+                client.close()
+        await asyncio.to_thread(upload)
+
+    async def get_file(self, remote: str, local: Path) -> None:
+        if self.config.transport == "https":
+            client = self.https_transport()
+            try:
+                await asyncio.to_thread(client.get, remote, local)
+            finally:
+                client.disconnect()
+            return
+        def download():
+            client = self.open_ssh_client()
+            try:
+                sftp = client.open_sftp()
+                try:
+                    sftp.get(remote, str(local))
+                finally:
+                    sftp.close()
+            finally:
+                client.close()
+        await asyncio.to_thread(download)
 
     async def download_archive(
         self,

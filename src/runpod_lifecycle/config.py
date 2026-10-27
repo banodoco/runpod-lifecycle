@@ -12,6 +12,13 @@ from typing import Any, Iterable
 from dotenv import dotenv_values, load_dotenv
 
 
+def _https_token_from_env():
+    if os.environ.get("RUNPOD_HTTPS_TOKEN_FILE"):
+        from .https import read_token_file
+        return read_token_file(os.environ["RUNPOD_HTTPS_TOKEN_FILE"])
+    return os.getenv("RUNPOD_HTTPS_TOKEN")
+
+
 def astrid_env_file_path(environ: dict[str, str] | None = None) -> Path:
     """Return the shared Astrid dotenv path without importing Astrid itself."""
 
@@ -184,10 +191,19 @@ class RunPodConfig:
     env_vars: dict[str, str] = field(default_factory=dict)
     name_prefix: str = "pod"
     ports: str | None = None
+    transport: str = "ssh"
+    https_token: str | None = field(default=None, repr=False)
     allowed_cuda_versions: tuple[str, ...] = ()
     min_cuda_version: str | None = None
 
     def __post_init__(self) -> None:
+        if self.transport not in {"ssh", "https"}:
+            raise ValueError("transport must be ssh or https")
+        if self.transport == "https" and self.template_id == DEFAULT_TEMPLATE_ID:
+            self.template_id = ""
+        if self.transport == "https" and not self.https_token:
+            import secrets
+            self.https_token = secrets.token_urlsafe(32)
         # Normalize list inputs to a tuple while preserving str inputs as-is.
         if isinstance(self.gpu_type, list):
             object.__setattr__(self, "gpu_type", _normalize_gpu_type(self.gpu_type))
@@ -262,6 +278,8 @@ class RunPodConfig:
             "ssh_private_key_path": ssh_private_key_path,
             "env_vars": _parse_env_vars(os.getenv("RUNPOD_ENV_VARS")),
             "name_prefix": os.getenv("RUNPOD_NAME_PREFIX", "pod"),
+            "transport": os.getenv("RUNPOD_TRANSPORT", "ssh"),
+            "https_token": overrides.get("https_token") if "https_token" in overrides else _https_token_from_env(),
             "ports": _parse_optional_string(os.getenv("RUNPOD_PORTS")),
             "allowed_cuda_versions": _parse_csv_tuple(raw_cuda_versions),
             "min_cuda_version": _parse_optional_string(os.getenv("RUNPOD_MIN_CUDA_VERSION")),

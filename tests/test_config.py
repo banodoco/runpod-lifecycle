@@ -235,3 +235,12 @@ def test_merge_returns_new_instance_with_overrides() -> None:
     assert merged.min_memory_gb == 64
     assert original.name_prefix == "pod"
     assert original.min_memory_gb == 32
+
+
+def test_https_config_token_override_ignores_stale_ambient_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("RUNPOD_HTTPS_TOKEN_FILE", str(tmp_path / "missing-token-file"))
+    config = RunPodConfig.from_env(api_key="test", transport="https", https_token=None)
+    other = RunPodConfig.from_env(api_key="test", transport="https", https_token=None)
+    assert config.https_token and config.https_token != other.https_token
+    assert config.https_token not in repr(config)
+    assert config.template_id == ""

@@ -1,0 +1,354 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import httpx
+import pytest
+
+from runpod_lifecycle import api
+from runpod_lifecycle.config import RunPodConfig
+from runpod_lifecycle.https import HttpsPodTransport, PodTransportError, agent_bootstrap, read_token_file, write_token_file
+from runpod_lifecycle.pod import Pod
+from runpod_lifecycle.pod_agent import AgentServer, CHUNK
+from runpod_lifecycle.preflight import preflight_transport
+
+TOKEN = "test-only-claim-token-" + "x" * 32
+
+
+@pytest.fixture
+def agent(tmp_path, monkeypatch):
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    server = AgentServer(("127.0.0.1", 0), TOKEN, tmp_path / "state")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = HttpsPodTransport("local", TOKEN, base_url=f"http://127.0.0.1:{server.server_port}",
+                               request_timeout=0.5, poll_interval=0.02)
+    try:
+        yield server, client
+    finally:
+        client.disconnect()
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+
+
+def test_auth_every_route_and_no_redirects(agent):
+    _, client = agent
+    for method, path in [("GET", "/health"), ("POST", "/jobs"), ("GET", "/jobs/id"),
+                         ("DELETE", "/jobs/id"), ("POST", "/uploads"), ("PUT", "/uploads/id"), ("GET", "/files")]:
+        response = client.http.request(method, path, headers={"Authorization": "Bearer wrong"})
+        assert response.status_code == 401
+    client.connect()
+    with pytest.raises(ValueError, match="HTTPS required"):
+        HttpsPodTransport("abc", TOKEN, base_url="http://example.com")
+
+
+def test_job_offsets_idempotency_and_binary_logs(agent):
+    _, client = agent
+    command = shlex.join([sys.executable, "-c", "import sys;sys.stdout.buffer.write(b'x'*700000+b'\\xe2\\x82\\xac');sys.stderr.write('err');sys.exit(7)"])
+    job = client.start(command)
+    assert client.start(command, job_id=job) == job
+    with pytest.raises(PodTransportError, match="409"):
+        client.start("false", job_id=job)
+    out, err, offsets = b"", b"", (0, 0)
+    while True:
+        result = client.poll(job, *offsets)
+        out += base64.b64decode(result["stdout"])
+        err += base64.b64decode(result["stderr"])
+        offsets = result["stdout_offset"], result["stderr_offset"]
+        if result["status"] == "exited" and result["stdout_eof"] and result["stderr_eof"]:
+            break
+    assert out == b"x" * 700000 + "€".encode()
+    assert err == b"err" and result["exit_code"] == 7
+    assert client.execute_command("printf hello; printf error >&2; exit 3") == (3, "hello", "error")
+
+
+def test_cancel_and_command_timeout(agent):
+    server, client = agent
+    code, _, stderr = client.execute_command("sleep 30", timeout=0.1)
+    assert code == -1 and "timed out" in stderr
+    for _ in range(100):
+        if all(job["process"].poll() is not None for job in server.jobs.values()):
+            break
+        time.sleep(0.02)
+    assert all(job["process"].poll() is not None for job in server.jobs.values())
+
+
+def test_50mb_resume_after_interruption_and_lost_reply(agent, tmp_path, monkeypatch):
+    _, client = agent
+    source, remote, output = (tmp_path / name for name in ("source", "remote", "output"))
+    with source.open("wb") as stream:
+        for i in range(50):
+            stream.write(bytes([i]) * CHUNK)
+    real = client._request
+    seen = []
+    def interrupt(method, path, **kwargs):
+        if method == "PUT":
+            seen.append(kwargs["params"]["offset"])
+            if len(seen) == 3:
+                raise KeyboardInterrupt
+        return real(method, path, **kwargs)
+    monkeypatch.setattr(client, "_request", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        client.put(source, str(remote))
+    assert not remote.exists()
+    lost = False
+    def lose_reply(method, path, **kwargs):
+        nonlocal lost
+        response = real(method, path, **kwargs)
+        if method == "PUT":
+            seen.append(kwargs["params"]["offset"])
+            if not lost:
+                lost = True
+                raise PodTransportError("simulated lost committed reply")
+        return response
+    monkeypatch.setattr(client, "_request", lose_reply)
+    client.put(source, str(remote))
+    assert seen[:4] == [0, CHUNK, 2 * CHUNK, 2 * CHUNK]
+    client.get(str(remote), output)
+    assert hashlib.sha256(output.read_bytes()).digest() == hashlib.sha256(source.read_bytes()).digest()
+    assert output.stat().st_size == 50 * CHUNK
+
+
+def test_upload_sha_rejection_and_reserved_inode(agent, tmp_path):
+    _, client = agent
+    source, remote = tmp_path / "secret-local", tmp_path / "secret-remote"
+    source.write_bytes(b"private data")
+    remote.touch(mode=0o600)
+    inode = remote.stat().st_ino
+    client.put(source, str(remote), reserved=True)
+    assert remote.read_bytes() == source.read_bytes()
+    assert remote.stat().st_ino == inode and remote.stat().st_mode & 0o777 == 0o600
+    source.write_bytes(b"other data")
+    with pytest.raises(PodTransportError, match="verification"):
+        client.put(source, str(remote), reserved=True)
+    assert remote.read_bytes() == b"private data"
+    bad = tmp_path / "bad"
+    state = client._request("POST", "/uploads", json={"path": str(bad), "size": 3, "sha256": "0" * 64}).json()
+    client._request("PUT", "/uploads/" + state["id"], params={"offset": 0}, content=b"bad")
+    client._request("POST", "/uploads/" + state["id"])
+    for _ in range(100):
+        state = client._request("GET", "/uploads/" + state["id"]).json()
+        if state["error"]:
+            break
+        time.sleep(.01)
+    assert state["error"] and not bad.exists()
+
+
+@pytest.mark.parametrize("use_ranges", [False, True])
+def test_empty_files_and_range_changed_representation(agent, tmp_path, use_ranges):
+    _, client = agent
+    source, remote, dest = (tmp_path / name for name in ("empty", "remote", "dest"))
+    source.touch()
+    client.put(source, str(remote))
+    client.get(str(remote), dest, use_ranges=use_ranges)
+    assert dest.read_bytes() == b""
+    response = client.http.get("/files", params={"path": str(remote)},
+                               headers={"Range": "bytes=0-10", "If-Match": '"stale"'})
+    assert response.status_code == 412
+
+
+async def test_fake_provider_and_pod_facade(agent, tmp_path, monkeypatch, runpod_sdk_mock):
+    server, client = agent
+    monkeypatch.setattr("runpod_lifecycle.preflight.preflight_transport", lambda _: None)
+    runpod_sdk_mock.create_pod.return_value = {"id": "fakepod"}
+    result = api.create_pod("test", "gpu", "runpod/base:latest", transport="https", https_token=TOKEN)
+    assert result["id"] == "fakepod"
+    payload = runpod_sdk_mock.create_pod.call_args.kwargs
+    assert payload["ports"] == "8000/http" and payload["env"]["ASTRID_POD_TOKEN"] == TOKEN
+    assert "ASTRID_POD_AGENT_B64" in payload["env"] and "docker_args" in payload
+    config = RunPodConfig(api_key="test", transport="https", https_token=TOKEN, template_id="")
+    assert TOKEN not in repr(config)
+    pod = Pod("fakepod", "test", config)
+    def local_client():
+        return HttpsPodTransport("local", TOKEN, base_url=f"http://127.0.0.1:{server.server_port}", poll_interval=.01)
+    monkeypatch.setattr(pod, "https_transport", local_client)
+    async def status():
+        return {"desired_status": "RUNNING", "ports": []}
+    monkeypatch.setattr(pod, "status", status)
+    assert (await pod.wait_ready(timeout=2))["desired_status"] == "RUNNING"
+    assert await pod.exec_ssh("printf facade") == (0, "facade", "")
+    tree = tmp_path / "tree"
+    (tree / "nested").mkdir(parents=True)
+    (tree / "nested" / "hello").write_text("world")
+    remote = tmp_path / "uploaded"
+    await pod.upload_path(tree, str(remote))
+    assert (remote / "nested" / "hello").read_text() == "world"
+    dest = tmp_path / "dest"
+    await pod.get_file(str(remote / "nested" / "hello"), dest)
+    assert dest.read_text() == "world"
+
+
+def test_preflight_proxy_fails_before_any_paid_create(monkeypatch, runpod_sdk_mock):
+    monkeypatch.setenv("HTTPS_PROXY", "http://localhost:1")
+    with pytest.raises(RuntimeError, match="SSH egress unavailable; use --transport https"):
+        api.create_pod("test", "gpu", "image")
+    runpod_sdk_mock.create_pod.assert_not_called()
+
+
+def test_preflight_https_checks_404_and_rejects_denial(monkeypatch):
+    monkeypatch.setattr(httpx, "get", lambda *a, **kw: httpx.Response(404))
+    preflight_transport("https")
+    monkeypatch.setattr(httpx, "get", lambda *a, **kw: httpx.Response(403))
+    with pytest.raises(RuntimeError, match="HTTP 403"):
+        preflight_transport("https")
+
+
+def test_token_file_permissions_and_no_symlinks(tmp_path):
+    path = tmp_path / "token"
+    write_token_file(path, TOKEN)
+    assert read_token_file(path) == TOKEN
+    path.chmod(0o644)
+    with pytest.raises(ValueError):
+        read_token_file(path)
+    link = tmp_path / "link"
+    link.symlink_to(path)
+    with pytest.raises(OSError):
+        read_token_file(link)
+
+
+def test_inline_bootstrap_runs_with_system_python_no_site_packages(tmp_path):
+    boot = agent_bootstrap(TOKEN)
+    import zlib
+    source = zlib.decompress(base64.b64decode(boot["env"]["ASTRID_POD_AGENT_B64"]))
+    assert source.startswith(b'"""Single-file')
+    # -S prevents third-party imports. Compile/import without starting main.
+    result = subprocess.run([sys.executable, "-S", "-c", "import sys;ns={'__name__':'test'};exec(sys.stdin.read(),ns)"],
+                            input=source.decode(), capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert TOKEN not in boot["docker_args"]
+
+
+def test_job_polling_across_real_proxy_timeout_window(agent):
+    _, client = agent
+    start = time.monotonic()
+    # Each HTTP request is limited to .5s. Job runs past RunPod's ~100s
+    # per-request window while incremental stdout/stderr remain available.
+    job = client.start("printf before; sleep 102; printf after; printf err >&2")
+    out = err = b""
+    offsets = (0, 0)
+    polls = 0
+    while True:
+        result = client.poll(job, *offsets)
+        out += base64.b64decode(result["stdout"])
+        err += base64.b64decode(result["stderr"])
+        offsets = result["stdout_offset"], result["stderr_offset"]
+        polls += 1
+        if result["status"] == "exited":
+            break
+        time.sleep(.5)
+    assert time.monotonic() - start >= 102
+    assert out == b"beforeafter" and err == b"err" and result["exit_code"] == 0 and polls > 100
+
+
+def test_cpu_rest_no_volume_bootstrap_and_error_redaction(monkeypatch):
+    monkeypatch.setattr("runpod_lifecycle.preflight.preflight_transport", lambda _: None)
+    calls = []
+    def create(url, **kwargs):
+        calls.append(kwargs["json"])
+        return httpx.Response(201, json={"id": "cpu1"})
+    monkeypatch.setattr(api.httpx, "post", create)
+    result = api.create_pod("test", None, "runpod/base:latest", compute_type="CPU", transport="https", https_token=TOKEN)
+    assert result["id"] == "cpu1"
+    payload = calls[-1]
+    assert "networkVolumeId" not in payload
+    assert payload["ports"] == ["8000/http"]
+    assert payload["dockerEntrypoint"] == ["/bin/bash", "-lc"]
+    assert TOKEN not in payload["dockerStartCmd"][0]
+    def reject(url, **kwargs):
+        return httpx.Response(400, json={"error": "bad " + TOKEN})
+    monkeypatch.setattr(api.httpx, "post", reject)
+    with pytest.raises(Exception) as caught:
+        api.create_pod("test", None, "runpod/base:latest", compute_type="CPU", transport="https", https_token=TOKEN)
+    assert TOKEN not in str(caught.value)
+
+
+def test_real_inline_start_command(tmp_path, monkeypatch):
+    import socket
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    boot = agent_bootstrap(TOKEN, port)
+    environment = dict(os.environ, **boot["env"], ASTRID_POD_STATE=str(tmp_path / "state"))
+    # Use the same shell command passed to SDK docker_args, with no site packages.
+    command = shlex.split(boot["docker_args"])
+    command[-1] = command[-1].replace("python3 -u", shlex.quote(sys.executable) + " -S -u")
+    process = subprocess.Popen(command, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    client = HttpsPodTransport("local", TOKEN, base_url=f"http://127.0.0.1:{port}", request_timeout=.2, poll_interval=.02)
+    try:
+        client.wait_ready(timeout=5)
+        assert client.execute_command("printf booted", timeout=5) == (0, "booted", "")
+        code, out, _ = client.execute_command("env | cut -d= -f1", timeout=5)
+        assert code == 0
+        assert "ASTRID_POD_TOKEN" not in out and "ASTRID_POD_AGENT_B64" not in out
+    finally:
+        client.disconnect()
+        process.terminate()
+        process.wait(timeout=5)
+        process.stderr.close()
+
+
+def test_both_download_framings_and_chunk_corruption(agent, tmp_path, monkeypatch):
+    _, client = agent
+    source = tmp_path / "source"
+    source.write_bytes(b"a" * (CHUNK + 123))
+    ranged = tmp_path / "ranged"
+    client.get(str(source), ranged, use_ranges=True)
+    assert ranged.read_bytes() == source.read_bytes()
+    real = client._request
+    def corrupt(method, path, **kwargs):
+        response = real(method, path, **kwargs)
+        if path == "/download-chunk":
+            data = response.json()
+            data["data"] = base64.b64encode(b"bad").decode()
+            return httpx.Response(200, json=data)
+        return response
+    monkeypatch.setattr(client, "_request", corrupt)
+    with pytest.raises(PodTransportError, match="invalid download chunk"):
+        client.get(str(source), tmp_path / "bad")
+    assert not (tmp_path / "bad").exists()
+
+
+def test_reupload_after_staging_refresh_removes_old_tree(agent, tmp_path):
+    _, client = agent
+    source, remote = tmp_path / "source", tmp_path / "remote"
+    source.write_bytes(b"same immutable bytes")
+    client.put(source, str(remote))
+    remote.unlink()
+    client.put(source, str(remote))
+    assert remote.read_bytes() == source.read_bytes()
+    remote.write_bytes(b"drifted")
+    client.put(source, str(remote))
+    assert remote.read_bytes() == source.read_bytes()
+
+
+def test_upload_resume_after_server_restart(agent, tmp_path):
+    server, client = agent
+    source, remote = tmp_path / "source", tmp_path / "remote"
+    source.write_bytes(b"x" * (CHUNK + 19))
+    state = client._request("POST", "/uploads", json={"path": str(remote), "size": source.stat().st_size,
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "reserved": False}).json()
+    client._request("PUT", "/uploads/" + state["id"], params={"offset": 0}, content=b"x" * CHUNK)
+    # A second server reads the same durable upload journal, with no jobs.
+    restarted = AgentServer(("127.0.0.1", 0), TOKEN, server.state_dir)
+    thread = threading.Thread(target=restarted.serve_forever, daemon=True)
+    thread.start()
+    recovered = HttpsPodTransport("local", TOKEN, base_url=f"http://127.0.0.1:{restarted.server_port}", poll_interval=.01)
+    try:
+        recovered.put(source, str(remote))
+        assert remote.read_bytes() == source.read_bytes()
+    finally:
+        recovered.close()
+        restarted.shutdown()
+        restarted.server_close()
+        thread.join(2)

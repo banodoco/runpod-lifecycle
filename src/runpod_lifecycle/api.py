@@ -199,9 +199,22 @@ def create_pod(
     min_cuda_version: str | None = None,
     cpu_api: str = "rest",
     instance_id: str | None = None,
+    transport: str = "ssh",
+    https_token: str | None = None,
 ) -> dict[str, Any]:
     """Create a RunPod pod and return provision metadata immediately."""
+    from .preflight import preflight_transport
+    preflight_transport(transport)
+    boot = None
+    if transport == "https":
+        from .https import agent_bootstrap
+        boot = agent_bootstrap(https_token or "")
+        if template_id:
+            raise ValueError("HTTPS requires an explicit image without a template override")
+        ports = boot["ports"]
     pod_env = dict(env_vars or {})
+    if boot:
+        pod_env.update(boot["env"])
     if public_key_string:
         pod_env["PUBLIC_KEY"] = public_key_string
     if compute_type == "CPU" and cpu_api == "sdk":
@@ -213,13 +226,14 @@ def create_pod(
                                      cloud_type="SECURE", data_center_id=data_center_id,
                                      network_volume_id=network_volume_id, volume_mount_path=volume_mount_path,
                                      container_disk_in_gb=container_disk_in_gb, ports=ports or "22/tcp",
-                                     env=pod_env, instance_id=instance_id)
+                                     env=pod_env, instance_id=instance_id,
+                                     **({"docker_args": boot["docker_args"]} if boot else {}))
         except Exception as exc:
             from runpod.error import QueryError, AuthenticationError
             if not isinstance(exc, (QueryError, AuthenticationError)):
                 raise
             message = str(exc)
-            for secret in (api_key, public_key_string):
+            for secret in (api_key, public_key_string, *pod_env.values()):
                 if secret:
                     message = message.replace(secret, "[redacted]")
             capacity = (isinstance(exc, QueryError)
@@ -239,6 +253,10 @@ def create_pod(
                    "containerDiskInGb": container_disk_in_gb, "volumeInGb": 0,
                    "volumeMountPath": volume_mount_path, "networkVolumeId": network_volume_id,
                    "ports": (ports or "22/tcp").split(","), "supportPublicIp": True, "env": pod_env}
+        if network_volume_id is None:
+            payload.pop("networkVolumeId")
+        if boot:
+            payload.update({"dockerEntrypoint": boot["docker_entrypoint"], "dockerStartCmd": boot["docker_start_cmd"]})
         if data_center_id:
             payload["dataCenterIds"] = [data_center_id]
         response = httpx.post(PODS_URL, headers=_auth_headers(api_key), json=payload, timeout=30)
@@ -257,7 +275,7 @@ def create_pod(
                             if field in value for message in messages(value[field])]
                 return []
             message = "; ".join(messages(body))
-            for secret in (api_key, public_key_string):
+            for secret in (api_key, public_key_string, *pod_env.values()):
                 if secret:
                     message = message.replace(secret, "[redacted]")
             message = message[:1000] or "no provider error detail"
@@ -294,6 +312,8 @@ def create_pod(
         "ports": ports or "22/tcp,8888/http",
         "network_volume_id": network_volume_id,
     }
+    if boot:
+        params["docker_args"] = boot["docker_args"]
     if data_center_id:
         params["data_center_id"] = data_center_id
 
@@ -329,7 +349,7 @@ def create_pod(
         if not isinstance(exc, (QueryError, AuthenticationError)):
             raise
         message = str(exc)
-        for secret in (api_key, public_key_string):
+        for secret in (api_key, public_key_string, *pod_env.values()):
             if secret:
                 message = message.replace(secret, "[redacted]")
         lower = message.lower()
