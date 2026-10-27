@@ -631,6 +631,7 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
         max_price_per_hour=args.max_price,
         require_secure_cloud=not args.allow_community_cloud,
         exclude_blackwell=args.exclude_blackwell,
+        min_cuda_version=getattr(args, "min_cuda_version", None),
         allowed_cuda_versions=_resolve_cli_cuda_versions(args),
         container_disk_gb=args.container_disk_gb,
         datacenter_ids=datacenter_ids,
@@ -2294,6 +2295,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="allowed_cuda_versions",
         help="Comma-separated CUDA host versions for the availability query (e.g. 12.4,12.6).",
     )
+    p_probe.add_argument("--min-cuda-version", help="Minimum compatible host CUDA capability")
     p_probe.add_argument(
         "--container-disk-gb",
         type=int,

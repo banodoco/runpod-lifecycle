@@ -100,6 +100,7 @@ async def probe(
     container_disk_gb: int = 100,
     datacenter_ids: list[str] | None = None,
     allowed_cuda_versions: list[str] | tuple[str, ...] | None = None,
+    min_cuda_version: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return price-ranked catalogue candidates with data-center stock evidence.
 
@@ -147,7 +148,7 @@ async def probe(
     proof of stock. CUDA constraints apply to both stock and price queries.
     No resource is allocated, and stock can change immediately after querying.
     """
-    constraints = _constraints(require_secure_cloud, container_disk_gb, allowed_cuda_versions)
+    constraints = _constraints(require_secure_cloud, container_disk_gb, allowed_cuda_versions, min_cuda_version)
     normalized_cuda_versions = normalize_allowed_cuda_versions(allowed_cuda_versions)
     if datacenter_ids is not None:
         catalogue = await _query(api_key, "query GpuCatalogue { gpuTypes { id displayName memoryInGb } }", {})
@@ -214,10 +215,16 @@ async def probe(
         try:
             centers = await _fetch_datacenters(api_key, constraints)
             for result in results:
-                dcs = await _for_gpu(
-                    api_key, result["gpu_type_id"], centers, constraints,
-                    datacenter_ids, False,
-                )
+                try:
+                    dcs = await _for_gpu(
+                        api_key, result["gpu_type_id"], centers, constraints,
+                        datacenter_ids, True,
+                    )
+                except _QueryUnavailable as exc:
+                    result["datacenter_availability"] = []
+                    result["availability_status"] = "unknown"
+                    result["availability_reason"] = str(exc)
+                    continue
                 # A price cap must also apply to DC-specific prices.
                 available = [dc for dc in dcs if dc.status == "available" and
                              (max_price_per_hour is None or dc.price_per_hour <= max_price_per_hour)]
