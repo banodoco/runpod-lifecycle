@@ -178,15 +178,15 @@ async def probe(
 
         lowest = entry.get("lowestPrice") or {}
         price_raw = lowest.get("uninterruptablePrice") if isinstance(lowest, dict) else None
-        if price_raw is None:
+        if price_raw is None and not datacenter_ids:
             # No availability under the requested cloud flag — drop it.
             continue
         try:
-            price = float(price_raw)
+            price = float(price_raw) if price_raw is not None else 0.0
         except (TypeError, ValueError):
             continue
 
-        if max_price_per_hour is not None and price > max_price_per_hour:
+        if not datacenter_ids and max_price_per_hour is not None and price > max_price_per_hour:
             continue
 
         results.append(
