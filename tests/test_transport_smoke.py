@@ -19,6 +19,10 @@ from runpod_lifecycle.pod_agent import AgentServer
 
 KEY = "test-provider-secret-must-not-escape"
 
+# The product's transfer deadline owns SIGALRM; keep pytest's independent
+# 60-second bound without consuming the same process alarm.
+pytestmark = pytest.mark.timeout(60, method="thread")
+
 
 class Clock:
     def __init__(self):
@@ -551,6 +555,195 @@ def test_transfer_http_status_retained_without_arbitrary_error_text(rig):
     result = run()
     assert result["transport_http_status"] == 502 and result["transport_failure"] == "http_rejected"
     assert "502" in handle.read_text() and KEY not in handle.read_text()
+
+
+@pytest.mark.parametrize("message,metadata", [
+    ("request rejected (operation=download framing=json offset=1048576 HTTP 403)",
+     {"transport_framing": "json", "transport_offset": 1048576,
+      "transport_http_status": 403, "transport_failure": "http_rejected"}),
+    ("request rejected (operation=download framing=range offset=0 HTTP 503)",
+     {"transport_framing": "range", "transport_offset": 0,
+      "transport_http_status": 503, "transport_failure": "http_rejected"}),
+    ("invalid download chunk or changed file (operation=download framing=json offset=7 HTTP 200)",
+     {"transport_framing": "json", "transport_offset": 7,
+      "transport_http_status": 200, "transport_failure": "transport_error"}),
+    ("invalid download range or changed file (operation=download framing=range offset=8 HTTP 200 received_bytes=3)",
+     {"transport_framing": "range", "transport_offset": 8, "transport_received_bytes": 3,
+      "transport_http_status": 200, "transport_failure": "transport_error"}),
+    ("short download or invalid range size (operation=download framing=range offset=9 HTTP 206 received_bytes=0)",
+     {"transport_framing": "range", "transport_offset": 9, "transport_received_bytes": 0,
+      "transport_http_status": 206, "transport_failure": "transport_error"}),
+    ("pod HTTPS request failed (operation=download framing=json offset=10 HTTP unavailable)",
+     {"transport_framing": "json", "transport_offset": 10, "transport_failure": "transport_error"}),
+    ("pod HTTPS request failed (operation=download framing=range offset=0 HTTP unavailable)",
+     {"transport_framing": "range", "transport_offset": 0, "transport_failure": "transport_error"}),
+    ("pod HTTPS request rejected (HTTP 401)",
+     {"transport_http_status": 401, "transport_failure": "http_rejected"}),
+    ("pod HTTPS request rejected (HTTP 504)",
+     {"transport_http_status": 504, "transport_failure": "http_rejected"}),
+])
+def test_download_error_formats_retain_only_safe_scalars(rig, message, metadata):
+    handle, provider, _, transport, run = rig
+    def fail(*args):
+        raise smoke.PodTransportError(message)
+    transport.get = fail
+    result = run()
+    if "transport_framing" in metadata:
+        metadata = dict(metadata, transport_operation="download")
+    assert {key: value for key, value in result.items() if key.startswith("transport_")} == metadata
+    for key, value in metadata.items():
+        assert type(result[key]) is type(value)
+    assert result["status"] == "failed" and result["phase"] == "download"
+    assert result["failure"] == "operation_failed" and not result["qualified"]
+    assert result["cleanup_get_status"] == 404 and transport.disconnected
+    assert provider.delete_calls == ["fakepod1"] and len(provider.create_calls) == 1
+    assert json.loads(handle.read_text()) == result
+    assert message not in handle.read_text() and "diagnostic" not in result
+    assert KEY not in handle.read_text() and provider.token not in handle.read_text()
+
+
+@pytest.mark.parametrize("message", [
+    "{secret}", "body={secret} (operation=download framing=json offset=0 HTTP 403)",
+    "request rejected (operation=download framing=json offset=0 HTTP 403) {secret}",
+    "{secret}pod HTTPS request rejected (HTTP 403)",
+    "pod HTTPS request rejected (HTTP 403)\n{secret}",
+    "pod HTTPS request rejected (HTTP 099)", "pod HTTPS request rejected (HTTP 600)",
+    "request rejected (operation={secret} framing=json offset=0 HTTP 403)",
+    "request rejected (operation=download framing={secret} offset=0 HTTP 403)",
+    "request rejected (operation=download framing=json offset={secret} HTTP 403)",
+    "request rejected (operation=download framing=json offset=-1 HTTP 403)",
+    "request rejected (operation=download framing=json offset=1.5 HTTP 403)",
+    "request rejected (operation=download framing=json offset=True HTTP 403)",
+    "request rejected (operation=download framing=json offset=١ HTTP 403)",
+    "request rejected (operation=download framing=json offset=" + "9" * 5000 + " HTTP 403)",
+    "request rejected (operation=download framing=json offset=9223372036854775808 HTTP 403)",
+    "request rejected (operation=download framing=json offset=0 HTTP 999)",
+    "request rejected (operation=download framing=json offset=0 HTTP ٤٠٣)",
+    "request rejected (operation=download framing=json offset=0 HTTP unavailable)",
+    "pod HTTPS request failed (operation=download framing=json offset=0 HTTP 403)",
+    "invalid download chunk or changed file (operation=download framing=range offset=0 HTTP 200)",
+    "invalid download range or changed file (operation=download framing=json offset=0 HTTP 206 received_bytes=3)",
+    "invalid download range or changed file (operation=download framing=range offset=0 HTTP 206)",
+    "short download or invalid range size (operation=download framing=range offset=0 HTTP 206 received_bytes=-1)",
+    "short download or invalid range size (operation=download framing=range offset=0 HTTP 206 received_bytes=9223372036854775808)",
+    "request rejected (operation=download framing=json offset=0 HTTP 403 received_bytes=3)",
+    "request rejected (operation=download framing=json offset=0 HTTP 403 header={secret})",
+])
+def test_arbitrary_transport_error_text_never_enters_cli_or_handle(rig, monkeypatch, capsys, message):
+    handle, provider, clock, transport, _ = rig
+    sentinels = (KEY, "sentinel-bearer-F014", "sentinel-body-F014",
+                 "X-Sentinel-Header-F014", "/private/sentinel-path-F014")
+    def fail(*args):
+        raise smoke.PodTransportError(message.format(secret=" ".join((*sentinels, provider.token))))
+    transport.get = fail
+    real_run = smoke.run_smoke
+    monkeypatch.setattr(smoke, "run_smoke", lambda **kwargs: real_run(
+        **kwargs, provider=provider, clock=clock, transport_factory=lambda *a, **kw: transport))
+    monkeypatch.setattr(cli, "load_runpod_env", lambda: None)
+    monkeypatch.setenv("RUNPOD_API_KEY", KEY)
+    assert cli.main(["transport-smoke", "--handle", str(handle), "--max-hourly", ".1",
+                     "--payload-bytes", "4096"]) == 1
+    printed = capsys.readouterr()
+    result = json.loads(printed.out)
+    assert json.loads(handle.read_text()) == result
+    assert {key: value for key, value in result.items() if key.startswith("transport_")} == {
+        "transport_failure": "transport_error"}
+    assert result["phase"] == "download" and result["cleanup_get_status"] == 404
+    assert len(provider.create_calls) == 1 and provider.delete_calls == ["fakepod1"]
+    assert "diagnostic" not in result
+    for sentinel in (*sentinels, provider.token):
+        assert sentinel not in printed.out + printed.err + handle.read_text()
+
+
+@pytest.mark.parametrize("mode,framing,status,offset,received", [
+    ("rejected", "json", 412, 5, None),
+    ("rejected", "range", 403, 0, None),
+    ("malformed", "json", 200, 0, None),
+    ("malformed", "range", 206, 0, 3),
+    ("short", "range", 206, 0, 3),
+    ("unavailable", "json", None, 0, None),
+    ("unavailable", "range", None, 0, None),
+])
+def test_integrated_download_errors_reach_failed_cli_receipt(
+        rig, monkeypatch, capsys, mode, framing, status, offset, received):
+    import base64
+
+    handle, provider, clock, transport, _ = rig
+    sentinels = (KEY, "sentinel-body-F014", "X-Sentinel-Header-F014", "/private/sentinel-path-F014")
+    calls = []
+    def fail_download(remote, destination):
+        def respond(request):
+            calls.append(request)
+            secret = " ".join((*sentinels, "Bearer " + provider.token))
+            if mode == "unavailable":
+                raise httpx.ReadTimeout(secret, request=request)
+            if offset and len(calls) == 1:
+                chunk = b"first"
+                return httpx.Response(200, json={"offset": 0, "total": 6, "etag": secret,
+                    "sha256": hashlib.sha256(chunk).hexdigest(), "data": base64.b64encode(chunk).decode()})
+            headers = {"ETag": secret, "X-Sentinel-Header-F014": secret}
+            if mode == "short":
+                headers["Content-Range"] = "bytes 0-4/5"
+            else:
+                headers["Content-Range"] = secret
+            return httpx.Response(status, content=b"bad" if received is not None else secret.encode(),
+                                  headers=headers)
+        client = HttpsPodTransport("fakepod1", provider.token, base_url="http://127.0.0.1", poll_interval=0)
+        client.http.close()
+        client.http = httpx.Client(base_url="http://127.0.0.1", transport=httpx.MockTransport(respond))
+        try:
+            client.get(sentinels[-1], destination, use_ranges=framing == "range")
+        finally:
+            client.close()
+    transport.get = fail_download
+    real_run = smoke.run_smoke
+    monkeypatch.setattr(smoke, "run_smoke", lambda **kwargs: real_run(
+        **kwargs, provider=provider, clock=clock, transport_factory=lambda *a, **kw: transport))
+    monkeypatch.setattr(cli, "load_runpod_env", lambda: None)
+    monkeypatch.setenv("RUNPOD_API_KEY", KEY)
+    assert cli.main(["transport-smoke", "--handle", str(handle), "--max-hourly", ".1",
+                     "--payload-bytes", "4096"]) == 1
+    printed = capsys.readouterr()
+    result = json.loads(printed.out)
+    expected = {"transport_operation": "download", "transport_framing": framing,
+                "transport_offset": offset,
+                "transport_failure": "http_rejected" if mode == "rejected" else "transport_error"}
+    if status is not None:
+        expected["transport_http_status"] = status
+    if received is not None:
+        expected["transport_received_bytes"] = received
+    assert {key: value for key, value in result.items() if key.startswith("transport_")} == expected
+    assert result["phase"] == "download" and result["status"] == "failed" and not result["qualified"]
+    assert result["cleanup_get_status"] == 404 and transport.disconnected
+    assert len(provider.create_calls) == 1 and provider.delete_calls == ["fakepod1"]
+    assert len(calls) == (3 if mode == "unavailable" else 2 if offset else 1)
+    assert json.loads(handle.read_text()) == result
+    for sentinel in (*sentinels, provider.token):
+        assert sentinel not in printed.out + printed.err + handle.read_text()
+
+
+def test_failed_download_metadata_survives_cleanup_only_without_token(rig):
+    handle, provider, clock, transport, run = rig
+    provider.delete_error = True
+    def fail(*args):
+        raise smoke.PodTransportError(
+            "request rejected (operation=download framing=json offset=1048576 HTTP 412)")
+    transport.get = fail
+    result = run(max_seconds=30)
+    assert result["cleanup"] == "pending" and "cleanup_get_status" not in result
+    metadata = {key: value for key, value in result.items() if key.startswith("transport_")}
+    assert metadata == {"transport_operation": "download", "transport_framing": "json",
+                        "transport_offset": 1048576, "transport_http_status": 412,
+                        "transport_failure": "http_rejected"}
+    Path(result["token_file"]).unlink()
+    provider.delete_error = False
+    result = smoke.run_smoke(handle=handle, api_key=KEY, cleanup_only=True,
+                             provider=provider, clock=clock, max_seconds=15)
+    assert {key: value for key, value in result.items() if key.startswith("transport_")} == metadata
+    assert result["phase"] == "download" and result["status"] == "failed" and not result["qualified"]
+    assert result["cleanup_get_status"] == 404 and len(provider.create_calls) == 1
+    assert json.loads(handle.read_text()) == result
+    assert KEY not in handle.read_text() and provider.token not in handle.read_text()
 
 
 @pytest.mark.parametrize("lost_reply", [False, True])

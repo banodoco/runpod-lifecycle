@@ -57,6 +57,40 @@ def _number(value):
     return type(value) in (int, float) and math.isfinite(value) and value > 0
 
 
+def _transport_failure(exc):
+    # PodTransportError currently has no typed metadata. Match only complete
+    # locally generated formats from https.py; never retain exception text or
+    # accept an arbitrary reason, framing, header/body suffix or remote path.
+    message = str(exc)
+    context = r"\(operation=(?P<operation>download) framing="
+    offset = r" offset=(?P<offset>[0-9]{1,19}) HTTP "
+    status = r"(?P<http_status>[1-5][0-9]{2})"
+    received = r" received_bytes=(?P<received_bytes>[0-9]{1,19})"
+    formats = (
+        (r"pod HTTPS request rejected \(HTTP " + status + r"\)", "http_rejected"),
+        ("request rejected " + context + r"(?P<framing>json|range)" + offset + status + r"\)",
+         "http_rejected"),
+        ("invalid download chunk or changed file " + context + r"(?P<framing>json)"
+         + offset + status + r"\)", "transport_error"),
+        (r"(?:invalid download range or changed file|short download or invalid range size) "
+         + context + r"(?P<framing>range)" + offset + status + received + r"\)", "transport_error"),
+        ("pod HTTPS request failed " + context + r"(?P<framing>json|range)"
+         + offset + r"unavailable\)", "transport_error"),
+    )
+    for pattern, failure in formats:
+        match = re.fullmatch(pattern, message)
+        if match:
+            metadata = {"transport_failure": failure}
+            for key, value in match.groupdict().items():
+                if key in {"offset", "received_bytes", "http_status"}:
+                    value = int(value)
+                    if value > 2**63 - 1:
+                        return {"transport_failure": "transport_error"}
+                metadata["transport_" + key] = value
+            return metadata
+    return {"transport_failure": "transport_error"}
+
+
 def _owned_fd(path, flags, mode=0o600):
     fd = os.open(path, flags | os.O_NOFOLLOW, mode)
     info = os.fstat(fd)
@@ -439,10 +473,7 @@ def run_smoke(*, handle, api_key, max_hourly=None, max_seconds=600,
             if isinstance(exc, SmokeError):
                 record["diagnostic"] = str(exc)
             if isinstance(exc, PodTransportError):
-                match = re.fullmatch(r"pod HTTPS request rejected \(HTTP ([0-9]{3})\)", str(exc))
-                record["transport_failure"] = "http_rejected" if match else "transport_error"
-                if match:
-                    record["transport_http_status"] = int(match[1])
+                record.update(_transport_failure(exc))
             save()
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
