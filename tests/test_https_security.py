@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import threading
+import hashlib
+import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
@@ -11,6 +13,110 @@ from runpod_lifecycle.https import HttpsPodTransport, PodTransportError
 from runpod_lifecycle.pod_agent import CHUNK
 
 TOKEN = "test-only-secret-" + "x" * 40
+
+
+def test_upload_client_matches_independent_protocol_fixture(tmp_path):
+    source = tmp_path / "source"
+    payload = b"x" * CHUNK + b"tail"
+    source.write_bytes(payload)
+    upload_id = "a" * 64
+    calls = []
+    committed = bytearray()
+
+    def respond(request):
+        calls.append((request.method, request.url.path))
+        assert request.url.host == "pod1-8000.proxy.runpod.net"
+        assert request.headers["Authorization"] == "Bearer " + TOKEN
+        assert "transfer-encoding" not in request.headers
+        if len(calls) == 1:
+            assert calls[-1] == ("POST", "/uploads")
+            assert json.loads(request.content) == {"path": "/tmp/fixture", "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(), "reserved": False}
+        elif len(calls) in (2, 3):
+            assert calls[-1] == ("PUT", "/uploads/" + upload_id)
+            assert dict(request.url.params) == {"offset": str(len(committed))}
+            assert int(request.headers["Content-Length"]) == len(request.content) <= CHUNK
+            committed.extend(request.content)
+        elif len(calls) == 4:
+            assert calls[-1] == ("POST", "/uploads/" + upload_id)
+            assert request.content == b""
+            assert committed == payload
+        else:
+            assert len(calls) == 5 and calls[-1] == ("GET", "/uploads/" + upload_id)
+        return httpx.Response(200, json={"id": upload_id, "offset": len(committed),
+                                         "complete": len(calls) == 5, "error": None})
+
+    client = HttpsPodTransport("pod1", TOKEN, poll_interval=0)
+    client.http.close()
+    client.http = httpx.Client(base_url="https://pod1-8000.proxy.runpod.net",
+        headers={"Authorization": "Bearer " + TOKEN}, transport=httpx.MockTransport(respond),
+        follow_redirects=False)
+    try:
+        client.put(source, "/tmp/fixture")
+        assert len(calls) == 5
+    finally:
+        client.close()
+
+
+def test_upload_reconciliation_failure_preserves_original_rejection(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.write_bytes(b"bounded chunk")
+    client = HttpsPodTransport("pod1", TOKEN)
+    chunk_error = PodTransportError("pod HTTPS request rejected (HTTP 403)")
+    calls = []
+
+    def request(method, path, **kwargs):
+        calls.append(method)
+        if method == "POST":
+            return httpx.Response(200, json={"id": "a" * 64, "offset": 0, "complete": False})
+        if method == "PUT":
+            raise chunk_error
+        raise PodTransportError("pod HTTPS request rejected (HTTP 404)")
+
+    monkeypatch.setattr(client, "_request", request)
+    try:
+        with pytest.raises(PodTransportError) as caught:
+            client.put(source, "/private/" + TOKEN)
+        assert caught.value is chunk_error
+        assert calls == ["POST", "PUT", "GET"]
+        assert TOKEN not in str(caught.value)
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("status", [302, 403, 404, None])
+def test_upload_failure_logging_omits_secrets_and_never_changes_route(tmp_path, caplog, status):
+    source = tmp_path / "source"
+    source.write_bytes(b"chunk")
+    upload_id = "b" * 64
+    requests = []
+
+    def respond(request):
+        requests.append((request.method, request.url.path))
+        assert request.url.host == "pod1-8000.proxy.runpod.net"
+        if request.method == "PUT":
+            if status is None:
+                raise httpx.ReadError(TOKEN, request=request)
+            return httpx.Response(status, text=TOKEN,
+                headers={"X-Secret": TOKEN, "Location": "https://attacker.example/" + TOKEN})
+        return httpx.Response(200, json={"id": upload_id, "offset": 0, "complete": False})
+
+    client = HttpsPodTransport("pod1", TOKEN, poll_interval=0)
+    client.http.close()
+    client.http = httpx.Client(base_url="https://pod1-8000.proxy.runpod.net",
+        headers={"Authorization": "Bearer " + TOKEN}, transport=httpx.MockTransport(respond),
+        follow_redirects=False)
+    try:
+        with pytest.raises(PodTransportError):
+            client.put(source, "/private/" + TOKEN)
+        assert requests == [("POST", "/uploads")] + [
+            ("PUT", "/uploads/" + upload_id)] * (3 if status is None else 1) + [
+            ("GET", "/uploads/" + upload_id)]
+        messages = [r.getMessage() for r in caplog.records if r.name == "runpod_lifecycle.https"]
+        assert messages == [f"pod HTTPS upload failed (stage=chunk HTTP {status or 'unavailable'})"]
+        assert not any(secret in messages[0] for secret in (TOKEN, upload_id, "X-Secret", "attacker", "/private"))
+    finally:
+        client.close()
 
 
 @pytest.mark.parametrize("url", [

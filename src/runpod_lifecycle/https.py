@@ -5,6 +5,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import logging
 import re
 import shlex
 import time
@@ -19,6 +20,7 @@ from . import pod_agent
 TOKEN_ENV = "ASTRID_POD_TOKEN"
 PORT = 8000
 CHUNK = pod_agent.CHUNK
+logger = logging.getLogger(__name__)
 
 
 class PodTransportError(RuntimeError):
@@ -103,17 +105,32 @@ class HttpsPodTransport:
                 if _download is not None:
                     framing, offset = _download
                     message += f" (operation=download framing={framing} offset={offset} HTTP unavailable)"
+                self._log_upload_failure(method, path)
                 raise PodTransportError(message) from None
             if response.status_code in {502, 503, 504} and attempt < 2:
                 time.sleep(self.poll_interval)
                 continue
             if not response.is_success:
+                self._log_upload_failure(method, path, response.status_code)
                 if _download is not None:
                     framing, offset = _download
                     raise self._download_error("request rejected", response, framing, offset)
                 raise PodTransportError(f"pod HTTPS request rejected (HTTP {response.status_code})")
             return response
         raise AssertionError("unreachable")
+
+    @staticmethod
+    def _log_upload_failure(method, path, status=None):
+        # Fixed local labels only: never log paths/IDs, metadata, exception
+        # text or response data. Keep the v1 exception/receipt formats intact.
+        stage = None
+        if method == "POST" and path == "/uploads":
+            stage = "initiate"
+        elif isinstance(path, str) and re.fullmatch(r"/uploads/[a-f0-9]{32,64}", path):
+            stage = {"PUT": "chunk", "POST": "verify", "GET": "status"}.get(method)
+        if stage:
+            logger.warning("pod HTTPS upload failed (stage=%s HTTP %s)", stage,
+                           status if type(status) is int and 100 <= status <= 599 else "unavailable")
 
     @staticmethod
     def _download_error(reason, response, framing, offset, *, received=None):
@@ -193,10 +210,15 @@ class HttpsPodTransport:
                 try:
                     state = self._request("PUT", "/uploads/" + upload_id,
                                           params={"offset": state["offset"]}, content=chunk).json()
-                except PodTransportError:
+                except PodTransportError as chunk_error:
                     # A committed chunk may have lost its reply. Reconcile its
                     # durable offset before sending any bytes again.
-                    state = self._request("GET", "/uploads/" + upload_id).json()
+                    try:
+                        state = self._request("GET", "/uploads/" + upload_id).json()
+                    except PodTransportError:
+                        # Keep the initiating rejection when reconciliation
+                        # also fails. Neither failure permits another write.
+                        raise chunk_error from None
                     if state["offset"] == stream.tell() - len(chunk):
                         raise
         if not state["complete"]:

@@ -392,6 +392,67 @@ def test_real_loopback_50mib_json_roundtrip(rig, tmp_path, monkeypatch):
             thread.join(2)
 
 
+@pytest.mark.parametrize("stage", ["initiate", "chunk", "verify", "status"])
+def test_upload_404_stages_keep_same_receipt_and_log_safe_stage(rig, tmp_path, monkeypatch, caplog, stage):
+    """Distinct local causes match QUAL0's retained evidence; none proves its cause."""
+    from runpod_lifecycle.pod_agent import Handler
+
+    handle, provider, clock, _, _ = rig
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    requests = []
+    remote = None
+
+    class RejectUpload(Handler):
+        def dispatch(self):
+            requests.append((self.command, self.path))
+            matches = ((stage == "initiate" and self.command == "POST" and self.path == "/uploads")
+                       or (stage == "chunk" and self.command == "PUT")
+                       or (stage == "verify" and self.command == "POST" and self.path.startswith("/uploads/"))
+                       or (stage == "status" and self.command == "GET" and self.path.startswith("/uploads/")))
+            if matches:
+                return self.reply(404, {"error": KEY + provider.token}, headers={"X-Secret": KEY})
+            return super().dispatch()
+
+    server = AgentServer(("127.0.0.1", 0), "fixture-only-" + "x" * 32, tmp_path / "agent-state")
+    server.RequestHandlerClass = RejectUpload
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    class LocalTransport(HttpsPodTransport):
+        def __init__(self, pod_id, token, **kwargs):
+            server.token = token
+            super().__init__(pod_id, token, base_url=f"http://127.0.0.1:{server.server_port}",
+                             request_timeout=.5, poll_interval=.01)
+
+        def put(self, local, remote_path, **kwargs):
+            nonlocal remote
+            remote = Path(remote_path)
+            return super().put(local, remote_path, **kwargs)
+
+    try:
+        result = smoke.run_smoke(handle=handle, api_key=KEY, max_hourly=.1, max_seconds=90,
+                                 payload_bytes=4096, provider=provider, clock=clock,
+                                 transport_factory=LocalTransport)
+        assert result["phase"] == "upload" and result["uname"] == "passed"
+        assert result["status"] == "failed" and not result["qualified"]
+        assert {k: v for k, v in result.items() if k.startswith("transport_")} == {
+            "transport_failure": "http_rejected", "transport_http_status": 404}
+        assert "transfer_receipt" not in result and "long_job" not in result
+        assert result["cleanup"] == "verified_absent" and result["cleanup_get_status"] == 404
+        assert len(provider.create_calls) == 1 and provider.delete_calls == ["fakepod1"]
+        assert ("GET", "/health") in requests and any(path == "/jobs" for _, path in requests)
+        messages = [r.getMessage() for r in caplog.records if r.name == "runpod_lifecycle.https"]
+        assert f"pod HTTPS upload failed (stage={stage} HTTP 404)" in messages
+        for secret in (KEY, provider.token, str(remote), "X-Secret"):
+            assert secret not in "\n".join(messages) + handle.read_text()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+        if remote:
+            remote.unlink(missing_ok=True)
+
+
 def test_product_provider_uses_only_standard_minimum_cpu_api(monkeypatch):
     calls = []
     def create(*args, **kwargs):

@@ -114,6 +114,15 @@ identities and tokens. They describe the failed operation, not its root cause.
 The original live Range failure predates these diagnostics and remains
 unexplained; local JSON success does not resolve that live qualification gap.
 
+Upload failures additionally emit a warning from `runpod_lifecycle.https` with
+the fixed stage `initiate`, `chunk`, `verify` or `status`, and the HTTP status
+(or `unavailable`). These warnings contain no upload ID, target path, metadata,
+response body/header or exception text. Retain sanitized stderr alongside the
+ordinary smoke receipt: its v1 upload fields identify only the phase and status,
+so an upload-phase 404 alone cannot distinguish the failing request or its cause.
+If chunk reconciliation also fails, the client preserves the original chunk
+exception and stops; it does not switch methods, routes or origins.
+
 No command or full-file hashing blocks a request. HTTP calls time out within
 30 seconds each; command timeouts cancel the process group. Upload verification
 runs in a background thread with a one-hour client polling bound. Job logs are

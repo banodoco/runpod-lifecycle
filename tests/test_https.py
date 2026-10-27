@@ -15,6 +15,7 @@ import httpx
 import pytest
 
 from runpod_lifecycle import api
+from runpod_lifecycle import pod_agent
 from runpod_lifecycle.config import RunPodConfig
 from runpod_lifecycle.https import HttpsPodTransport, PodTransportError, agent_bootstrap, read_token_file, write_token_file
 from runpod_lifecycle.pod import Pod
@@ -221,6 +222,7 @@ def test_inline_bootstrap_runs_with_system_python_no_site_packages(tmp_path):
     import zlib
     source = zlib.decompress(base64.b64decode(boot["env"]["ASTRID_POD_AGENT_B64"]))
     assert source.startswith(b'"""Single-file')
+    assert source == Path(pod_agent.__file__).read_bytes()
     # -S prevents third-party imports. Compile/import without starting main.
     result = subprocess.run([sys.executable, "-S", "-c", "import sys;ns={'__name__':'test'};exec(sys.stdin.read(),ns)"],
                             input=source.decode(), capture_output=True, text=True)
@@ -272,7 +274,8 @@ def test_cpu_rest_no_volume_bootstrap_and_error_redaction(monkeypatch):
     assert TOKEN not in str(caught.value)
 
 
-def test_real_inline_start_command(tmp_path, monkeypatch):
+@pytest.mark.parametrize("startup", ["sdk", "rest"])
+def test_real_inline_start_command(tmp_path, monkeypatch, startup):
     import socket
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     with socket.socket() as probe:
@@ -280,8 +283,9 @@ def test_real_inline_start_command(tmp_path, monkeypatch):
         port = probe.getsockname()[1]
     boot = agent_bootstrap(TOKEN, port)
     environment = dict(os.environ, **boot["env"], ASTRID_POD_STATE=str(tmp_path / "state"))
-    # Use the same shell command passed to SDK docker_args, with no site packages.
-    command = shlex.split(boot["docker_args"])
+    # Exercise both provider startup representations with no site packages.
+    command = (shlex.split(boot["docker_args"]) if startup == "sdk"
+               else boot["docker_entrypoint"] + boot["docker_start_cmd"])
     command[-1] = command[-1].replace("python3 -u", shlex.quote(sys.executable) + " -S -u")
     process = subprocess.Popen(command, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     client = HttpsPodTransport("local", TOKEN, base_url=f"http://127.0.0.1:{port}", request_timeout=.2, poll_interval=.02)
@@ -291,6 +295,11 @@ def test_real_inline_start_command(tmp_path, monkeypatch):
         code, out, _ = client.execute_command("env | cut -d= -f1", timeout=5)
         assert code == 0
         assert "ASTRID_POD_TOKEN" not in out and "ASTRID_POD_AGENT_B64" not in out
+        source, remote, output = (tmp_path / name for name in ("source", "remote", "output"))
+        source.write_bytes(b"x" * CHUNK + b"bootstrap upload")
+        client.put(source, str(remote))
+        client.get(str(remote), output)
+        assert output.read_bytes() == source.read_bytes()
     finally:
         client.disconnect()
         process.terminate()
