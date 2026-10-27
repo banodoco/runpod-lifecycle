@@ -236,3 +236,20 @@ async def test_probe_raises_on_http_failure(monkeypatch: pytest.MonkeyPatch) -> 
 
     with pytest.raises(RuntimeError, match="HTTP 500"):
         await probe(api_key="k")
+
+
+def test_dc_price_is_used_when_global_price_is_absent(monkeypatch):
+    from runpod_lifecycle.availability import DataCenterAvailability
+    async def query(*args,**kwargs):
+        return {"gpuTypes":[_gpu("gpu","gpu",24,None)]}
+    async def centers(*args,**kwargs):
+        return [{"id":"EUR-NO-1"}]
+    async def price(*args,**kwargs):
+        return [DataCenterAvailability(datacenter_id="EUR-NO-1",name="EUR-NO-1",location="Europe",
+                                      status="available",stock_level="Low",price_per_hour=.89,
+                                      network_volume_support=True,reason=None)]
+    monkeypatch.setattr(probe_module,"_query",query)
+    monkeypatch.setattr(probe_module,"_fetch_datacenters",centers)
+    monkeypatch.setattr(probe_module,"_for_gpu",price)
+    rows=asyncio.run(probe(api_key="test",datacenter_ids=["EUR-NO-1"],max_price_per_hour=1.18))
+    assert rows[0]["price_per_hour"]==.89

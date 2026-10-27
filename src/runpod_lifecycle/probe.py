@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 
 from .api import GRAPHQL_URL, _auth_headers, normalize_allowed_cuda_versions
-from .availability import _QueryUnavailable, _constraints, _fetch_datacenters, _for_gpu
+from .availability import _QueryUnavailable, _constraints, _fetch_datacenters, _for_gpu, _query
 
 # GraphQL query used by :func:`probe`. ``lowestPrice`` is parameterised at
 # request time because RunPod's schema expects a literal boolean rather than
@@ -147,7 +147,11 @@ async def probe(
     """
     constraints = _constraints(require_secure_cloud, container_disk_gb, allowed_cuda_versions)
     normalized_cuda_versions = normalize_allowed_cuda_versions(allowed_cuda_versions)
-    raw = await _fetch_gpu_types(api_key, require_secure_cloud, normalized_cuda_versions)
+    if datacenter_ids is not None:
+        catalogue = await _query(api_key, "query GpuTypesProbe { gpuTypes { id displayName memoryInGb } }", {})
+        raw = catalogue.get("gpuTypes") or []
+    else:
+        raw = await _fetch_gpu_types(api_key, require_secure_cloud, normalized_cuda_versions)
 
     gpu_type_allowlist: set[str] | None = (
         set(gpu_types) if gpu_types is not None else None
