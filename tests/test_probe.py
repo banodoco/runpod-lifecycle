@@ -42,10 +42,11 @@ def _patch_response(
     captured: dict[str, Any] = {}
 
     def fake_post(url: str, json: dict[str, Any], headers: dict[str, str], timeout: int):
-        captured["url"] = url
-        captured["json"] = json
-        captured["headers"] = headers
-        captured["timeout"] = timeout
+        if "GpuTypesProbe" in json["query"]:
+            captured["url"] = url
+            captured["json"] = json
+            captured["headers"] = headers
+            captured["timeout"] = timeout
         response = MagicMock()
         response.status_code = 200
         response.json.return_value = {"data": {"gpuTypes": payload}}
@@ -205,6 +206,7 @@ async def test_probe_includes_secure_cloud_and_datacenter_fields(
     results = await probe(api_key="k", min_memory_gb=24, require_secure_cloud=True)
     assert results[0]["secure_cloud"] is True
     assert results[0]["datacenters_available"] == []
+    assert results[0]["availability_status"] == "unknown"
     assert results[0]["memory_gb"] == 48
 
 

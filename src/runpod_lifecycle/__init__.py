@@ -1,5 +1,6 @@
 """Async RunPod lifecycle primitives for launching pods, waiting for readiness, executing SSH commands, and terminating machines through a small typed public API. Also provides account-wide discovery (list_pods, find_orphans) and a `runpod-lifecycle` CLI."""
 
+from .availability import DataCenterAvailability, GpuAvailability, gpu_availability
 from .config import RunPodConfig
 from .discovery import (
     PodSummary,
@@ -93,6 +94,9 @@ __all__ = [
     "launch_when_available",
     "resume_when_available",
     "probe",
+    "DataCenterAvailability",
+    "GpuAvailability",
+    "gpu_availability",
     "find_gpu_type",
     "get_network_volumes",
     "create_network_volume",

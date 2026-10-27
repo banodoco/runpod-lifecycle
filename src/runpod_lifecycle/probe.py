@@ -1,23 +1,21 @@
 """Probe RunPod GPU availability without provisioning a pod.
 
-The :func:`probe` function answers the question "what configuration could
-actually launch right now, given my constraints?" — by querying RunPod's
-GraphQL ``gpuTypes`` schema and returning a price-ranked list of viable
-candidates. This avoids the trial-and-error provisioning loop where every
-failed attempt costs 20s+ of RAM-tier iteration.
+The :func:`probe` function ranks provider catalogue candidates and enriches
+them with data-center stock and price evidence. Only confirmed stock satisfies
+a requested data-center filter; unknown availability remains explicit. No pod
+is provisioned during discovery.
 """
 
 from __future__ import annotations
 
 import asyncio
-import logging
+from dataclasses import asdict
 from typing import Any
 
 import httpx
 
 from .api import GRAPHQL_URL, _auth_headers, normalize_allowed_cuda_versions
-
-logger = logging.getLogger("runpod_lifecycle.probe")
+from .availability import _QueryUnavailable, _constraints, _fetch_datacenters, _for_gpu
 
 # GraphQL query used by :func:`probe`. ``lowestPrice`` is parameterised at
 # request time because RunPod's schema expects a literal boolean rather than
@@ -101,7 +99,7 @@ async def probe(
     datacenter_ids: list[str] | None = None,
     allowed_cuda_versions: list[str] | tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return a price-ranked list of viable pod configurations.
+    """Return price-ranked catalogue candidates with data-center stock evidence.
 
     Each returned entry has the shape::
 
@@ -111,7 +109,9 @@ async def probe(
           "price_per_hour": 0.77,
           "secure_cloud": True,
           "is_blackwell": False,
-          "datacenters_available": [],
+          "datacenters_available": ["EU-RO-1"],
+          "availability_status": "available",
+          "datacenter_availability": [{"datacenter_id": "EU-RO-1", ...}],
         }
 
     Parameters
@@ -133,35 +133,19 @@ async def probe(
         (case-insensitive). Banodoco hivemind reports a training-quality
         regression on Blackwell variants.
     container_disk_gb:
-        Reserved for the eventual datacenter-availability lookup; currently
-        unused but accepted for forward compatibility with the brief.
+        Minimum free container disk required by the provider stock query.
     datacenter_ids:
-        Optional restriction list. The ``datacenters_available`` field is
-        returned as ``[]`` for now (TODO below); when this argument is set
-        and the field is empty we still return the entry so callers can rank
-        and try them — actual DC-level capacity must be inferred by attempting
-        to launch.
+        Optional exact DC allow-list. Only configurations with confirmed stock
+        in this list are returned. An empty list matches no data centers.
 
-    Returns
-    -------
-    list[dict]
-        Configurations sorted by ``price_per_hour`` ascending. GPU types with
-        no ``lowestPrice`` (i.e. no current availability under the
-        ``secureCloud`` flag requested) are filtered out.
-
-    Notes
-    -----
-    TODO: RunPod's public GraphQL schema does not expose a clean per-GPU
-    datacenter availability list. ``datacenters_available`` is therefore a
-    best-effort empty list ``[]`` for the first cut; a future revision can
-    fill it in once we settle on whether to scrape the ``Stockless``
-    detection endpoint or the ``dataCenters { compute }`` resolver (the
-    latter is admin-gated as of this writing).
+    Results include DC-specific evidence in ``datacenter_availability`` and
+    confirmed available IDs in ``datacenters_available``. Without a DC filter,
+    catalogue candidates whose DC stock cannot be determined are retained with
+    an explicit ``availability_status`` of ``unknown``; price alone is never
+    proof of stock. CUDA constraints apply to both stock and price queries.
+    No resource is allocated, and stock can change immediately after querying.
     """
-    # ``container_disk_gb`` and ``datacenter_ids`` accepted but unused for
-    # the first cut — see TODO above.
-    del container_disk_gb
-
+    constraints = _constraints(require_secure_cloud, container_disk_gb, allowed_cuda_versions)
     normalized_cuda_versions = normalize_allowed_cuda_versions(allowed_cuda_versions)
     raw = await _fetch_gpu_types(api_key, require_secure_cloud, normalized_cuda_versions)
 
@@ -212,19 +196,37 @@ async def probe(
                 "price_per_hour": price,
                 "secure_cloud": bool(require_secure_cloud),
                 "is_blackwell": blackwell,
-                "datacenters_available": [],  # TODO: see docstring.
+                "datacenters_available": [],
+                "gpu_type_id": gpu_id,
                 **({"allowed_cuda_versions": list(normalized_cuda_versions)} if normalized_cuda_versions else {}),
             }
         )
 
-    # ``datacenter_ids`` is accepted today purely as a no-op annotation; once
-    # availability data is plumbed through we will filter ``results`` by it.
-    if datacenter_ids:
-        logger.debug(
-            "probe: datacenter_ids=%s requested but availability data is not yet "
-            "plumbed; returning unfiltered results",
-            datacenter_ids,
-        )
+    if results:
+        try:
+            centers = await _fetch_datacenters(api_key, constraints)
+            for result in results:
+                dcs = await _for_gpu(
+                    api_key, result["gpu_type_id"], centers, constraints,
+                    datacenter_ids, False,
+                )
+                # A price cap must also apply to DC-specific prices.
+                available = [dc for dc in dcs if dc.status == "available" and
+                             (max_price_per_hour is None or dc.price_per_hour <= max_price_per_hour)]
+                result["datacenter_availability"] = [asdict(dc) for dc in dcs]
+                result["datacenters_available"] = [dc.datacenter_id for dc in available]
+                result["availability_status"] = (
+                    "available" if available else "unknown" if any(dc.status == "unknown" for dc in dcs) else "unavailable"
+                )
+                if available:
+                    result["price_per_hour"] = min(dc.price_per_hour for dc in available)
+        except _QueryUnavailable as exc:
+            for result in results:
+                result["datacenter_availability"] = []
+                result["availability_status"] = "unknown"
+                result["availability_reason"] = str(exc)
+    if datacenter_ids is not None:
+        results = [result for result in results if result["datacenters_available"]]
 
     results.sort(key=lambda r: r["price_per_hour"])
     return results

@@ -45,6 +45,7 @@ from .prebuilt import (
     write_manifest,
 )
 from .probe import probe as _probe
+from .availability import gpu_availability as _gpu_availability
 from .ssh import SSHClient
 
 
@@ -589,6 +590,26 @@ async def _cmd_volume_create(args: argparse.Namespace) -> int:
         return 1
 
 
+async def _cmd_availability(args: argparse.Namespace) -> int:
+    """Read-only provider stock discovery; always emit a typed JSON result."""
+    result = await _gpu_availability(
+        api_key=_resolve_api_key(args),
+        gpu=args.gpu,
+        min_cuda_version=args.min_cuda_version,
+        datacenter_ids=(
+            [d.strip() for d in args.datacenter_ids.split(",") if d.strip()]
+            if args.datacenter_ids is not None
+            else None
+        ),
+        require_secure_cloud=not args.allow_community_cloud,
+        require_network_volume=not args.allow_no_network_volume,
+        container_disk_gb=args.container_disk_gb,
+        allowed_cuda_versions=_resolve_cli_cuda_versions(args),
+    )
+    print(json.dumps(result.to_dict(), indent=2))
+    return {"available": 0, "unavailable": 2, "unknown": 3}[result.status]
+
+
 async def _cmd_probe(args: argparse.Namespace) -> int:
     """Query RunPod for currently-launchable GPU configs (no pod created)."""
     api_key = _resolve_api_key(args)
@@ -598,10 +619,10 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
         gpu_types_arg = [g.strip() for g in args.gpu_types.split(",") if g.strip()] or None
 
     datacenter_ids: list[str] | None = None
-    if getattr(args, "datacenter_ids", None):
+    if getattr(args, "datacenter_ids", None) is not None:
         datacenter_ids = [
             d.strip() for d in args.datacenter_ids.split(",") if d.strip()
-        ] or None
+        ]
 
     results = await _probe(
         api_key=api_key,
@@ -2213,6 +2234,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_vol_create.add_argument("size_gb", type=int)
     p_vol_create.add_argument("--datacenter", required=True, help="Datacenter ID (e.g. US-TX-1).")
 
+    p_availability = sub.add_parser(
+        "availability",
+        help="Read-only GPU stock by data center (JSON; Secure Cloud/network storage by default).",
+    )
+    p_availability.add_argument(
+        "--gpu",
+        required=True,
+        help="Exact provider GPU display name or ID, e.g. RTX 5090.",
+    )
+    p_availability.add_argument(
+        "--datacenter-ids", help="Comma-separated data-center ID allow-list."
+    )
+    p_availability.add_argument(
+        "--allowed-cuda-versions",
+        help="Comma-separated allowed host CUDA versions, e.g. 13.0.",
+    )
+    p_availability.add_argument(
+        "--min-cuda-version", help="Minimum provider host CUDA capability, e.g. 13.0."
+    )
+    p_availability.add_argument("--container-disk-gb", type=int, default=100)
+    p_availability.add_argument("--allow-community-cloud", action="store_true")
+    p_availability.add_argument("--allow-no-network-volume", action="store_true")
+
     p_probe = sub.add_parser(
         "probe",
         help="Query RunPod for currently-launchable GPU configs (no pod created).",
@@ -2254,13 +2298,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--container-disk-gb",
         type=int,
         default=100,
-        help="Container disk size used for forward-compatible availability checks.",
+        help="Minimum free container disk for provider availability checks.",
     )
     p_probe.add_argument(
         "--datacenter-ids",
         dest="datacenter_ids",
-        help="Comma-separated datacenter id allow-list (forward-compatible; "
-        "currently informational only).",
+        help="Comma-separated datacenter id allow-list; require confirmed stock in those centers.",
     )
     p_probe.add_argument(
         "--format",
@@ -2488,6 +2531,7 @@ _HANDLERS: dict[str, Any] = {
     "fetch": _cmd_fetch,
     "run": _cmd_run,
     "probe": _cmd_probe,
+    "availability": _cmd_availability,
     "volumes": None,  # dispatched via volumes_cmd below
     "prebuilt": _cmd_prebuilt,
 }
