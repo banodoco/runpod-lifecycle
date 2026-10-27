@@ -321,8 +321,23 @@ def create_pod(
         params["env"] = pod_env
 
     sdk_stdout = io.StringIO()
-    with contextlib.redirect_stdout(sdk_stdout):
-        pod = sdk.create_pod(**params)
+    try:
+        with contextlib.redirect_stdout(sdk_stdout):
+            pod = sdk.create_pod(**params)
+    except Exception as exc:
+        from runpod.error import QueryError, AuthenticationError
+        if not isinstance(exc, (QueryError, AuthenticationError)):
+            raise
+        message = str(exc)
+        for secret in (api_key, public_key_string):
+            if secret:
+                message = message.replace(secret, "[redacted]")
+        lower = message.lower()
+        capacity = (isinstance(exc, QueryError)
+                    and "there are no longer any instances available with the requested specifications" in lower
+                    and not any(x in lower for x in ("invalid", "validation", "unsupported", "expected")))
+        error = ProviderCapacityUnavailable if capacity else ProviderRequestRejected
+        raise error(200 if isinstance(exc, QueryError) else 401, message[:1000]) from None
     leaked_stdout = sdk_stdout.getvalue().strip()
     if leaked_stdout:
         logger.debug("RunPod SDK create_pod wrote %d bytes to stdout; suppressed to avoid leaking pod env", len(leaked_stdout))
