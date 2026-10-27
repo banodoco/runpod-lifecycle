@@ -197,11 +197,39 @@ def create_pod(
     vcpu_count: int = 2,
     data_center_id: str | None = None,
     min_cuda_version: str | None = None,
+    cpu_api: str = "rest",
+    instance_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a RunPod pod and return provision metadata immediately."""
     pod_env = dict(env_vars or {})
     if public_key_string:
         pod_env["PUBLIC_KEY"] = public_key_string
+    if compute_type == "CPU" and cpu_api == "sdk":
+        sdk = _get_runpod()
+        sdk.api_key = api_key
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                pod = sdk.create_pod(name=name, image_name=image_name, gpu_type_id=None,
+                                     cloud_type="SECURE", data_center_id=data_center_id,
+                                     network_volume_id=network_volume_id, volume_mount_path=volume_mount_path,
+                                     container_disk_in_gb=container_disk_in_gb, ports=ports or "22/tcp",
+                                     env=pod_env, instance_id=instance_id)
+        except Exception as exc:
+            from runpod.error import QueryError, AuthenticationError
+            if not isinstance(exc, (QueryError, AuthenticationError)):
+                raise
+            message = str(exc)
+            for secret in (api_key, public_key_string):
+                if secret:
+                    message = message.replace(secret, "[redacted]")
+            capacity = (isinstance(exc, QueryError)
+                        and "there are no longer any instances available with the requested specifications" in message.lower()
+                        and not any(x in message.lower() for x in ("invalid", "validation", "unsupported", "expected")))
+            error = ProviderCapacityUnavailable if capacity else ProviderRequestRejected
+            raise error(200 if isinstance(exc, QueryError) else 401, message[:1000]) from None
+        if not isinstance(pod, dict) or not pod.get("id"):
+            raise RuntimeError("CPU SDK create returned no pod ID; reconcile allocation")
+        return {"id": pod["id"], "name": name, "created": True, "compute_type": "CPU"}
     if compute_type == "CPU":
         if cpu_flavor_priority not in {"availability", "custom"}:
             raise ValueError("CPU flavor priority must be availability or custom")
