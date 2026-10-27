@@ -185,6 +185,7 @@ class RunPodConfig:
     name_prefix: str = "pod"
     ports: str | None = None
     allowed_cuda_versions: tuple[str, ...] = ()
+    min_cuda_version: str | None = None
 
     def __post_init__(self) -> None:
         # Normalize list inputs to a tuple while preserving str inputs as-is.
@@ -194,6 +195,10 @@ class RunPodConfig:
             # Re-normalize tuples to strip empties / whitespace consistently.
             object.__setattr__(self, "gpu_type", _normalize_gpu_type(self.gpu_type))
         object.__setattr__(self, "allowed_cuda_versions", _normalize_cuda_versions(self.allowed_cuda_versions))
+        if self.min_cuda_version is not None:
+            object.__setattr__(self, "min_cuda_version", _normalize_cuda_versions((self.min_cuda_version,))[0])
+            if self.allowed_cuda_versions:
+                raise ValueError("minimum and exact CUDA filters cannot be combined")
 
     @property
     def gpu_type_candidates(self) -> tuple[str, ...]:
@@ -259,6 +264,7 @@ class RunPodConfig:
             "name_prefix": os.getenv("RUNPOD_NAME_PREFIX", "pod"),
             "ports": _parse_optional_string(os.getenv("RUNPOD_PORTS")),
             "allowed_cuda_versions": _parse_csv_tuple(raw_cuda_versions),
+            "min_cuda_version": _parse_optional_string(os.getenv("RUNPOD_MIN_CUDA_VERSION")),
         }
         data.update(overrides)
 

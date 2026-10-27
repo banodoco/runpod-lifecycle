@@ -169,6 +169,7 @@ async def _try_launch_one_gpu(
                     template_id=config.template_id,
                     ports=config.ports,
                     allowed_cuda_versions=config.allowed_cuda_versions or None,
+                    **({"min_cuda_version": config.min_cuda_version} if config.min_cuda_version else {}),
                 )
             except Exception as exc:
                 # Only a definite capacity rejection permits another create.

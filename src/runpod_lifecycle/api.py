@@ -196,6 +196,7 @@ def create_pod(
     cpu_flavor_priority: str = "custom",
     vcpu_count: int = 2,
     data_center_id: str | None = None,
+    min_cuda_version: str | None = None,
 ) -> dict[str, Any]:
     """Create a RunPod pod and return provision metadata immediately."""
     pod_env = dict(env_vars or {})
@@ -269,6 +270,11 @@ def create_pod(
         params["data_center_id"] = data_center_id
 
     normalized_cuda_versions = normalize_allowed_cuda_versions(allowed_cuda_versions)
+    if min_cuda_version is not None:
+        if normalized_cuda_versions:
+            raise ValueError("minimum and exact CUDA filters cannot be combined")
+        min_cuda_version = normalize_allowed_cuda_versions((min_cuda_version,))[0]
+        params["min_cuda_version"] = min_cuda_version
     if normalized_cuda_versions is not None:
         # The SDK maps this snake_case argument to GraphQL's
         # ``allowedCudaVersions`` input on podFindAndDeployOnDemand.
@@ -308,6 +314,7 @@ def create_pod(
         "gpu_type_id": gpu_type_id,
         "created": True,
         **({"allowed_cuda_versions": list(normalized_cuda_versions)} if normalized_cuda_versions else {}),
+        **({"min_cuda_version": min_cuda_version} if min_cuda_version else {}),
     }
 
 
