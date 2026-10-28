@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -361,3 +362,106 @@ def test_upload_resume_after_server_restart(agent, tmp_path):
         restarted.shutdown()
         restarted.server_close()
         thread.join(2)
+
+
+def _detached_state(client, job, root, want, timeout=10):
+    deadline = time.monotonic() + timeout
+    while True:
+        state = client.detached_poll(job["id"], root=root)
+        if state["state"] == want or time.monotonic() >= deadline:
+            return state
+        time.sleep(0.02)
+
+
+def _gone(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        # An unreaped zombie has been killed already; only a live state counts.
+        return Path(f"/proc/{pid}/stat").read_text().split(")", 1)[1].split()[0] == "Z"
+    except OSError:
+        return True
+
+
+def test_detached_job_start_poll_writes_exit_file(agent, tmp_path):
+    _, client = agent
+    root = str(tmp_path / "volume" / ".astrid-jobs")
+    job = client.detached_start("echo out; echo err >&2; sleep 0.2; exit 7", root=root)
+    state = _detached_state(client, job, root, "exited")
+    assert state["state"] == "exited" and state["exit_code"] == 7
+    directory = Path(job["dir"])
+    assert (directory / "exit").read_text() == "7\n"
+    assert (directory / "stdout").read_text() == "out\n"
+    assert (directory / "stderr").read_text() == "err\n"
+    assert state["pid"] == int((directory / "pid").read_text())
+    assert oct(directory.stat().st_mode & 0o777) == "0o700"
+
+
+def test_detached_job_cancel_signals_group_and_keeps_state(agent, tmp_path):
+    _, client = agent
+    root = str(tmp_path / "volume" / ".astrid-jobs")
+    child_pid = tmp_path / "child.pid"
+    job = client.detached_start(f"sleep 30 & echo $! > {shlex.quote(str(child_pid))}; wait", root=root)
+    for _ in range(200):
+        if child_pid.exists() and child_pid.read_text().strip():
+            break
+        time.sleep(0.02)
+    running = _detached_state(client, job, root, "running")
+    assert running["state"] == "running"
+    cancelled = client.detached_cancel(job["id"], root=root)
+    assert cancelled["state"] == "cancelled" and cancelled["exit_code"] is None
+    assert not (Path(job["dir"]) / "exit").exists()
+    deadline = time.monotonic() + 5
+    while not _gone(int(child_pid.read_text())) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert _gone(int(child_pid.read_text()))
+    # A job that already finished keeps its exit code under cancel.
+    done = client.detached_start("exit 3", root=root)
+    _detached_state(client, done, root, "exited")
+    assert client.detached_cancel(done["id"], root=root)["exit_code"] == 3
+
+
+def test_client_timeout_does_not_cancel_detached_job(agent, tmp_path, monkeypatch):
+    _, client = agent
+    root = str(tmp_path / "volume" / ".astrid-jobs")
+    job_id = uuid.uuid4().hex
+    cancels = []
+    real_cancel = client.cancel
+    monkeypatch.setattr(client, "cancel", lambda job: cancels.append(job) or real_cancel(job))
+    # The client's wait for the launcher times out, as a dropped connection would.
+    with monkeypatch.context() as timed_out:
+        def dropped(*_args, **_kwargs):
+            raise PodTransportError("pod HTTPS request failed")
+        timed_out.setattr(client, "poll", dropped)
+        with pytest.raises(PodTransportError, match="request failed"):
+            client.detached_start("sleep 0.3; echo done; exit 7", root=root, job_id=job_id)
+    state = _detached_state(client, {"id": job_id}, root, "exited")
+    assert state["exit_code"] == 7
+    assert (Path(root) / job_id / "stdout").read_text() == "done\n"
+    assert cancels == []
+
+
+def test_detached_job_refuses_relaunch_and_bad_input(agent, tmp_path):
+    _, client = agent
+    root = str(tmp_path / "volume" / ".astrid-jobs")
+    job_id = uuid.uuid4().hex
+    client.detached_start("echo first", root=root, job_id=job_id)
+    _detached_state(client, {"id": job_id}, root, "exited")
+    with pytest.raises(PodTransportError, match="launch failed"):
+        client.detached_start("echo second", root=root, job_id=job_id)
+    assert (Path(root) / job_id / "stdout").read_text() == "first\n"
+    with pytest.raises(ValueError):
+        client.detached_poll("../escape", root=root)
+    with pytest.raises(ValueError):
+        client.detached_cancel(job_id, root="relative/root")
+    assert client.detached_poll(uuid.uuid4().hex, root=root)["state"] == "missing"
+
+
+def test_job_verbs_parse_under_https_transport():
+    from runpod_lifecycle.cli import build_parser
+    args = build_parser().parse_args(["--transport", "https", "job", "start", "pod1", "--command", "echo hi"])
+    assert (args.cmd, args.job_cmd, args.pod_id, args.command) == ("job", "start", "pod1", "echo hi")
+    args = build_parser().parse_args(["job", "cancel", "pod1", "a" * 32])
+    assert (args.job_cmd, args.job_id) == ("cancel", "a" * 32)

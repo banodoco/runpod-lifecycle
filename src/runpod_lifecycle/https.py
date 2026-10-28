@@ -27,6 +27,21 @@ CHUNK = pod_agent.CHUNK
 # the request did not reach the agent and is safe to retry within this bound.
 ROUTE_GRACE_SECONDS = 90
 READY_CONSECUTIVE = 3
+# Detached jobs keep all state on the volume, so they outlive the client. The
+# supervisor runs under setsid (its own session and process group), so cancelling
+# the short launcher agent job never reaches the work.
+DETACHED_ROOT = "/workspace/.astrid-jobs"
+_DETACHED_ID = re.compile(r"[a-f0-9]{32}")
+_DETACHED_SUPERVISOR = """\
+d="$1"
+echo "$$" > "$d/pid.tmp" && mv "$d/pid.tmp" "$d/pid"
+if [ -e "$d/cancel" ]; then echo cancelled > "$d/status.tmp" && mv "$d/status.tmp" "$d/status"; exit 0; fi
+echo running > "$d/status.tmp" && mv "$d/status.tmp" "$d/status"
+rc=0
+bash "$d/command.sh" > "$d/stdout" 2> "$d/stderr" < /dev/null || rc=$?
+echo "$rc" > "$d/exit.tmp" && mv "$d/exit.tmp" "$d/exit"
+echo exited > "$d/status.tmp" && mv "$d/status.tmp" "$d/status"
+"""
 logger = logging.getLogger(__name__)
 
 
@@ -112,6 +127,22 @@ def _is_loopback(url: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return host == "localhost"
+
+
+def _detached_directory(root: str, job_id: str) -> str:
+    if not isinstance(root, str) or not root.startswith("/") or any(c in root for c in "\x00\r\n") \
+            or ".." in root.split("/"):
+        raise ValueError("detached root must be an absolute path without '..'")
+    if not isinstance(job_id, str) or not _DETACHED_ID.fullmatch(job_id):
+        raise ValueError("invalid detached job ID")
+    return f"{root.rstrip('/')}/{job_id}"
+
+
+def _detached_record(job_id: str, directory: str, fields: dict) -> dict:
+    exit_code, pid = fields.get("exit_code", ""), fields.get("pid", "")
+    return {"id": job_id, "dir": directory, "state": fields.get("state", "missing"),
+            "exit_code": int(exit_code) if exit_code.isdigit() else None,
+            "pid": int(pid) if pid.isdigit() else None}
 
 
 def _transport_url(pod_id: str, port: int, override: str | None) -> str:
@@ -316,6 +347,78 @@ class HttpsPodTransport:
                 self.cancel(job_id)
 
     run = exec = execute_command
+
+    def _detached_script(self, script: str, timeout: float) -> dict:
+        code, stdout, _stderr = self.execute_command(script, timeout=timeout)
+        if code != 0:
+            raise PodTransportError(f"detached job control failed (exit {code})")
+        return dict(line.split("=", 1) for line in stdout.splitlines() if "=" in line)
+
+    def detached_start(self, command: str, *, root: str = DETACHED_ROOT, job_id: str | None = None,
+                       launch_timeout: float = 60) -> dict:
+        """Run command detached on the volume; return {"id", "dir"}.
+
+        The agent job used here only spawns the supervisor and exits. It is never
+        cancelled, so a client timeout while waiting for it leaves the work running.
+        """
+        job_id = uuid.uuid4().hex if job_id is None else job_id
+        directory = _detached_directory(root, job_id)
+        if not isinstance(command, str) or not command.strip() or "\x00" in command:
+            raise ValueError("detached command must be a non-empty string")
+        encoded = base64.b64encode(command.encode()).decode()
+        launcher = (
+            "set -eu\n"
+            f"d={shlex.quote(directory)}\n"
+            'if [ -e "$d" ]; then exit 3; fi\n'
+            "umask 077\n"
+            'mkdir -p -- "$d"\n'
+            f'printf %s {shlex.quote(encoded)} | base64 -d > "$d/command.sh"\n'
+            'printf starting > "$d/status"\n'
+            f'setsid bash -c {shlex.quote(_DETACHED_SUPERVISOR)} detached-job "$d" </dev/null >/dev/null 2>&1 &\n'
+        )
+        launch = self.start(launcher)
+        deadline = time.monotonic() + launch_timeout
+        while True:
+            result = self.poll(launch)
+            if result["status"] == "exited":
+                break
+            if time.monotonic() >= deadline:
+                raise PodTransportError("detached job launch did not finish")
+            time.sleep(self.poll_interval)
+        if result["exit_code"] != 0:
+            raise PodTransportError(f"detached job launch failed (exit {result['exit_code']})")
+        return {"id": job_id, "dir": directory}
+
+    def detached_poll(self, job_id: str, *, root: str = DETACHED_ROOT) -> dict:
+        directory = _detached_directory(root, job_id)
+        script = (
+            f"d={shlex.quote(directory)}\n"
+            'if [ -f "$d/exit" ]; then state=exited; code=$(cat "$d/exit")\n'
+            'elif [ -f "$d/status" ]; then state=$(cat "$d/status"); code=\n'
+            "else state=missing; code=; fi\n"
+            'pid=$(cat "$d/pid" 2>/dev/null || true)\n'
+            'printf "state=%s\\nexit_code=%s\\npid=%s\\n" "$state" "$code" "$pid"\n'
+        )
+        return _detached_record(job_id, directory, self._detached_script(script, timeout=15))
+
+    def detached_cancel(self, job_id: str, *, root: str = DETACHED_ROOT) -> dict:
+        """Signal the recorded process group; a finished job keeps its exit code."""
+        directory = _detached_directory(root, job_id)
+        script = (
+            f"d={shlex.quote(directory)}\n"
+            'if [ ! -d "$d" ] || [ -f "$d/exit" ]; then exit 0; fi\n'
+            ': > "$d/cancel"\n'
+            'pid=$(cat "$d/pid" 2>/dev/null || true)\n'
+            'case "$pid" in ""|*[!0-9]*|0|1) pid= ;; esac\n'
+            'if [ -n "$pid" ]; then\n'
+            '  kill -TERM -- "-$pid" 2>/dev/null || true\n'
+            "  for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 -- \"-$pid\" 2>/dev/null || break; sleep 0.2; done\n"
+            '  kill -KILL -- "-$pid" 2>/dev/null || true\n'
+            "fi\n"
+            'if [ ! -f "$d/exit" ] && [ -d "$d" ]; then echo cancelled > "$d/status.tmp" && mv "$d/status.tmp" "$d/status"; fi\n'
+        )
+        self._detached_script(script, timeout=30)
+        return self.detached_poll(job_id, root=root)
 
     def put(self, local: str | Path, remote: str, *, reserved: bool = False):
         local = Path(local)

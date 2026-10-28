@@ -26,6 +26,7 @@ from .lifecycle import (
     launch_when_available as _launch_when_available,
     resume_when_available as _resume_when_available,
 )
+from .https import DETACHED_ROOT
 from .pod import Pod
 from .prebuilt import (
     PrebuiltEnvContract,
@@ -504,6 +505,28 @@ async def _cmd_fetch(args: argparse.Namespace) -> int:
     else:
         print("no artifacts found", file=sys.stderr)
         return 1
+    return 0
+
+
+async def _cmd_job(args: argparse.Namespace) -> int:
+    """Detached job start/poll/cancel over HTTPS. Jobs outlive client timeouts."""
+    config = _resolve_config(args)
+    if config.transport != "https":
+        print("error: job verbs require --transport https", file=sys.stderr)
+        return 2
+    pod = await discovery.get_pod(args.pod_id, config)
+    await pod.wait_ready(timeout=60)
+    client = pod.https_transport()
+    try:
+        if args.job_cmd == "start":
+            result = await asyncio.to_thread(client.detached_start, args.command, root=args.root)
+        elif args.job_cmd == "poll":
+            result = await asyncio.to_thread(client.detached_poll, args.job_id, root=args.root)
+        else:
+            result = await asyncio.to_thread(client.detached_cancel, args.job_id, root=args.root)
+    finally:
+        client.disconnect()
+    print(json.dumps(result, sort_keys=True))
     return 0
 
 
@@ -2237,6 +2260,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_fetch.add_argument("--remote", required=True, help="Remote root path on pod (e.g. /workspace).")
     p_fetch.add_argument("--local", required=True, help="Local destination directory.")
 
+    p_job = sub.add_parser("job", help="Detached pod jobs over HTTPS: start, poll, cancel.")
+    job_sub = p_job.add_subparsers(dest="job_cmd", required=True)
+    p_job_start = job_sub.add_parser("start", help="Run a shell command detached on the pod volume; prints JSON.")
+    p_job_start.add_argument("pod_id")
+    p_job_start.add_argument("--command", required=True, help="Shell command to run detached.")
+    p_job_start.add_argument("--root", default=DETACHED_ROOT, help="Absolute volume directory for job state.")
+    p_job_poll = job_sub.add_parser("poll", help="Print a detached job's state and exit code as JSON.")
+    p_job_poll.add_argument("pod_id")
+    p_job_poll.add_argument("job_id")
+    p_job_poll.add_argument("--root", default=DETACHED_ROOT, help="Absolute volume directory for job state.")
+    p_job_cancel = job_sub.add_parser("cancel", help="Signal a detached job's process group; prints JSON.")
+    p_job_cancel.add_argument("pod_id")
+    p_job_cancel.add_argument("job_id")
+    p_job_cancel.add_argument("--root", default=DETACHED_ROOT, help="Absolute volume directory for job state.")
+
     p_run = sub.add_parser("run", help="Ship a script file and run it on a pod (sync composite).")
     p_run.add_argument("pod_id")
     p_run.add_argument("--script", required=True, help="Path to the shell script to run.")
@@ -2560,6 +2598,7 @@ _HANDLERS: dict[str, Any] = {
     "exec": _cmd_exec,
     "ship": _cmd_ship,
     "fetch": _cmd_fetch,
+    "job": _cmd_job,
     "run": _cmd_run,
     "probe": _cmd_probe,
     "availability": _cmd_availability,
