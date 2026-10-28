@@ -18,7 +18,7 @@ import pytest
 from runpod_lifecycle import api
 from runpod_lifecycle import pod_agent
 from runpod_lifecycle.config import RunPodConfig
-from runpod_lifecycle.https import HttpsPodTransport, PodTransportError, agent_bootstrap, read_token_file, write_token_file
+from runpod_lifecycle.https import HttpsPodTransport, PodTransportError, _detached_record, agent_bootstrap, read_token_file, write_token_file
 from runpod_lifecycle.pod import Pod
 from runpod_lifecycle.pod_agent import AgentServer, CHUNK
 from runpod_lifecycle.preflight import preflight_transport
@@ -457,6 +457,147 @@ def test_detached_job_refuses_relaunch_and_bad_input(agent, tmp_path):
     with pytest.raises(ValueError):
         client.detached_cancel(job_id, root="relative/root")
     assert client.detached_poll(uuid.uuid4().hex, root=root)["state"] == "missing"
+
+
+def _record_requests(client):
+    """Record (method, path) for every request the client sends, in order."""
+    seen = []
+    client.http.event_hooks["request"].append(lambda request: seen.append((request.method, request.url.path)))
+    return seen
+
+
+def _legacy_detached_poll(client, job_id, root):
+    """The former shell-job read, kept only as the oracle for field equivalence."""
+    directory = f"{root}/{job_id}"
+    script = (
+        f"d={shlex.quote(directory)}\n"
+        'if [ -f "$d/exit" ]; then state=exited; code=$(cat "$d/exit")\n'
+        'elif [ -f "$d/status" ]; then state=$(cat "$d/status"); code=\n'
+        "else state=missing; code=; fi\n"
+        'pid=$(cat "$d/pid" 2>/dev/null || true)\n'
+        'printf "state=%s\\nexit_code=%s\\npid=%s\\n" "$state" "$code" "$pid"\n'
+    )
+    code, stdout, _stderr = client.execute_command(script, timeout=15)
+    assert code == 0
+    return _detached_record(job_id, directory, dict(line.split("=", 1) for line in stdout.splitlines() if "=" in line))
+
+
+def test_detached_poll_creates_no_agent_job_record(agent, tmp_path):
+    server, client = agent
+    root = str(tmp_path / "volume" / ".astrid-jobs")
+    running = client.detached_start("sleep 30", root=root)
+    _detached_state(client, running, root, "running")
+    done = client.detached_start("exit 4", root=root)
+    _detached_state(client, done, root, "exited")
+    records = len(server.jobs)
+    seen = _record_requests(client)
+    try:
+        for job in (running, done):
+            client.detached_poll(job["id"], root=root)
+        polled, records_after = list(seen), len(server.jobs)
+    finally:
+        client.detached_cancel(running["id"], root=root)
+    assert polled and set(polled) == {("POST", "/download-chunk")}
+    assert records_after == records
+
+
+def test_detached_poll_fields_match_the_former_shell_read(agent, tmp_path):
+    _, client = agent
+    root = str(tmp_path / "volume" / ".astrid-jobs")
+    running = client.detached_start("sleep 30", root=root)
+    _detached_state(client, running, root, "running")
+    exited = client.detached_start("echo out; exit 7", root=root)
+    _detached_state(client, exited, root, "exited")
+    try:
+        for job, state, code in ((running, "running", None), (exited, "exited", 7)):
+            polled = client.detached_poll(job["id"], root=root)
+            assert polled == _legacy_detached_poll(client, job["id"], root)
+            assert polled == {"id": job["id"], "dir": job["dir"], "state": state, "exit_code": code,
+                              "pid": int((Path(job["dir"]) / "pid").read_text())}
+    finally:
+        client.detached_cancel(running["id"], root=root)
+
+
+def test_detached_poll_reads_state_on_an_engine_proxy_agent(tmp_path, monkeypatch):
+    # Engine-enabled agents refuse every request that carries a Range header.
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    server = AgentServer(("127.0.0.1", 0), TOKEN, tmp_path / "state",
+                         engine_proxy={"endpoint_id": "engine-a", "port": 9})
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = HttpsPodTransport("local", TOKEN, base_url=f"http://127.0.0.1:{server.server_port}",
+                               request_timeout=0.5, poll_interval=0.02)
+    root = str(tmp_path / "volume" / ".astrid-jobs")
+    try:
+        job = client.detached_start("echo out; exit 5", root=root)
+        assert _detached_state(client, job, root, "exited")["exit_code"] == 5
+    finally:
+        client.disconnect()
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+
+
+@pytest.mark.parametrize("job_id", ["../escape", "A" * 32, "a" * 31, "a" * 33, "g" * 32, "a" * 32 + "/x", ""])
+def test_detached_poll_rejects_bad_job_id_before_any_request(agent, tmp_path, job_id):
+    _, client = agent
+    root = str(tmp_path / "volume" / ".astrid-jobs")
+    seen = _record_requests(client)
+    with pytest.raises(ValueError, match="invalid detached job ID"):
+        client.detached_poll(job_id, root=root)
+    with pytest.raises(ValueError, match="absolute path"):
+        client.detached_poll(uuid.uuid4().hex, root="relative/root")
+    assert seen == []
+
+
+def test_rate_limit_error_names_status_and_body_without_retrying(agent):
+    server, client = agent
+
+    class Finished:
+        pid = 0
+
+        def poll(self):
+            return 0
+
+    # Stand-in records fill the 128-record cap, so the agent's own 429 is real.
+    for index in range(128):
+        server.jobs[f"{index:032x}"] = {"process": Finished(), "directory": None, "command": "true"}
+    seen = _record_requests(client)
+    with pytest.raises(PodTransportError, match=r"HTTP 429; body: .*job limit reached; rotate claim") as caught:
+        client.start("echo hi")
+    assert "Retry-After" not in str(caught.value)
+    assert seen == [("POST", "/jobs")]
+
+
+def test_rate_limit_detail_keeps_retry_after_redacts_token_and_never_retries(agent, monkeypatch):
+    _, client = agent
+    calls = []
+
+    def throttled(request):
+        calls.append(request)
+        return httpx.Response(429, content=f'{{"error": "slow down {TOKEN}"}}'.encode(),
+                              headers={"Retry-After": "30"})
+
+    stub = httpx.Client(base_url=str(client.http.base_url), headers=client.http.headers,
+                        transport=httpx.MockTransport(throttled))
+    monkeypatch.setattr(client, "http", stub)
+    with pytest.raises(PodTransportError) as caught:
+        client.start("echo hi")
+    text = str(caught.value)
+    assert "HTTP 429; body: " in text and "slow down [redacted]" in text and "Retry-After: 30" in text
+    assert TOKEN not in text and len(calls) == 1
+
+
+def test_job_poll_rejects_bad_id_before_pod_discovery(monkeypatch, capsys):
+    from runpod_lifecycle import cli
+    monkeypatch.setattr("runpod_lifecycle.cli.load_runpod_env", lambda *a, **k: None)
+
+    async def no_discovery(*_args, **_kwargs):
+        raise AssertionError("pod discovery must not run for a malformed job ID")
+
+    monkeypatch.setattr("runpod_lifecycle.cli.discovery.get_pod", no_discovery)
+    assert cli.main(["--transport", "https", "job", "poll", "pod-1", "../escape"]) == 2
+    assert "invalid detached job ID" in capsys.readouterr().err
 
 
 def test_job_verbs_parse_under_https_transport():

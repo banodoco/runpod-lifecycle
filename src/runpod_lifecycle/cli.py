@@ -26,7 +26,7 @@ from .lifecycle import (
     launch_when_available as _launch_when_available,
     resume_when_available as _resume_when_available,
 )
-from .https import DETACHED_ROOT
+from .https import DETACHED_ROOT, _detached_directory
 from .pod import Pod
 from .prebuilt import (
     PrebuiltEnvContract,
@@ -510,6 +510,13 @@ async def _cmd_fetch(args: argparse.Namespace) -> int:
 
 async def _cmd_job(args: argparse.Namespace) -> int:
     """Detached job start/poll/cancel over HTTPS. Jobs outlive client timeouts."""
+    if args.job_cmd != "start":
+        try:
+            # Reject a malformed job ID or root before any pod discovery or request.
+            _detached_directory(args.root, args.job_id)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     config = _resolve_config(args)
     if config.transport != "https":
         print("error: job verbs require --transport https", file=sys.stderr)

@@ -211,9 +211,10 @@ class HttpsPodTransport:
         """True for the provider proxy's no-route reply, never for an agent reply."""
         return response.status_code == 404 and not response.content
 
-    def _request(self, method, path, *, _download=None, _route_grace=None, **kwargs):
+    def _request(self, method, path, *, _download=None, _route_grace=None, _absent=(), **kwargs):
         # All operations are idempotent: command IDs and upload offsets make
         # retry after a lost response safe. Never follow redirects with auth.
+        # Statuses listed in _absent are returned to the caller, not raised.
         grace = self.route_grace if _route_grace is None else _route_grace
         route_deadline = None
         attempt = 0
@@ -247,13 +248,39 @@ class HttpsPodTransport:
                 attempt += 1
                 self._pause(self.poll_interval)
                 continue
-            if not response.is_success:
+            if not response.is_success and response.status_code not in _absent:
                 self._log_upload_failure(method, path, response.status_code)
                 if _download is not None:
                     framing, offset = _download
                     raise self._download_error("request rejected", response, framing, offset)
-                raise PodTransportError(f"pod HTTPS request rejected (HTTP {response.status_code})")
+                detail = self._rate_limit_detail(response)
+                raise PodTransportError(f"pod HTTPS request rejected (HTTP {response.status_code}{detail})")
             return response
+
+    def _rate_limit_detail(self, response) -> str:
+        """Sanitized body and Retry-After for HTTP 429 only; empty otherwise.
+
+        The bearer token is redacted before the body is shortened, so no part of
+        it can survive truncation. No retry or backoff happens here.
+        """
+        if response.status_code != 429:
+            return ""
+        secret = self.http.headers.get("Authorization", "").removeprefix("Bearer ")
+
+        def clean(text: str, limit: int) -> str:
+            if secret:
+                text = text.replace(secret, "[redacted]")
+            text = "".join(char if char.isprintable() else " " for char in text)
+            return " ".join(text.split())[:limit]
+
+        parts = []
+        body = clean(response.content.decode("utf-8", "replace"), 200)
+        if body:
+            parts.append(f"body: {body}")
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            parts.append(f"Retry-After: {clean(retry_after, 40)}")
+        return "; " + "; ".join(parts) if parts else ""
 
     @staticmethod
     def _log_upload_failure(method, path, status=None):
@@ -389,17 +416,45 @@ class HttpsPodTransport:
             raise PodTransportError(f"detached job launch failed (exit {result['exit_code']})")
         return {"id": job_id, "dir": directory}
 
+    def _detached_file(self, path: str) -> str | None:
+        """Text of one job-state file, or None when the agent cannot open it (HTTP 400).
+
+        Reads the JSON chunk envelope, not a Range GET: engine-enabled agents
+        refuse every Range request. State files are a few bytes, so one chunk
+        must hold the whole file; the envelope's total and SHA256 confirm it.
+        """
+        response = self._request("POST", "/download-chunk", json={"path": path, "offset": 0},
+                                 _absent=(400,))
+        if response.status_code == 400:
+            return None
+        try:
+            data = response.json()
+            chunk = base64.b64decode(data["data"], validate=True)
+            valid = (type(data["total"]) is int and data["total"] == len(chunk)
+                     and hashlib.sha256(chunk).hexdigest() == data["sha256"])
+        except (ValueError, KeyError, TypeError):
+            valid = False
+        if not valid:
+            raise PodTransportError("pod HTTPS job state read failed")
+        return chunk.decode(errors="replace")
+
     def detached_poll(self, job_id: str, *, root: str = DETACHED_ROOT) -> dict:
+        """Read a detached job's state without creating an agent job record.
+
+        Status is read before exit on purpose: the supervisor writes exit before
+        its final "exited" status, so an "exited" read is always followed by an
+        exit file. Same fields and precedence as the former shell read (exit wins).
+        """
         directory = _detached_directory(root, job_id)
-        script = (
-            f"d={shlex.quote(directory)}\n"
-            'if [ -f "$d/exit" ]; then state=exited; code=$(cat "$d/exit")\n'
-            'elif [ -f "$d/status" ]; then state=$(cat "$d/status"); code=\n'
-            "else state=missing; code=; fi\n"
-            'pid=$(cat "$d/pid" 2>/dev/null || true)\n'
-            'printf "state=%s\\nexit_code=%s\\npid=%s\\n" "$state" "$code" "$pid"\n'
-        )
-        return _detached_record(job_id, directory, self._detached_script(script, timeout=15))
+        status = self._detached_file(f"{directory}/status")
+        exit_text = self._detached_file(f"{directory}/exit")
+        pid = self._detached_file(f"{directory}/pid")
+        if exit_text is not None:
+            state, code = "exited", exit_text.rstrip("\n")
+        else:
+            state, code = (status.rstrip("\n") if status is not None else "missing"), ""
+        return _detached_record(job_id, directory,
+                                {"state": state, "exit_code": code, "pid": (pid or "").rstrip("\n")})
 
     def detached_cancel(self, job_id: str, *, root: str = DETACHED_ROOT) -> dict:
         """Signal the recorded process group; a finished job keeps its exit code."""
