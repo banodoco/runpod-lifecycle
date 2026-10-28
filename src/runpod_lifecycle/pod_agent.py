@@ -368,6 +368,65 @@ def save_state(path, state):
     os.replace(temporary, path)
 
 
+def _write_engine_bearer_file(state_dir, token):
+    """Project the original startup bearer; an attachment never owns this file."""
+    if (not isinstance(token, str) or not 32 <= len(token) < 256
+            or any(ord(c) <= 32 or ord(c) >= 127 for c in token)):
+        raise ValueError("invalid engine bearer")
+    path = Path(state_dir)
+    raw = str(state_dir)
+    if (not path.is_absolute() or str(path) != raw
+            or any(p in ("", ".", "..") for p in raw.split("/")[1:])):
+        raise ValueError("unsafe engine state directory")
+    directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        parts = path.parts[1:]
+        for part in parts:
+            try:
+                os.mkdir(part, 0o700, dir_fd=directory)
+            except FileExistsError:
+                pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            dir_fd=directory)
+            os.close(directory)
+            directory = child
+        info = os.fstat(directory)
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise ValueError("unsafe engine state directory")
+        flags = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        try:
+            fd = os.open("engine-bearer.token", os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags,
+                         0o600, dir_fd=directory)
+        except FileExistsError:
+            fd = os.open("engine-bearer.token", os.O_RDONLY | flags, dir_fd=directory)
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                        or info.st_size != len(token)
+                        or not hmac.compare_digest(os.read(fd, 256), token.encode("ascii"))):
+                    raise ValueError("engine bearer restart differs or is unsafe")
+            finally:
+                os.close(fd)
+        else:
+            try:
+                body = token.encode("ascii")
+                while body:
+                    written = os.write(fd, body)
+                    if written <= 0:
+                        raise OSError("short private write")
+                    body = body[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.fsync(directory)
+        return path / "engine-bearer.token"
+    except OSError:
+        raise ValueError("engine bearer file is unavailable or unsafe") from None
+    finally:
+        os.close(directory)
+
+
 class AgentServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -381,19 +440,23 @@ class AgentServer(ThreadingHTTPServer):
                                    else ObservationPolicy(observation_policy))
         self.jobs = {}
         self.lock = threading.RLock()
-        self._engine_state_dir = state_dir
+        self.state_dir = Path(state_dir or tempfile.mkdtemp(prefix="astrid-agent-"))
+        self._engine_state_dir = self.state_dir
+        if self.engine_proxy is not None:
+            _write_engine_bearer_file(self.state_dir, self.token)
         if self.observation_policy is not None:
             if self.engine_proxy is not None and self.engine_proxy.input_files:
                 self._enable_uploads()
             # No upload journal recovery or other control-state IO in this mode.
             super().__init__(address, Handler)
             return
-        self.state_dir = Path(state_dir or tempfile.mkdtemp(prefix="astrid-agent-"))
         self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.state_dir.chmod(0o700)
         # Incomplete chunks are committed by offset; restart SHA verification
         # if the agent exited while hashing, before any target promotion.
         for meta in self.state_dir.glob("*.json"):
+            if meta.name == "engine-readiness.json":
+                continue
             state = json.loads(meta.read_text())
             if state.get("verifying"):
                 if not Path(state["staging"]).exists():
@@ -423,6 +486,7 @@ class AgentServer(ThreadingHTTPServer):
                 raise ValueError("the engine slot is already bound")
             if current is None and self.observation_policy is not None and selected.input_files:
                 self._enable_uploads()
+            _write_engine_bearer_file(self._engine_state_dir, self.token)
             self.engine_proxy = selected
 
     @contextmanager

@@ -412,7 +412,22 @@ def read_token_file(path: str | Path) -> str:
     """Load a local bearer without following symlinks or accepting shared files."""
     import os
     import stat
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    raw = str(path)
+    selected = Path(raw)
+    if (not selected.is_absolute() or str(selected) != raw
+            or any(p in ("", ".", "..") for p in raw.split("/")[1:])):
+        raise ValueError("pod token file path is unsafe")
+    directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for part in selected.parts[1:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            dir_fd=directory)
+            os.close(directory)
+            directory = child
+        fd = os.open(selected.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                     dir_fd=directory)
+    finally:
+        os.close(directory)
     try:
         info = os.fstat(fd)
         if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
