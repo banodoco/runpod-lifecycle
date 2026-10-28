@@ -34,7 +34,8 @@ class PodTransportError(RuntimeError):
     """Deliberately contains no request bodies, headers or token material."""
 
 
-def agent_bootstrap(token: str, port: int = PORT, *, observation_policy=None, engine_proxy=None) -> dict:
+def agent_bootstrap(token: str, port: int = PORT, *, observation_policy=None, engine_proxy=None,
+                    state_dir=None) -> dict:
     """Create SDK/REST-independent boot material. The token is only in env.
 
     Inlining the compressed single-file agent avoids mutable download URLs and
@@ -55,6 +56,12 @@ def agent_bootstrap(token: str, port: int = PORT, *, observation_policy=None, en
     output_roots grants JSON-chunk reads beneath configured directories.
     Both are installed-session startup configuration, never request inputs.
     Omitting the slot stays observation-only. Engine calls are HTTP-only.
+
+    state_dir selects the agent's private ASTRID_POD_STATE directory (absolute,
+    canonical, mode 0700 on the pod); it is accepted only with engine_proxy so
+    the original bearer and engine-readiness.json share one private parent.
+    With it the engine selection is sent base64-encoded (ASTRID_POD_ENGINE_B64),
+    so every env value is plain safe text for the SDK's GraphQL interpolation.
     """
     import zlib
     if len(token) < 32 or not token.isascii():
@@ -62,6 +69,11 @@ def agent_bootstrap(token: str, port: int = PORT, *, observation_policy=None, en
     policy = (None if observation_policy is None
               else pod_agent.ObservationPolicy(observation_policy))
     engine = None if engine_proxy is None else pod_agent.EngineProxy(**engine_proxy)
+    if state_dir is not None:
+        from .engine_startup import _state_path
+        if engine is None:
+            raise ValueError("a state directory selection requires an engine proxy slot")
+        state_dir = _state_path(state_dir, None)
     source = Path(pod_agent.__file__).read_bytes()
     payload = base64.b64encode(zlib.compress(source, 9)).decode()
     loader = ("import os,base64,zlib; "
@@ -70,8 +82,17 @@ def agent_bootstrap(token: str, port: int = PORT, *, observation_policy=None, en
     command = "python3 -u -c " + shlex.quote(loader)
     environment = {TOKEN_ENV: token, "ASTRID_POD_AGENT_B64": payload, "ASTRID_POD_PORT": str(port)}
     if engine is not None:
-        environment[pod_agent.ENGINE_ENV] = json.dumps(
-            engine.configuration(), separators=(",", ":"))
+        encoded = json.dumps(engine.configuration(), separators=(",", ":"))
+        if state_dir is None:
+            environment[pod_agent.ENGINE_ENV] = encoded
+        else:
+            encoded_b64 = base64.b64encode(encoded.encode()).decode()
+            # The agent refuses a larger value after the pod is paid for:
+            # refuse it here, before any create call.
+            if len(encoded_b64) > pod_agent.ENGINE_B64_LIMIT:
+                raise ValueError("engine startup selection is too large")
+            environment[pod_agent.ENGINE_B64_ENV] = encoded_b64
+            environment["ASTRID_POD_STATE"] = state_dir
     if policy is not None:
         environment[pod_agent.OBSERVATION_ENV] = policy.encoded
     return {"env": environment,

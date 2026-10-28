@@ -32,6 +32,11 @@ OBSERVATION_ENV = "ASTRID_POD_OBSERVATION_B64"
 OBSERVATION_LIMIT = 16384  # ASCII bytes of the complete base64 env value.
 OBSERVATION_SCHEMA = "astrid.pod-observation.v1"
 ENGINE_ENV = "ASTRID_POD_ENGINE"
+# Startup selection with a private state directory travels as base64 JSON so
+# provider env serialization (the SDK interpolates values into GraphQL
+# strings) never sees quotes, backslashes or path text.
+ENGINE_B64_ENV = "ASTRID_POD_ENGINE_B64"
+ENGINE_B64_LIMIT = 16384
 ENGINE_BODY_LIMIT = 1024 * 1024 * 1024
 ENGINE_TRANSFER_SECONDS = 15
 
@@ -891,8 +896,15 @@ def main():
         policy = {"schema": OBSERVATION_SCHEMA, "roots": list(validated.roots),
                   "files": list(validated.files)}
     engine_options = {}
+    encoded_engine = os.environ.pop(ENGINE_B64_ENV, None)
     if ENGINE_ENV in os.environ:
+        if encoded_engine is not None:
+            raise ValueError("conflicting engine startup selections")
         engine_options["engine_proxy"] = json.loads(os.environ.pop(ENGINE_ENV))
+    elif encoded_engine is not None:
+        if len(encoded_engine) > ENGINE_B64_LIMIT:
+            raise ValueError("engine startup selection is too large")
+        engine_options["engine_proxy"] = json.loads(base64.b64decode(encoded_engine, validate=True))
     server = AgentServer(("0.0.0.0", int(os.environ.get("ASTRID_POD_PORT", "8000"))), token,
                          os.environ.get("ASTRID_POD_STATE", "/tmp/astrid-pod-agent"),
                          observation_policy=policy, **engine_options)

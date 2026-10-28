@@ -170,6 +170,7 @@ async def _try_launch_one_gpu(
                     ports=config.ports,
                     **({"transport": config.transport, "https_token": config.https_token}
                        if config.transport == "https" else {}),
+                    **({"engine_startup": config.engine_startup} if config.engine_startup is not None else {}),
                     allowed_cuda_versions=config.allowed_cuda_versions or None,
                     **({"min_cuda_version": config.min_cuda_version} if config.min_cuda_version else {}),
                 )
@@ -201,6 +202,8 @@ async def _try_launch_one_gpu(
             pod._gpu_type = gpu_type
             pod._allowed_cuda_versions = config.allowed_cuda_versions
             pod._storage_name = storage_name
+            pod.claim_id = pod_details.get("claim_id")
+            pod._engine_state_dir = pod_details.get("state_dir")
             try:
                 await _emit_state(
                     hooks,

@@ -214,6 +214,50 @@ disk-backed and returned in at most 256 KiB per stream per poll. This small agen
 retains at most 128 job records per claim; rotate/release long-lived claims before
 that bound. It has no multi-user isolation, file quota, or log quota.
 
+## Engine startup selection (trusted, optional)
+
+The original claim can fix the one engine slot and the agent's private state
+directory at pod creation. Nothing is configurable over HTTP and the default
+(no selection) is unchanged. Provide a local file (owned, not group/other
+writable, at most 16 KiB, strict JSON without duplicate keys) with
+`launch --engine-startup /abs/engine-startup.json`, or export
+`RUNPOD_ENGINE_STARTUP_FILE=/abs/engine-startup.json` so an unmodified claim
+script (which builds `RunPodConfig.from_env`) picks it up. It requires
+`RUNPOD_TRANSPORT=https` and contains no bearer, provider key or controller key:
+
+```json
+{"schema": "astrid.engine-startup.v1",
+ "engine_proxy": {"endpoint_id": "vibecomfy-h3", "port": 8188,
+                  "input_files": ["/workspace/ComfyUI/input/<approved-basename>"],
+                  "output_roots": ["/workspace/ComfyUI/output"]},
+ "state_dir": "/workspace/astrid/agent-state"}
+```
+
+* Only `vibecomfy-h3` on loopback port 8188 is accepted; the public port list
+  stays exactly `8000/http`, and no template override is allowed.
+* `input_files` are exact absolute destinations (no globs or directories) and
+  `output_roots` the selected output root(s), both non-empty and fixed here; the
+  agent cannot expand them later. The caller derives the input list from the
+  basenames of the approved asset archive/manifest it will install (one
+  destination per approved asset basename under the engine input directory),
+  never from request data.
+* `state_dir` must be strictly beneath the volume mount path, use only
+  `[A-Za-z0-9._/-]`, and must not contain or lie inside any input or output
+  path. The agent creates it 0700 and writes the original claim bearer to
+  `<state_dir>/engine-bearer.token` (0600) before serving; the later readiness
+  producer writes `<state_dir>/engine-readiness.json` into the same directory.
+  Health is served before any engine exists and asserts no engine readiness.
+* The engine selection travels as base64 JSON (`ASTRID_POD_ENGINE_B64`) with a
+  plain-text `ASTRID_POD_STATE`, because the provider SDK interpolates env values
+  into GraphQL strings unescaped.
+
+Intended handoff: normal-mode claim (this selection) -> existing remote install
+CLI over the same bearer with `root`/`state`/`input`/`output` paths from the
+selection -> target readiness producer writing `engine-readiness.json` into
+`state_dir` -> finalizer reading `engine-bearer.token` and the profile from
+`state_dir`. Those stages own their own behavior; this package only fixes the
+startup slot and private state.
+
 ## Security and rollout status
 
 Knowing a pod URL alone permits no command, file or health access. A stolen

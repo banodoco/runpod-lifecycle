@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 import time
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,9 @@ class Pod:
         self._ram_tier = ram_tier
         self._storage_volume = storage_volume
         self._ssh_details: dict[str, Any] | None = None
+        # Per-claim private agent state (engine startup only); see terminate().
+        self.claim_id: str | None = None
+        self._engine_state_dir: str | None = None
         self._last_exec_at: float | None = None
         self._created_at = time.monotonic()
 
@@ -149,7 +153,25 @@ class Pod:
             logger.warning("Could not determine GPU utilization for pod %s: %s", self.id, exc)
             return False
 
+    async def _remove_engine_bearer(self) -> None:
+        """Best effort: never leave the engine bearer on the persistent volume.
+
+        The pod is still terminated if this fails; the file then sits in a
+        claim-unique directory that no later claim will reuse.
+        """
+        if not self._engine_state_dir or self.config.transport != "https":
+            return
+        command = "rm -f -- " + shlex.quote(f"{self._engine_state_dir}/engine-bearer.token")
+        client = self.https_transport()
+        try:
+            await asyncio.wait_for(asyncio.to_thread(client.execute_command, command, 20), 30)
+        except Exception as exc:
+            logger.warning("Could not remove the engine bearer of pod %s: %s", self.id, type(exc).__name__)
+        finally:
+            client.disconnect()
+
     async def terminate(self) -> None:
+        await self._remove_engine_bearer()
         try:
             await asyncio.to_thread(api.terminate_pod, self.id, self.config.api_key)
         except CleanupPendingError as exc:

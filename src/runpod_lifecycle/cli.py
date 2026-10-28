@@ -180,6 +180,11 @@ def _resolve_config(args: argparse.Namespace) -> RunPodConfig:
             raise ValueError("--allowed-cuda-versions must contain at least one version")
         overrides["allowed_cuda_versions"] = parsed_cuda_versions
 
+    engine_startup_arg = getattr(args, "engine_startup", None)
+    if engine_startup_arg is not None:
+        from .engine_startup import load_engine_startup
+        overrides["engine_startup"] = load_engine_startup(engine_startup_arg)
+
     config = RunPodConfig.from_env(**overrides)
     if config.transport == "https":
         if not os.environ.get("RUNPOD_HTTPS_TOKEN_FILE") and not os.environ.get("RUNPOD_HTTPS_TOKEN"):
@@ -416,6 +421,7 @@ async def _cmd_launch(args: argparse.Namespace) -> int:
             "gpu_type_candidates": list(config.gpu_type_candidates),
             "storage_candidates": _unique_values([config.storage_name, *config.storage_volumes]),
             "terminated": False,
+            **_claim_record(pod),
         }
         try:
             await pod.terminate()
@@ -435,7 +441,7 @@ async def _cmd_launch(args: argparse.Namespace) -> int:
     else:
         ssh_details = await pod._ensure_ssh_details()
         route = {"ssh": f"root@{ssh_details['ip']} -p {ssh_details['port']}"}
-    info = {"pod_id": pod.id, "name": pod.name, "gpu_type": config.gpu_type, **route}
+    info = {"pod_id": pod.id, "name": pod.name, "gpu_type": config.gpu_type, **route, **_claim_record(pod)}
     print(json.dumps(info, indent=2))
 
     if not getattr(args, "detach", False):
@@ -448,6 +454,12 @@ async def _cmd_launch(args: argparse.Namespace) -> int:
             await pod.terminate()
             print(f"terminated {pod.id}")
     return 0
+
+
+def _claim_record(pod: Pod) -> dict[str, str]:
+    """Per-claim private state, for the claim handle (engine startup only)."""
+    state = getattr(pod, "_engine_state_dir", None)
+    return {"claim_id": pod.claim_id, "state_dir": state} if state and pod.claim_id else {}
 
 
 async def _cmd_exec(args: argparse.Namespace) -> int:
@@ -2177,6 +2189,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated network volume names to try after --storage-name. "
             "Defaults to RUNPOD_STORAGE_VOLUMES."
+        ),
+    )
+    p_launch.add_argument(
+        "--engine-startup",
+        metavar="FILE",
+        help=(
+            "Absolute path of a local astrid.engine-startup.v1 JSON file selecting the one trusted "
+            "vibecomfy-h3 engine slot and private agent state directory (HTTPS transport only)."
         ),
     )
     p_launch.add_argument("--timeout", type=int, default=600, help="Seconds to wait for pod readiness.")

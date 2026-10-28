@@ -201,21 +201,55 @@ def create_pod(
     instance_id: str | None = None,
     transport: str = "ssh",
     https_token: str | None = None,
+    engine_startup: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create a RunPod pod and return provision metadata immediately."""
+    """Create a RunPod pod and return provision metadata immediately.
+
+    engine_startup is the trusted ``astrid.engine-startup.v1`` selection
+    (see ``engine_startup``). It is validated, and must be paired with the
+    HTTPS transport, before any provider call; the only public port stays
+    the agent's.
+    """
     from .preflight import preflight_transport
     preflight_transport(transport)
     boot = None
+    claim = {}
+    if engine_startup is not None and transport != "https":
+        raise ValueError("engine startup requires the HTTPS transport")
+    if engine_startup is not None:
+        # The SDK interpolates these into GraphQL strings: refuse anything but
+        # plain text before any provider call (same check as the env values).
+        from .engine_startup import require_plain_text, require_safe_public_key
+        for field, value in (("name", name), ("image_name", image_name), ("gpu_type_id", gpu_type_id),
+                             ("network_volume_id", network_volume_id), ("data_center_id", data_center_id)):
+            require_plain_text(field, value)
+        require_safe_public_key(public_key_string)
     if transport == "https":
         from .https import agent_bootstrap
-        boot = agent_bootstrap(https_token or "")
+        engine_options = {}
+        if engine_startup is not None:
+            from .engine_startup import claim_state_dir, normalize_engine_startup
+            selected = normalize_engine_startup(engine_startup, volume_mount_path=volume_mount_path)
+            # Each claim gets its own private state directory: a repeat claim
+            # on the same volume must never meet an earlier engine bearer.
+            claim = claim_state_dir(selected["state_dir"])
+            engine_options = {"engine_proxy": selected["engine_proxy"], "state_dir": claim["state_dir"]}
+        boot = agent_bootstrap(https_token or "", **engine_options)
         if template_id:
             raise ValueError("HTTPS requires an explicit image without a template override")
         ports = boot["ports"]
     pod_env = dict(env_vars or {})
     if boot:
         pod_env.update(boot["env"])
-    if public_key_string:
+    if engine_startup is not None:
+        # Keep the agent's port the sole public one and every env value plain.
+        if ports != "8000/http" or any(
+                not re.fullmatch(r"[A-Za-z0-9_]+", str(k)) or not re.fullmatch(r"[A-Za-z0-9+/=_.:@-]*", str(v))
+                for k, v in pod_env.items()):
+            raise ValueError("engine startup requires plain-text env values and the single agent port")
+    # The engine path is HTTPS-only: PUBLIC_KEY (SSH access) is never sent
+    # there, so it cannot bypass the plain-text check above.
+    if public_key_string and engine_startup is None:
         pod_env["PUBLIC_KEY"] = public_key_string
     if compute_type == "CPU" and cpu_api == "sdk":
         sdk = _get_runpod()
@@ -243,7 +277,7 @@ def create_pod(
             raise error(200 if isinstance(exc, QueryError) else 401, message[:1000]) from None
         if not isinstance(pod, dict) or not pod.get("id"):
             raise RuntimeError("CPU SDK create returned no pod ID; reconcile allocation")
-        return {"id": pod["id"], "name": name, "created": True, "compute_type": "CPU"}
+        return {"id": pod["id"], "name": name, "created": True, "compute_type": "CPU", **claim}
     if compute_type == "CPU":
         if cpu_flavor_priority not in {"availability", "custom"}:
             raise ValueError("CPU flavor priority must be availability or custom")
@@ -288,7 +322,7 @@ def create_pod(
         pod = response.json()
         if not isinstance(pod, dict) or not pod.get("id"):
             raise RuntimeError("CPU create response has no pod ID; reconcile allocation")
-        return {"id": pod["id"], "name": name, "created": True, "compute_type": "CPU"}
+        return {"id": pod["id"], "name": name, "created": True, "compute_type": "CPU", **claim}
     if compute_type != "GPU":
         raise ValueError("compute_type must be CPU or GPU")
     sdk = _get_runpod()
@@ -376,6 +410,7 @@ def create_pod(
         "name": name,
         "gpu_type_id": gpu_type_id,
         "created": True,
+        **claim,
         **({"allowed_cuda_versions": list(normalized_cuda_versions)} if normalized_cuda_versions else {}),
         **({"min_cuda_version": min_cuda_version} if min_cuda_version else {}),
     }
