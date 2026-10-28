@@ -34,7 +34,7 @@ class PodTransportError(RuntimeError):
     """Deliberately contains no request bodies, headers or token material."""
 
 
-def agent_bootstrap(token: str, port: int = PORT, *, observation_policy=None) -> dict:
+def agent_bootstrap(token: str, port: int = PORT, *, observation_policy=None, engine_proxy=None) -> dict:
     """Create SDK/REST-independent boot material. The token is only in env.
 
     Inlining the compressed single-file agent avoids mutable download URLs and
@@ -45,12 +45,23 @@ def agent_bootstrap(token: str, port: int = PORT, *, observation_policy=None) ->
     It restricts the agent to authenticated health/downloads. Its base64 JSON
     env value is capped at 16384 ASCII bytes and consumed at agent startup.
     None preserves the general command/file agent.
+
+    engine_proxy is a trusted-startup {endpoint_id, port} slot, enabled only
+    after the original installation/session readiness handoff. Its upstream
+    is always 127.0.0.1; the provider exposes only this agent's port. It cannot
+    be configured by an HTTP call. With an observation policy it preserves
+    curated reads and denies ordinary commands. Optional input_files grants
+    only exact absolute destinations to the existing chunk upload; optional
+    output_roots grants JSON-chunk reads beneath configured directories.
+    Both are installed-session startup configuration, never request inputs.
+    Omitting the slot stays observation-only. Engine calls are HTTP-only.
     """
     import zlib
     if len(token) < 32 or not token.isascii():
         raise ValueError("claim token must have at least 32 ASCII characters")
     policy = (None if observation_policy is None
               else pod_agent.ObservationPolicy(observation_policy))
+    engine = None if engine_proxy is None else pod_agent.EngineProxy(**engine_proxy)
     source = Path(pod_agent.__file__).read_bytes()
     payload = base64.b64encode(zlib.compress(source, 9)).decode()
     loader = ("import os,base64,zlib; "
@@ -58,6 +69,9 @@ def agent_bootstrap(token: str, port: int = PORT, *, observation_policy=None) ->
               "'<astrid-pod-agent>','exec'))")
     command = "python3 -u -c " + shlex.quote(loader)
     environment = {TOKEN_ENV: token, "ASTRID_POD_AGENT_B64": payload, "ASTRID_POD_PORT": str(port)}
+    if engine is not None:
+        environment[pod_agent.ENGINE_ENV] = json.dumps(
+            engine.configuration(), separators=(",", ":"))
     if policy is not None:
         environment[pod_agent.OBSERVATION_ENV] = policy.encoded
     return {"env": environment,
@@ -69,6 +83,14 @@ def pod_url(pod_id: str, port: int = PORT) -> str:
     if not re.fullmatch(r"[a-z0-9]+", pod_id) or not 1 <= port <= 65535:
         raise ValueError("invalid pod ID or port")
     return f"https://{pod_id}-{port}.proxy.runpod.net"
+
+
+def _is_loopback(url: str) -> bool:
+    host = urlsplit(url).hostname or ""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
 
 
 def _transport_url(pod_id: str, port: int, override: str | None) -> str:
@@ -102,14 +124,35 @@ class HttpsPodTransport:
 
     def __init__(self, pod_id: str, token: str, *, port: int = PORT, base_url: str | None = None,
                  request_timeout: float = 20, poll_interval: float = 0.5,
-                 route_grace: float = ROUTE_GRACE_SECONDS):
+                 route_grace: float = ROUTE_GRACE_SECONDS, deadline: float | None = None):
         url = _transport_url(pod_id, port, base_url)
         if len(token) < 32 or not token.isascii():
             raise ValueError("missing random pod token")
         self.poll_interval = poll_interval
         self.route_grace = route_grace
+        # Optional absolute local time.monotonic() caller deadline. It bounds
+        # every actual request wait and every retry/route-grace sleep.
+        self.deadline = deadline
+        self.request_timeout = min(request_timeout, 30)
+        # The exact pod origin keeps the supported controller egress
+        # (environment proxy/CA configuration), as in the live-qualified
+        # transport. Only a loopback base (a route-local gateway or test agent,
+        # already restricted by _transport_url) must never leave the host.
         self.http = httpx.Client(base_url=url, headers={"Authorization": "Bearer " + token},
-                                 timeout=min(request_timeout, 30), follow_redirects=False)
+                                 timeout=self.request_timeout, follow_redirects=False,
+                                 trust_env=not _is_loopback(url))
+
+    def _remaining(self):
+        if self.deadline is None:
+            return None
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise PodTransportError("pod HTTPS caller deadline exceeded")
+        return remaining
+
+    def _pause(self, seconds):
+        remaining = self._remaining()
+        time.sleep(seconds if remaining is None else min(seconds, remaining))
 
     @staticmethod
     def route_unavailable(response) -> bool:
@@ -123,12 +166,15 @@ class HttpsPodTransport:
         route_deadline = None
         attempt = 0
         while True:
+            remaining = self._remaining()
+            if remaining is not None:
+                kwargs["timeout"] = min(self.request_timeout, remaining)
             try:
                 response = self.http.request(method, path, **kwargs)
             except httpx.RequestError:
                 if attempt < 2:
                     attempt += 1
-                    time.sleep(self.poll_interval)
+                    self._pause(self.poll_interval)
                     continue
                 message = "pod HTTPS request failed"
                 if _download is not None:
@@ -143,11 +189,11 @@ class HttpsPodTransport:
                     route_deadline = now + grace
                     logger.warning("pod HTTPS route unavailable (HTTP 404 without agent body); retrying")
                 if now < route_deadline:
-                    time.sleep(min(max(self.poll_interval, 0.05), max(0, route_deadline - now)))
+                    self._pause(min(max(self.poll_interval, 0.05), max(0, route_deadline - now)))
                     continue
             elif response.status_code in {502, 503, 504} and attempt < 2:
                 attempt += 1
-                time.sleep(self.poll_interval)
+                self._pause(self.poll_interval)
                 continue
             if not response.is_success:
                 self._log_upload_failure(method, path, response.status_code)
@@ -281,7 +327,7 @@ class HttpsPodTransport:
             while not state["complete"]:
                 if time.monotonic() >= deadline:
                     raise PodTransportError("upload verification timed out; resume the same file")
-                time.sleep(self.poll_interval)
+                self._pause(self.poll_interval)
                 state = self._request("GET", "/uploads/" + upload_id).json()
                 if state.get("error"):
                     raise PodTransportError("upload verification failed")

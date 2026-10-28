@@ -194,6 +194,14 @@ The agent never sends an empty 404; its 404s are JSON (`unknown job`,
   error `pod HTTPS request rejected (HTTP 404)` is raised as before.
 - `runpod-lifecycle transport-smoke` writes these fixed-label warnings (and the
   upload stage warnings) to stderr; provider SDK calls remain muted.
+- An optional absolute `deadline` (local `time.monotonic()`) bounds every
+  request wait and every retry/route-grace sleep; past it the transport raises
+  `pod HTTPS caller deadline exceeded`.
+- The engine relay preserves the signature: an empty-bodied engine 404 is
+  replied as the agent's JSON 404, so only the provider can produce an empty one.
+- The exact pod origin keeps the normal controller egress (environment proxy and
+  CA settings). A loopback `base_url` (route-local gateway, tests) ignores proxy
+  environment variables.
 
 Range requests are not used by default: on the live proxy a `Range` request
 header did not reach the agent intact (agent answered 400 "bounded byte Range

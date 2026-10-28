@@ -7,11 +7,14 @@ may restrict it to health and curated read-only files with ObservationPolicy.
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
+import socket
 import signal
 import stat
 import subprocess
@@ -28,6 +31,213 @@ ID = re.compile(r"[a-f0-9]{32,64}\Z")
 OBSERVATION_ENV = "ASTRID_POD_OBSERVATION_B64"
 OBSERVATION_LIMIT = 16384  # ASCII bytes of the complete base64 env value.
 OBSERVATION_SCHEMA = "astrid.pod-observation.v1"
+ENGINE_ENV = "ASTRID_POD_ENGINE"
+ENGINE_BODY_LIMIT = 1024 * 1024 * 1024
+ENGINE_TRANSFER_SECONDS = 15
+
+
+class EngineProxy:
+    """One trusted startup slot. The upstream host is deliberately not an input."""
+
+    def __init__(self, endpoint_id, port, *, input_files=(), output_roots=()):
+        if (not isinstance(endpoint_id, str) or not re.fullmatch(r"[a-z][a-z0-9-]*", endpoint_id)
+                or type(port) is not int or not 1 <= port <= 65535):
+            raise ValueError("invalid engine proxy slot")
+        self.endpoint_id, self.port = endpoint_id, port
+        self.prefix = "/engines/" + endpoint_id
+        if (not isinstance(input_files, (list, tuple)) or len(input_files) > 32
+                or not isinstance(output_roots, (list, tuple)) or len(output_roots) > 8):
+            raise ValueError("invalid engine transfer configuration")
+        for path in (*input_files, *output_roots):
+            observation_path(path)
+        if len(set(input_files)) != len(input_files) or len(set(output_roots)) != len(output_roots):
+            raise ValueError("duplicate engine transfer path")
+        self.input_files = tuple(input_files)
+        self.output_roots = tuple(output_roots)
+        self.output_policy = (ObservationPolicy({"schema": OBSERVATION_SCHEMA,
+                              "roots": list(output_roots), "files": []}) if output_roots else None)
+
+    def configuration(self):
+        data = {"endpoint_id": self.endpoint_id, "port": self.port}
+        if self.input_files:
+            data["input_files"] = list(self.input_files)
+        if self.output_roots:
+            data["output_roots"] = list(self.output_roots)
+        return data
+
+    @contextmanager
+    def input_parent(self, path):
+        # Exact destinations only, from trusted startup. Open all ancestors
+        # without symlinks and keep the final directory fd through the IO.
+        if path not in self.input_files:
+            raise ObservationDenied()
+        directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            for part in path.split("/")[1:-1]:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                dir_fd=directory)
+                os.close(directory)
+                directory = child
+            info = os.fstat(directory)
+            if info.st_uid != os.getuid() or info.st_mode & 0o022:
+                raise ObservationDenied()
+            name = path.rsplit("/", 1)[-1]
+            try:
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid():
+                    raise ObservationDenied()
+            yield directory
+        finally:
+            os.close(directory)
+
+
+def engine_operation(method, target):
+    """Closed ComfyUI surface, also used by the single-slot client adapter."""
+    if (not isinstance(target, str) or not target.startswith("/")
+            or any(ord(c) <= 32 or ord(c) >= 127 for c in target)
+            or any(c in target for c in "\\#") or len(target) > 16384):
+        return False
+    parsed = urlsplit(target)
+    if parsed.scheme or parsed.netloc or "%" in parsed.path:
+        return False
+    path = parsed.path
+    if path.startswith("/api/"):
+        path = path[4:]
+    if method == "GET":
+        return (path in {"/object_info", "/system_stats", "/queue", "/history"}
+                or re.fullmatch(r"/(?:history|object_info)/[A-Za-z0-9_-]+", path) is not None)
+    return method == "POST" and path in {
+        "/prompt", "/queue", "/interrupt", "/free"}
+
+
+def relay_engine(handler, connection, target, *, bearer=None, timeout=None):
+    """One short HTTP exchange, no redirects, upgrades, ranges or retries.
+
+    A lost prompt reply is acceptance-unknown. The timer bounds the entire
+    outbound exchange, including connect/headers and slow streamed bodies.
+    """
+    handler.close_connection = True
+    started = time.monotonic()
+    budget = min(ENGINE_TRANSFER_SECONDS, timeout if timeout is not None else ENGINE_TRANSFER_SECONDS)
+    if budget <= 0:
+        connection.close()
+        return handler.reply(504, {"error": "engine deadline exceeded"})
+    deadline = started + budget
+    connection.timeout = budget
+    def expire():
+        sock = connection.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+    timer = threading.Timer(budget, expire)
+    timer.daemon = True
+    timer.start()
+    headers = {}
+    response = None
+    sent = False
+    try:
+        if (handler.headers.get("Upgrade") is not None or handler.headers.get("Range") is not None
+                or "upgrade" in {v.strip().lower() for v in handler.headers.get("Connection", "").split(",")}):
+            return handler.reply(403, {"error": "HTTP-only engine surface"})
+        if (handler.headers.get("Transfer-Encoding")
+                or len(handler.headers.get_all("Content-Length", [])) > 1):
+            raise ValueError("explicit request framing required")
+        length = int(handler.headers.get("Content-Length", "0"))
+        if not 0 <= length <= ENGINE_BODY_LIMIT:
+            raise ValueError("engine body exceeds limit")
+        headers["Connection"] = "close"
+        # Deliberate allowlist: no client Authorization, Cookie, Host, proxy
+        # headers, forwarding destination or hop-by-hop headers reach ComfyUI.
+        for name in ("Content-Type", "Accept"):
+            if name in handler.headers:
+                headers[name] = handler.headers[name]
+        if bearer is not None:
+            headers["Authorization"] = "Bearer " + bearer
+        if length or handler.command == "POST":
+            headers["Content-Length"] = str(length)
+        connection.putrequest(handler.command, target, skip_accept_encoding=True)
+        for name, value in headers.items():
+            connection.putheader(name, value)
+        connection.endheaders()
+        remaining = length
+        while remaining:
+            budget = min(ENGINE_TRANSFER_SECONDS, deadline - time.monotonic())
+            if budget <= 0:
+                raise TimeoutError()
+            handler.connection.settimeout(budget)
+            connection.sock.settimeout(budget)
+            block = handler.rfile.read(min(CHUNK, remaining))
+            if not block:
+                raise ValueError("short engine upload")
+            connection.send(block)
+            remaining -= len(block)
+        connection.sock.settimeout(min(ENGINE_TRANSFER_SECONDS, max(0.001, deadline - time.monotonic())))
+        upstream_socket = connection.sock
+        response = connection.getresponse()
+        if 300 <= response.status < 400:
+            return handler.reply(502, {"error": "engine redirect refused"})
+        if response.status == 101:
+            return handler.reply(502, {"error": "unexpected engine upgrade"})
+        declared = response.getheader("Content-Length")
+        size = None if declared is None else int(declared)
+        if size is not None and not 0 <= size <= ENGINE_BODY_LIMIT:
+            raise ValueError("engine response exceeds limit")
+        first = b""
+        if response.status == 404 and size != 0:
+            upstream_socket.settimeout(min(ENGINE_TRANSFER_SECONDS, max(0.001, deadline - time.monotonic())))
+            first = response.read1(min(CHUNK, ENGINE_BODY_LIMIT))
+        if response.status == 404 and not first:
+            # An empty-bodied 404 is the provider's no-route signature, which
+            # clients may retry unchanged. This agent never emits one, so an
+            # empty engine 404 becomes a final JSON 404 here.
+            return handler.reply(404, {"error": "engine resource not found"})
+        sent = True
+        handler.send_response(response.status)
+        handler.send_header("Connection", "close")
+        handler.send_header("Cache-Control", "no-store")
+        for name in ("Content-Type", "Content-Range", "ETag"):
+            value = response.getheader(name)
+            if value is not None:
+                handler.send_header(name, value)
+        if size is not None:
+            handler.send_header("Content-Length", str(size))
+        handler.end_headers()
+        total = len(first)
+        if first:
+            handler.wfile.write(first)
+        while not response.isclosed():
+            budget = min(ENGINE_TRANSFER_SECONDS, deadline - time.monotonic())
+            if budget <= 0:
+                raise TimeoutError()
+            upstream_socket.settimeout(budget)
+            handler.connection.settimeout(budget)
+            block = response.read1(min(CHUNK, ENGINE_BODY_LIMIT - total + 1))
+            if not block:
+                if size is not None and total != size:
+                    raise OSError("short engine response")
+                break
+            total += len(block)
+            if total > ENGINE_BODY_LIMIT:
+                raise ValueError("engine response exceeds limit")
+            handler.wfile.write(block)
+        if size is not None and total != size:
+            raise OSError("short engine response")
+    except (OSError, http.client.HTTPException):
+        if not sent:
+            handler.reply(502, {"error": "engine transport unavailable"})
+    except (ValueError, TypeError):
+        if not sent:
+            handler.reply(400 if response is None else 502, {"error": "invalid engine exchange"})
+    finally:
+        if response is not None:
+            response.close()
+        timer.cancel()
+        connection.close()
 
 
 class ObservationDenied(ValueError):
@@ -161,15 +371,20 @@ def save_state(path, state):
 class AgentServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, token, state_dir=None, *, observation_policy=None):
+    def __init__(self, address, token, state_dir=None, *, observation_policy=None, engine_proxy=None):
         if len(token) < 32 or not token.isascii():
             raise ValueError("a random token of at least 32 ASCII characters is required")
         self.token = token
+        # This configuration comes only from trusted startup, never a route.
+        self.engine_proxy = None if engine_proxy is None else EngineProxy(**engine_proxy)
         self.observation_policy = (None if observation_policy is None
                                    else ObservationPolicy(observation_policy))
         self.jobs = {}
         self.lock = threading.RLock()
+        self._engine_state_dir = state_dir
         if self.observation_policy is not None:
+            if self.engine_proxy is not None and self.engine_proxy.input_files:
+                self._enable_uploads()
             # No upload journal recovery or other control-state IO in this mode.
             super().__init__(address, Handler)
             return
@@ -187,6 +402,51 @@ class AgentServer(ThreadingHTTPServer):
                 state["verifying"] = False
                 save_state(meta, state)
         super().__init__(address, Handler)
+
+    def _enable_uploads(self):
+        self.state_dir = Path(self._engine_state_dir or tempfile.mkdtemp(prefix="astrid-engine-"))
+        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = self.state_dir.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError("engine upload state must be a private owned directory")
+
+    def enable_engine(self, endpoint_id, port, *, input_files=(), output_roots=()):
+        """Trusted installed-session handoff. No HTTP configuration endpoint.
+
+        Observation reads stay curated; only exact configured input writes and
+        output reads are added. Job/command authority is never granted.
+        """
+        selected = EngineProxy(endpoint_id, port, input_files=input_files, output_roots=output_roots)
+        with self.lock:
+            current = self.engine_proxy
+            if current is not None and current.configuration() != selected.configuration():
+                raise ValueError("the engine slot is already bound")
+            if current is None and self.observation_policy is not None and selected.input_files:
+                self._enable_uploads()
+            self.engine_proxy = selected
+
+    @contextmanager
+    def upload_stream(self, state, mode):
+        if self.observation_policy is None:
+            with open(state["staging"], mode) as stream:
+                yield stream
+            return
+        slot = self.engine_proxy
+        if slot is None or state.get("reserved"):
+            raise ObservationDenied()
+        with slot.input_parent(state["path"]) as directory:
+            staging = Path(state["staging"])
+            if (str(staging.parent) != str(Path(state["path"]).parent)
+                    or not re.fullmatch(r"\.astrid-upload-[a-f0-9]{32}", staging.name)):
+                raise ObservationDenied()
+            fd = os.open(staging.name, (os.O_RDWR if mode == "r+b" else os.O_RDONLY)
+                         | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid():
+                os.close(fd)
+                raise ObservationDenied()
+            with os.fdopen(fd, mode) as stream:
+                yield stream
 
     def cancel(self, job):
         process = job["process"]
@@ -207,8 +467,12 @@ class AgentServer(ThreadingHTTPServer):
 
     def finish_upload(self, meta, state):
         try:
-            if digest_file(state["staging"]) != state["sha256"]:
-                raise ValueError("sha256 mismatch")
+            with self.upload_stream(state, "rb") as stream:
+                digest = hashlib.sha256()
+                for block in iter(lambda: stream.read(CHUNK), b""):
+                    digest.update(block)
+                if digest.hexdigest() != state["sha256"]:
+                    raise ValueError("sha256 mismatch")
             target = Path(state["path"])
             if state.get("reserved"):
                 # Preserve inode/device/mode established by worker reserve_secret.
@@ -226,6 +490,10 @@ class AgentServer(ThreadingHTTPServer):
                 finally:
                     os.close(fd)
                 os.unlink(state["staging"])
+            elif self.observation_policy is not None:
+                with self.engine_proxy.input_parent(state["path"]) as directory:
+                    os.replace(Path(state["staging"]).name, target.name,
+                               src_dir_fd=directory, dst_dir_fd=directory)
             else:
                 os.replace(state["staging"], target)
             state["file_signature"] = file_signature(target)
@@ -245,6 +513,8 @@ class AgentServer(ThreadingHTTPServer):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "AstridPodAgent/1"
+    protocol_version = "HTTP/1.1"
+    rbufsize = 0
 
     def log_message(self, *_args):
         pass  # No request paths, headers, command output or bearer tokens in logs.
@@ -262,7 +532,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def open_download(self, path):
         if self.server.observation_policy is not None:
-            return self.server.observation_policy.open(path)
+            try:
+                return self.server.observation_policy.open(path)
+            except ObservationDenied:
+                slot = self.server.engine_proxy
+                if (self.command == "POST" and urlsplit(self.path).path == "/download-chunk"
+                        and slot is not None and slot.output_policy is not None):
+                    return slot.output_policy.open(path)
+                raise
         target = Path(path)
         if not target.is_absolute():
             raise ValueError("absolute path required")
@@ -277,9 +554,11 @@ class Handler(BaseHTTPRequestHandler):
         return info
 
     def reply(self, status, data=None, *, body=None, headers=None):
+        self.close_connection = True
         if body is None:
             body = json.dumps(data or {}).encode()
         self.send_response(status)
+        self.send_header("Connection", "close")
         self.send_header("Content-Type", "application/json" if data is not None else "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -294,10 +573,14 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         if not 0 <= length <= limit:
             raise ValueError("request body exceeds limit")
-        data = self.rfile.read(length)
-        if len(data) != length:
-            raise ValueError("short body")
-        return data
+        blocks, remaining = [], length
+        while remaining:
+            block = self.rfile.read(min(CHUNK, remaining))
+            if not block:
+                raise ValueError("short body")
+            blocks.append(block)
+            remaining -= len(block)
+        return b"".join(blocks)
 
     def json_body(self):
         data = json.loads(self.body())
@@ -307,17 +590,40 @@ class Handler(BaseHTTPRequestHandler):
 
     def dispatch(self):
         authorization = self.headers.get("Authorization", "")
-        if not hmac.compare_digest(authorization.encode(), ("Bearer " + self.server.token).encode()):
+        if (len(self.headers.get_all("Authorization", [])) != 1
+                or not hmac.compare_digest(authorization.encode(), ("Bearer " + self.server.token).encode())):
             self.close_connection = True
             return self.reply(401, {"error": "unauthorized"})
+        if self.server.engine_proxy is not None and (
+                self.headers.get("Upgrade") is not None or self.headers.get("Range") is not None
+                or "upgrade" in {v.strip().lower() for v in self.headers.get("Connection", "").split(",")}):
+            return self.reply(403, {"error": "HTTP-only engine surface"})
         parsed = urlsplit(self.path)
         query = parse_qs(parsed.query)
         path = parsed.path
+        slot = self.server.engine_proxy
+        engine_allowed = slot is not None and (
+            path.startswith(slot.prefix + "/") or
+            (slot.input_files and (path == "/uploads" or path.startswith("/uploads/"))))
         if (self.server.observation_policy is not None
                 and (self.command, path) not in {("GET", "/health"),
-                    ("POST", "/download-chunk"), ("GET", "/files")}):
+                    ("POST", "/download-chunk"), ("GET", "/files")}
+                and not engine_allowed):
             self.close_connection = True
             return self.reply(403, {"error": "forbidden"})
+        if path.startswith("/engines/"):
+            slot = self.server.engine_proxy
+            if slot is None or not path.startswith(slot.prefix + "/"):
+                return self.reply(404, {"error": "unknown engine slot"})
+            target = self.path[len(slot.prefix):]
+            if not engine_operation(self.command, target):
+                return self.reply(403, {"error": "engine operation denied"})
+            try:
+                return relay_engine(self, http.client.HTTPConnection("127.0.0.1", slot.port, timeout=ENGINE_TRANSFER_SECONDS), target)
+            except (OSError, http.client.HTTPException):
+                # No response body, headers, token or upstream exception text.
+                self.close_connection = True
+                return
         if self.command == "GET" and path == "/health":
             return self.reply(200, {"ok": True, "protocol": 1})
         if path == "/jobs" and self.command == "POST":
@@ -364,10 +670,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, result)
         if path == "/uploads" and self.command == "POST":
             data = self.json_body()
+            if self.server.observation_policy is not None:
+                try:
+                    observation_path(data["path"])
+                except ValueError:
+                    raise ObservationDenied() from None
             target = Path(data["path"])
             size, sha = data["size"], data["sha256"]
             if not target.is_absolute() or type(size) is not int or size < 0 or not re.fullmatch(r"[a-f0-9]{64}", sha):
                 raise ValueError("invalid upload metadata")
+            if self.server.observation_policy is not None:
+                slot = self.server.engine_proxy
+                if slot is None or data.get("reserved"):
+                    raise ObservationDenied()
+                with slot.input_parent(str(target)):
+                    pass
             # File metadata and committed offsets survive server restarts.
             upload_id = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
             meta = self.server.state_dir / (upload_id + ".json")
@@ -381,8 +698,15 @@ class Handler(BaseHTTPRequestHandler):
                         except FileNotFoundError:
                             reusable = False
                 if not reusable:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    fd, staging = tempfile.mkstemp(prefix=".astrid-upload-", dir=target.parent)
+                    if self.server.observation_policy is not None:
+                        with slot.input_parent(str(target)) as directory:
+                            name = ".astrid-upload-" + os.urandom(16).hex()
+                            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                         0o600, dir_fd=directory)
+                            staging = str(target.parent / name)
+                    else:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        fd, staging = tempfile.mkstemp(prefix=".astrid-upload-", dir=target.parent)
                     os.close(fd)
                     data.update({"staging": staging, "offset": 0, "complete": False})
                     save_state(meta, data)
@@ -397,12 +721,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not meta.exists():
                     return self.reply(404, {"error": "unknown upload"})
                 state = json.loads(meta.read_text())
+                if self.server.observation_policy is not None:
+                    with self.server.engine_proxy.input_parent(state["path"]):
+                        pass
                 if self.command == "PUT":
                     chunk = self.body()
                     offset = int(query.get("offset", ["-1"])[0])
                     if state["complete"] or state.get("verifying") or offset != state["offset"] or offset + len(chunk) > state["size"]:
                         return self.reply(409, {"offset": state["offset"]})
-                    with open(state["staging"], "r+b") as stream:
+                    with self.server.upload_stream(state, "r+b") as stream:
                         stream.seek(offset)
                         stream.write(chunk)
                         stream.flush()
@@ -499,9 +826,12 @@ def main():
         validated = ObservationPolicy.from_environment(encoded)
         policy = {"schema": OBSERVATION_SCHEMA, "roots": list(validated.roots),
                   "files": list(validated.files)}
+    engine_options = {}
+    if ENGINE_ENV in os.environ:
+        engine_options["engine_proxy"] = json.loads(os.environ.pop(ENGINE_ENV))
     server = AgentServer(("0.0.0.0", int(os.environ.get("ASTRID_POD_PORT", "8000"))), token,
                          os.environ.get("ASTRID_POD_STATE", "/tmp/astrid-pod-agent"),
-                         observation_policy=policy)
+                         observation_policy=policy, **engine_options)
     try:
         server.serve_forever()
     finally:
