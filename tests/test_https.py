@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -382,7 +383,36 @@ def _gone(pid):
         # An unreaped zombie has been killed already; only a live state counts.
         return Path(f"/proc/{pid}/stat").read_text().split(")", 1)[1].split()[0] == "Z"
     except OSError:
-        return True
+        # Without /proc, an existing process is conservatively still live.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        return False
+
+
+def test_gone_checks_live_process_when_proc_is_unavailable(monkeypatch):
+    def unavailable(*_args, **_kwargs):
+        raise OSError("/proc unavailable")
+    monkeypatch.setattr(Path, "read_text", unavailable)
+    assert not _gone(os.getpid())
+
+
+def test_detached_job_without_setsid_binary(agent, tmp_path, monkeypatch):
+    _, client = agent
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("bash", "mkdir", "base64", "mv"):
+        executable = shutil.which(name)
+        assert executable is not None
+        (bin_dir / name).symlink_to(executable)
+    (bin_dir / "python3").symlink_to(sys.executable)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    root = str(tmp_path / "volume" / ".astrid-jobs")
+    job = client.detached_start("echo complete", root=root)
+    state = _detached_state(client, job, root, "exited")
+    assert state["exit_code"] == 0
+    assert (Path(job["dir"]) / "stdout").read_text() == "complete\n"
 
 
 def test_detached_job_start_poll_writes_exit_file(agent, tmp_path):
@@ -410,6 +440,9 @@ def test_detached_job_cancel_signals_group_and_keeps_state(agent, tmp_path):
         time.sleep(0.02)
     running = _detached_state(client, job, root, "running")
     assert running["state"] == "running"
+    assert not _gone(int(child_pid.read_text()))
+    assert os.getpgid(running["pid"]) == running["pid"]
+    assert os.getsid(running["pid"]) == running["pid"]
     cancelled = client.detached_cancel(job["id"], root=root)
     assert cancelled["state"] == "cancelled" and cancelled["exit_code"] is None
     assert not (Path(job["dir"]) / "exit").exists()

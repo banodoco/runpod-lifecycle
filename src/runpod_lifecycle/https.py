@@ -28,7 +28,7 @@ CHUNK = pod_agent.CHUNK
 ROUTE_GRACE_SECONDS = 90
 READY_CONSECUTIVE = 3
 # Detached jobs keep all state on the volume, so they outlive the client. The
-# supervisor runs under setsid (its own session and process group), so cancelling
+# supervisor runs in its own session and process group, so cancelling
 # the short launcher agent job never reaches the work.
 DETACHED_ROOT = "/workspace/.astrid-jobs"
 _DETACHED_ID = re.compile(r"[a-f0-9]{32}")
@@ -401,7 +401,8 @@ class HttpsPodTransport:
             'mkdir -p -- "$d"\n'
             f'printf %s {shlex.quote(encoded)} | base64 -d > "$d/command.sh"\n'
             'printf starting > "$d/status"\n'
-            f'setsid bash -c {shlex.quote(_DETACHED_SUPERVISOR)} detached-job "$d" </dev/null >/dev/null 2>&1 &\n'
+            f'python3 -c {shlex.quote("import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])")} '
+            f'bash -c {shlex.quote(_DETACHED_SUPERVISOR)} detached-job "$d" </dev/null >/dev/null 2>&1 &\n'
         )
         launch = self.start(launcher)
         deadline = time.monotonic() + launch_timeout
