@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 from dataclasses import asdict, is_dataclass
 import json
+import math
 import os
 import re
 import shlex
@@ -18,8 +19,10 @@ from typing import Any
 
 from . import api, config as cfg, discovery
 from .config import RunPodConfig, load_runpod_env
+from .events import EventHooks, PodEvent, PodState
 from .guard import PodGuard, install_signal_handlers
 from .lifecycle import (
+    _CapacityLaunchFailure,
     find_gpu_type,
     get_network_volumes,
     launch as _launch,
@@ -396,20 +399,54 @@ async def _cmd_gpu_types(args: argparse.Namespace) -> int:
 # -- Sprint 4 verbs --------------------------------------------------------
 
 
+def _write_capacity_progress(fd: int, line: str) -> None:
+    try:
+        os.write(fd, line.encode("ascii"))
+    except OSError:
+        # A progress consumer must not change allocation or retry behavior.
+        pass
+
+
+def _capacity_wait_progress(event: PodEvent, *, fd: int) -> None:
+    """Publish only the numeric retry fields, never the hook's provider details."""
+    if event.pod_id is not None or event.state != PodState.PROVISIONING:
+        return
+    detail = event.detail
+    attempt = detail.get("attempt")
+    retry = detail.get("retry_in_sec")
+    wait = detail.get("max_wait_sec")
+    if type(attempt) is not int or attempt < 1 or type(wait) is not int or wait < 1:
+        return
+    if type(retry) not in (int, float) or not math.isfinite(retry) or retry <= 0:
+        return
+    payload = {"placement_attempt": attempt, "retry_interval": retry, "wait_seconds": wait}
+    line = "RUNPOD_CAPACITY_WAIT " + json.dumps(payload, separators=(",", ":")) + "\n"
+    _write_capacity_progress(fd, line)
+
+
 async def _cmd_launch(args: argparse.Namespace) -> int:
     """Launch a new RunPod pod. With --detach, prints details and exits 0."""
     config = _resolve_config(args)
     name = getattr(args, "name", None)
     pod: Pod | None = None
-    if getattr(args, "wait_capacity", None):
-        pod = await _launch_when_available(
-            config,
-            name=name,
-            max_wait_sec=args.wait_capacity,
-            retry_interval_sec=args.retry_interval,
-        )
-    else:
-        pod = await _launch(config, name=name)
+    progress_fd = getattr(args, "capacity_progress_fd", None)
+    try:
+        if getattr(args, "wait_capacity", None):
+            hooks = (EventHooks(on_state_change=lambda event: _capacity_wait_progress(event, fd=progress_fd))
+                     if progress_fd is not None else None)
+            pod = await _launch_when_available(
+                config,
+                name=name,
+                hooks=hooks,
+                max_wait_sec=args.wait_capacity,
+                retry_interval_sec=args.retry_interval,
+            )
+        else:
+            pod = await _launch(config, name=name)
+    except _CapacityLaunchFailure:
+        if progress_fd is not None:
+            _write_capacity_progress(progress_fd, "RUNPOD_CAPACITY_EXHAUSTED\n")
+        raise
 
     if getattr(args, "probe_only", False):
         info = {
@@ -2240,7 +2277,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--wait-capacity",
         type=int,
         default=0,
-        help="Seconds to keep retrying the requested GPU/storage matrix before failing.",
+        help=(
+            "Seconds to retry the requested GPU/storage matrix per launch invocation. "
+            "Callers trying separate GPU/datacenter placements can wait this long for each, "
+            "so total time can exceed this value."
+        ),
     )
     p_launch.add_argument(
         "--retry-interval",
@@ -2248,6 +2289,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=30,
         help="Seconds between --wait-capacity launch attempts.",
     )
+    p_launch.add_argument("--capacity-progress-fd", type=int, help=argparse.SUPPRESS)
 
     p_exec = sub.add_parser("exec", help="Execute a command on an existing pod via SSH.")
     p_exec.add_argument("pod_id")

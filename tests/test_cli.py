@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import sys
 from copy import deepcopy
 from types import SimpleNamespace
@@ -8,6 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from runpod_lifecycle import cli, discovery
+from runpod_lifecycle.events import PodEvent, PodState
+from runpod_lifecycle.errors import AllocationUnknown, LaunchFailure, ProviderCapacityUnavailable
 
 
 def _summary(pod_id: str = "p1", cost: float = 0.5) -> discovery.PodSummary:
@@ -45,6 +49,148 @@ def test_resume_cli_accepts_capacity_wait_options() -> None:
     assert args.wait_capacity == 900
     assert args.retry_interval == 60
     assert args.wait_ready is True
+
+
+def test_launch_wait_help_and_forwarding(monkeypatch, base_config, capsys) -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["launch", "--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "per launch invocation" in help_text
+    assert "separate GPU/datacenter placements" in help_text
+    assert "total time can exceed this value" in help_text
+
+    class StopAfterForwarding(Exception):
+        pass
+
+    async def fake_wait(config, **kwargs):
+        assert config is base_config
+        assert kwargs["max_wait_sec"] == 73
+        assert kwargs["retry_interval_sec"] == 9
+        assert kwargs["hooks"].on_state_change is not None
+        raise StopAfterForwarding
+
+    monkeypatch.setattr(cli, "_resolve_config", lambda _: base_config)
+    monkeypatch.setattr(cli, "_launch_when_available", fake_wait)
+    args = cli.build_parser().parse_args(["launch", "--wait-capacity", "73", "--retry-interval", "9", "--capacity-progress-fd", "42"])
+    with pytest.raises(StopAfterForwarding):
+        asyncio.run(cli._cmd_launch(args))
+
+
+def test_launch_capacity_hook_reports_before_sleep_without_provider_data(
+    monkeypatch, base_config, capsys,
+) -> None:
+    from runpod_lifecycle import lifecycle
+
+    class StopAtSleep(Exception):
+        pass
+
+    read_fd, write_fd = os.pipe()
+    calls = []
+    def create(**kwargs):
+        calls.append(kwargs)
+        raise ProviderCapacityUnavailable(200, "no longer any instances available token=secret pod-provider-id")
+
+    async def sleep(seconds):
+        assert seconds == 10
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
+        assert os.read(read_fd, 4096).decode() == (
+            'RUNPOD_CAPACITY_WAIT {"placement_attempt":1,"retry_interval":10,"wait_seconds":120}\n'
+        )
+        raise StopAtSleep
+
+    monkeypatch.setattr(cli, "_resolve_config", lambda _: base_config.merge(ram_tiers=(64,), storage_volumes=()))
+    monkeypatch.setattr(lifecycle, "find_gpu_type", lambda *_: {"id": "gpu-provider-id"})
+    monkeypatch.setattr(lifecycle, "get_storage_volume_id", lambda *_: "volume-provider-id")
+    monkeypatch.setattr(lifecycle, "check_and_expand_storage", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(lifecycle, "create_pod", create)
+    monkeypatch.setattr(lifecycle.asyncio, "sleep", sleep)
+    args = cli.build_parser().parse_args(["launch", "--name", "private-name", "--wait-capacity", "120", "--retry-interval", "10", "--capacity-progress-fd", str(write_fd)])
+    try:
+        with pytest.raises(StopAtSleep):
+            asyncio.run(cli._cmd_launch(args))
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+    assert len(calls) == 1
+
+
+def test_capacity_progress_strictly_filters_hook_fields(tmp_path) -> None:
+    output = tmp_path / "progress"
+    fd = os.open(output, os.O_WRONLY | os.O_CREAT, 0o600)
+    cli._capacity_wait_progress(PodEvent(None, PodState.PROVISIONING, {
+        "attempt": 2, "retry_in_sec": 4.5, "max_wait_sec": 30,
+        "last_error": "token=secret", "name": "provider-id", "extra": "private",
+    }), fd=fd)
+    assert output.read_text() == (
+        'RUNPOD_CAPACITY_WAIT {"placement_attempt":2,"retry_interval":4.5,"wait_seconds":30}\n'
+    )
+    for event in (
+        PodEvent("provider-id", PodState.PROVISIONING, {"attempt": 1, "retry_in_sec": 1, "max_wait_sec": 1}),
+        PodEvent(None, PodState.READY, {"attempt": 1, "retry_in_sec": 1, "max_wait_sec": 1}),
+        PodEvent(None, PodState.PROVISIONING, {"attempt": "secret", "retry_in_sec": 1, "max_wait_sec": 1}),
+        PodEvent(None, PodState.PROVISIONING, {"attempt": 1, "retry_in_sec": float("nan"), "max_wait_sec": 1}),
+        PodEvent(None, PodState.PROVISIONING, {"attempt": True, "retry_in_sec": 1, "max_wait_sec": 1}),
+    ):
+        cli._capacity_wait_progress(event, fd=fd)
+    os.close(fd)
+    assert output.read_text().count("\n") == 1
+
+
+@pytest.mark.parametrize("wait", [0, 15])
+@pytest.mark.parametrize("failure,expected", [
+    (cli._CapacityLaunchFailure("private provider details"), "RUNPOD_CAPACITY_EXHAUSTED\n"),
+    (LaunchFailure("no free gpu: unresolved candidate"), ""),
+    (AllocationUnknown("name", "gpu", 64, None, None), ""),
+    (RuntimeError("no free gpu: malformed"), ""),
+])
+def test_terminal_capacity_signal_requires_explicit_classification(monkeypatch, base_config, tmp_path, wait, failure, expected) -> None:
+    output = tmp_path / "progress"
+    fd = os.open(output, os.O_WRONLY | os.O_CREAT, 0o600)
+    async def fail(*args, **kwargs):
+        raise failure
+    monkeypatch.setattr(cli, "_resolve_config", lambda _: base_config)
+    monkeypatch.setattr(cli, "_launch", fail)
+    monkeypatch.setattr(cli, "_launch_when_available", fail)
+    args = cli.build_parser().parse_args(["launch", "--wait-capacity", str(wait), "--capacity-progress-fd", str(fd)])
+    try:
+        with pytest.raises(type(failure)):
+            asyncio.run(cli._cmd_launch(args))
+    finally:
+        os.close(fd)
+    assert output.read_text() == expected
+
+
+@pytest.mark.parametrize("wait", [0, 1])
+def test_terminal_capacity_signal_through_real_launch(monkeypatch, base_config, tmp_path, wait) -> None:
+    from runpod_lifecycle import lifecycle
+
+    output = tmp_path / "progress"
+    fd = os.open(output, os.O_WRONLY | os.O_CREAT, 0o600)
+    clock = [0.0]
+    async def sleep(seconds):
+        clock[0] += seconds
+    monkeypatch.setattr(cli, "_resolve_config", lambda _: base_config.merge(ram_tiers=(64,), storage_volumes=()))
+    monkeypatch.setattr(lifecycle, "find_gpu_type", lambda *_: {"id": "gpu"})
+    monkeypatch.setattr(lifecycle, "get_storage_volume_id", lambda *_: "volume")
+    monkeypatch.setattr(lifecycle, "check_and_expand_storage", lambda *a, **k: None)
+    def reject(**kwargs):
+        raise ProviderCapacityUnavailable(200, "no longer any instances available")
+    monkeypatch.setattr(lifecycle, "create_pod", reject)
+    monkeypatch.setattr(lifecycle.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(lifecycle.asyncio, "sleep", sleep)
+    args = cli.build_parser().parse_args(["launch", "--wait-capacity", str(wait), "--capacity-progress-fd", str(fd)])
+    try:
+        with pytest.raises(cli._CapacityLaunchFailure):
+            asyncio.run(cli._cmd_launch(args))
+    finally:
+        os.close(fd)
+    lines = output.read_text().splitlines()
+    assert lines[-1] == "RUNPOD_CAPACITY_EXHAUSTED"
+    assert len(lines) == (2 if wait else 1)
+    if wait:
+        assert lines[0] == 'RUNPOD_CAPACITY_WAIT {"placement_attempt":1,"retry_interval":1.0,"wait_seconds":1}'
 
 
 def test_prebuilt_help_lists_validation_subcommands(capsys: pytest.CaptureFixture[str]) -> None:

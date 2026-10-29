@@ -9,9 +9,12 @@ import time
 from typing import Any
 
 from . import api
-from .api import _is_capacity_error, create_pod, find_gpu_type, get_network_volumes, start_pod
+from .api import create_pod, find_gpu_type, get_network_volumes, start_pod
 from .config import RunPodConfig
-from .errors import AllocationUnknown, LaunchFailure, PostCreateHookFailure
+from .errors import (
+    AllocationUnknown, LaunchFailure, PostCreateHookFailure,
+    ProviderCapacityUnavailable,
+)
 from .events import EventHooks, PodState, _emit_error, _emit_state
 from .pod import Pod
 from .storage import check_and_expand_storage, get_storage_volume_id
@@ -101,6 +104,12 @@ class _GpuCandidateFailure(Exception):
         self.last_error = last_error
 
 
+class _CapacityLaunchFailure(LaunchFailure):
+    """Every attempted placement was rejected explicitly for capacity."""
+
+    retryable = True
+
+
 async def _try_launch_one_gpu(
     config: RunPodConfig,
     gpu_type: str,
@@ -178,7 +187,7 @@ async def _try_launch_one_gpu(
                 # Only a definite capacity rejection permits another create.
                 # Timeouts, transport errors, and malformed responses can mean
                 # the provider allocated a pod without returning its ID.
-                if not isinstance(exc, (TimeoutError, ConnectionError, OSError)) and _is_capacity_error(exc):
+                if isinstance(exc, ProviderCapacityUnavailable):
                     last_error = exc
                     logger.warning("Capacity rejected create for gpu=%s storage=%s ram=%sGB: %s", gpu_type, storage_name, ram_tier, exc)
                     continue
@@ -317,7 +326,13 @@ async def launch(
         None,
     )
 
-    error = LaunchFailure(
+    only_capacity = (
+        bool(candidate_failures)
+        and all(failure.last_error is not None for failure in candidate_failures)
+        and len(storage_targets) == (len(input_storages) if input_storages else 1)
+    )
+    failure_type = _CapacityLaunchFailure if only_capacity else LaunchFailure
+    error = failure_type(
         f"Failed to launch pod across GPU candidates {list(candidates)}: {reasons}"
     )
     await _emit_error(
@@ -367,7 +382,7 @@ async def launch_when_available(
         except AllocationUnknown:
             raise
         except LaunchFailure as exc:
-            if not exc.retryable:
+            if not isinstance(exc, _CapacityLaunchFailure):
                 raise
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -381,7 +396,7 @@ async def launch_when_available(
                         "retry_interval_sec": retry_interval_sec,
                     },
                 )
-                raise LaunchFailure(
+                raise _CapacityLaunchFailure(
                     f"Capacity did not become available after {attempt} attempts "
                     f"over {max_wait_sec}s: {exc}"
                 ) from exc
