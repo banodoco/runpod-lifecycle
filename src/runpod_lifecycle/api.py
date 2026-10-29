@@ -129,31 +129,52 @@ def list_pods(api_key: str) -> list[dict[str, Any]]:
     without that key, causing an otherwise harmless empty/list refresh to fail
     with ``KeyError('data')``. The REST collection is the authoritative fallback
     and also gives termination verification a transport independent of the
-    mutation call.
+    mutation call. Successful SDK projections that omit attachment fields are
+    enriched by exact pod ID from REST with includeNetworkVolume=true.
     """
     sdk = _get_runpod()
     if sdk is not None:
         sdk.api_key = api_key
+    pods = None
     try:
         pods = sdk.get_pods() if sdk is not None else None
         if isinstance(pods, list):
-            return pods
-        if pods is not None:
+            # The SDK's QUERY_POD omits attachment evidence. Keep its runtime
+            # metadata, but corroborate omitted attachments with REST below.
+            if all(not isinstance(p, dict) or "networkVolumeId" in p or "networkVolume" in p for p in pods):
+                return pods
+        elif pods is not None:
             logger.warning("RunPod SDK returned unexpected pod collection: %r", type(pods).__name__)
     except Exception as exc:
         logger.warning("RunPod SDK get_pods failed; falling back to REST: %s", exc)
 
-    response = httpx.get(PODS_URL, headers=_auth_headers(api_key), timeout=30)
+    response = httpx.get(
+        PODS_URL, headers=_auth_headers(api_key), timeout=30,
+        params={"includeNetworkVolume": "true"},
+    )
     if response.status_code != 200:
         raise RuntimeError(
             f"RunPod pod listing failed: HTTP {response.status_code}: {response.text[:500]}"
         )
     payload = response.json()
-    if isinstance(payload, list):
-        return payload
     if isinstance(payload, dict) and isinstance(payload.get("pods"), list):
-        return payload["pods"]
-    raise RuntimeError(f"RunPod pod listing returned unexpected {type(payload).__name__} payload")
+        payload = payload["pods"]
+    if not isinstance(payload, list) or any(not isinstance(p, dict) for p in payload):
+        raise RuntimeError("RunPod pod listing returned a malformed collection")
+    if not isinstance(pods, list):
+        return payload
+    enriched = []
+    for pod in pods:
+        if not isinstance(pod, dict) or "networkVolumeId" in pod or "networkVolume" in pod:
+            enriched.append(pod)
+            continue
+        pod_id = pod.get("id")
+        matches = [p for p in payload if isinstance(pod_id, str) and pod_id and p.get("id") == pod_id]
+        # Never infer attachment from the requested volume, a pod name, or an
+        # ambiguous join. Missing/null evidence remains explicit in the CLI.
+        attachment = matches[0].get("networkVolume") if len(matches) == 1 else None
+        enriched.append({**pod, "networkVolume": attachment})
+    return enriched
 
 
 def find_gpu_type(gpu_display_name: str, api_key: str) -> dict[str, Any] | None:

@@ -31,6 +31,23 @@ class PodSummary:
     network_volume_id: str | None
 
 
+def _network_volume_id(raw: dict[str, Any]) -> str | None:
+    """Normalize observed SDK/REST identities, rejecting malformed/conflicting evidence.
+
+    REST GET /v1/pods?includeNetworkVolume=true returns networkVolume.id.
+    It is an attached-volume object, not the similarly named request filter.
+    """
+    identities = []
+    if "networkVolumeId" in raw:
+        identities.append(raw["networkVolumeId"])
+    if "networkVolume" in raw:
+        volume = raw["networkVolume"]
+        identities.append(volume.get("id") if isinstance(volume, dict) else None)
+    if not identities or any(not isinstance(v, str) or not v or v.strip() != v for v in identities):
+        return None
+    return identities[0] if all(v == identities[0] for v in identities) else None
+
+
 def _to_summary(raw: dict[str, Any]) -> PodSummary:
     runtime = raw.get("runtime") if isinstance(raw.get("runtime"), dict) else {}
     machine = raw.get("machine") if isinstance(raw.get("machine"), dict) else {}
@@ -50,7 +67,7 @@ def _to_summary(raw: dict[str, Any]) -> PodSummary:
         cost_per_hr=cost_val,
         uptime_seconds=runtime.get("uptimeInSeconds") if runtime else None,
         ports=runtime.get("ports", []) if runtime else [],
-        network_volume_id=raw.get("networkVolumeId"),
+        network_volume_id=_network_volume_id(raw),
     )
 
 

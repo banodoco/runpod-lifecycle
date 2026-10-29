@@ -36,6 +36,51 @@ def test_list_pods_falls_back_to_rest_when_sdk_graphql_response_is_incomplete(
     assert api.list_pods("test") == [{"id": "p1", "desiredStatus": "RUNNING"}]
 
 
+def test_successful_sdk_projection_is_enriched_by_exact_rest_id(monkeypatch, runpod_sdk_mock):
+    from runpod.api import ctl_commands
+    # runpod-python 836a0d88 QUERY_POD selects runtime but no attachment field.
+    sdk_pod = {"id": "p1", "runtime": {"ports": [{"privatePort": 22}]}}
+    def graphql(query, **kwargs):
+        assert query == ctl_commands.pod_queries.QUERY_POD
+        assert "networkVolume" not in query
+        return {"data": {"myself": {"pods": [sdk_pod]}}}
+    monkeypatch.setattr(ctl_commands, "run_graphql_query", graphql)
+    runpod_sdk_mock.get_pods.side_effect = ctl_commands.get_pods
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse(200, [
+            {"id": "unrelated", "networkVolume": {"id": "wrong"}},
+            {"id": "p1", "networkVolume": {"id": "vol-1"}},
+        ])
+
+    monkeypatch.setattr(api.httpx, "get", get)
+    result = api.list_pods("test")
+    assert result == [{**sdk_pod, "networkVolume": {"id": "vol-1"}}]
+    assert "networkVolume" not in sdk_pod  # do not mutate provider payloads
+    assert calls == [(api.PODS_URL, {"headers": {"Authorization": "Bearer test"},
+                                   "timeout": 30, "params": {"includeNetworkVolume": "true"}})]
+
+
+@pytest.mark.parametrize("payload", [[], [{"id": "other", "networkVolume": {"id": "vol-1"}}],
+    [{"id": "p1", "networkVolume": {"id": "vol-1"}}] * 2])
+def test_rest_enrichment_keeps_unobservable_pod_in_inventory(monkeypatch, runpod_sdk_mock, payload):
+    runpod_sdk_mock.get_pods.return_value = [{"id": "p1"}]
+    monkeypatch.setattr(api.httpx, "get", lambda *a, **kw: FakeResponse(200, payload))
+    assert api.list_pods("test") == [{"id": "p1", "networkVolume": None}]
+
+
+def test_rest_fallback_exposes_documented_attachment(monkeypatch, runpod_sdk_mock):
+    runpod_sdk_mock.get_pods.side_effect = KeyError("data")
+    payload = [{"id": "p1", "networkVolume": {"id": "vol-1"}}]
+    def get(*args, **kwargs):
+        assert kwargs["params"] == {"includeNetworkVolume": "true"}
+        return FakeResponse(200, payload)
+    monkeypatch.setattr(api.httpx, "get", get)
+    assert api.list_pods("test") == payload
+
+
 def test_terminate_pod_waits_for_provider_side_absence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

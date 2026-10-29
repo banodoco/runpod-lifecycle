@@ -320,6 +320,22 @@ def test_cli_list_json(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFi
     assert [p["id"] for p in payload] == ["a", "b"]
 
 
+def test_cli_list_serializes_rest_attachment_after_sdk_projection(monkeypatch, runpod_sdk_mock, capsys):
+    from runpod_lifecycle import api
+    monkeypatch.setattr(cli, "load_runpod_env", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_resolve_api_key", lambda _: "test")
+    runpod_sdk_mock.get_pods.return_value = [{"id": "p1", "name": "projected"}]
+    def get(url, **kwargs):
+        assert url == api.PODS_URL and kwargs["params"] == {"includeNetworkVolume": "true"}
+        return SimpleNamespace(status_code=200, json=lambda: [
+            {"id": "p1", "networkVolume": {"id": "vol-1"}}])
+    monkeypatch.setattr(api.httpx, "get", get)
+    assert cli.main(["list", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload) == 1 and payload[0]["network_volume_id"] == "vol-1"
+    assert payload[0]["id"] == "p1" and payload[0]["name"] == "projected"
+
+
 def test_cli_status_redacts_credentials_without_changing_status_fields(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
