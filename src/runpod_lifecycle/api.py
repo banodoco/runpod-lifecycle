@@ -177,6 +177,29 @@ def list_pods(api_key: str) -> list[dict[str, Any]]:
     return enriched
 
 
+def get_pod_mounts(pod_id: str, api_key: str) -> dict[str, Any]:
+    """Read typed storage evidence afresh for exactly one pod, without fallback.
+
+    Account API support is not inferred from the public schema. In particular,
+    an unavailable typed field must never fall back to legacy attachment facts.
+    SDK/provider errors can contain query or account details, so keep them out
+    of diagnostics on this narrow fail-closed path.
+    """
+    if not isinstance(pod_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", pod_id):
+        raise ValueError("Invalid pod ID for mount observation")
+    try:
+        sdk = _get_runpod()
+        if sdk is None or not callable(getattr(sdk, "get_pod_mounts", None)):
+            raise RuntimeError("Typed provider mount projection is unavailable")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            pod = sdk.get_pod_mounts(pod_id, api_key=api_key)
+    except Exception:
+        raise RuntimeError("Typed provider mount observation failed") from None
+    if not isinstance(pod, dict) or pod.get("id") != pod_id:
+        raise ValueError("Exact-pod mount observation is unavailable")
+    return pod
+
+
 def find_gpu_type(gpu_display_name: str, api_key: str) -> dict[str, Any] | None:
     """Find a GPU type by display name or ID."""
     sdk = _get_runpod()

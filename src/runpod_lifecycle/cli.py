@@ -316,6 +316,12 @@ async def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_mounts(args: argparse.Namespace) -> int:
+    observation = await discovery.observe_pod_mounts(args.pod_id, _resolve_api_key(args), args.nonce)
+    print(json.dumps(observation, separators=(",", ":")))
+    return 0
+
+
 async def _cmd_resume(args: argparse.Namespace) -> int:
     api_key = _resolve_api_key(args)
     pod = Pod(
@@ -2179,6 +2185,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="Show normalized status for a pod.")
     p_status.add_argument("pod_id")
 
+    p_mounts = sub.add_parser("mounts", help="Read fresh exact-pod typed mount evidence (JSON).")
+    p_mounts.add_argument("pod_id")
+    p_mounts.add_argument("--nonce", required=True, help="Invocation nonce: 32 lowercase hexadecimal characters.")
+    p_mounts.add_argument("--json", action="store_true", required=True)
+
     p_resume = sub.add_parser(
         "resume",
         help="Resume an existing stopped Pod, waiting for its original GPU capacity.",
@@ -2638,6 +2649,7 @@ def build_parser() -> argparse.ArgumentParser:
 _HANDLERS: dict[str, Any] = {
     "list": _cmd_list,
     "status": _cmd_status,
+    "mounts": _cmd_mounts,
     "resume": _cmd_resume,
     "terminate": _cmd_terminate,
     "find-orphans": _cmd_find_orphans,
