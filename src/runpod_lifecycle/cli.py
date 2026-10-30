@@ -20,6 +20,7 @@ from typing import Any
 from . import api, config as cfg, discovery
 from .config import RunPodConfig, load_runpod_env
 from .events import EventHooks, PodEvent, PodState
+from .errors import AllocationUnknown
 from .guard import PodGuard, install_signal_handlers
 from .lifecycle import (
     _CapacityLaunchFailure,
@@ -436,6 +437,15 @@ async def _cmd_launch(args: argparse.Namespace) -> int:
     name = getattr(args, "name", None)
     pod: Pod | None = None
     progress_fd = getattr(args, "capacity_progress_fd", None)
+    attempt = 0
+
+    def start_attempt(index: int) -> None:
+        nonlocal attempt
+        attempt = index
+        if progress_fd is not None:
+            payload = {"placement_attempt": index}
+            _write_capacity_progress(progress_fd, "RUNPOD_PLACEMENT_ATTEMPT " + json.dumps(payload, separators=(",", ":")) + "\n")
+
     try:
         if getattr(args, "wait_capacity", None):
             hooks = (EventHooks(on_state_change=lambda event: _capacity_wait_progress(event, fd=progress_fd))
@@ -446,12 +456,22 @@ async def _cmd_launch(args: argparse.Namespace) -> int:
                 hooks=hooks,
                 max_wait_sec=args.wait_capacity,
                 retry_interval_sec=args.retry_interval,
+                on_attempt=start_attempt,
             )
         else:
+            start_attempt(1)
             pod = await _launch(config, name=name)
     except _CapacityLaunchFailure:
         if progress_fd is not None:
             _write_capacity_progress(progress_fd, "RUNPOD_CAPACITY_EXHAUSTED\n")
+        raise
+    except Exception as exc:
+        if progress_fd is not None and attempt:
+            payload = {
+                "classification": "allocation_unknown" if isinstance(exc, AllocationUnknown) else "non_capacity_failure",
+                "placement_attempt": attempt,
+            }
+            _write_capacity_progress(progress_fd, "RUNPOD_TERMINAL_FAILURE " + json.dumps(payload, separators=(",", ":")) + "\n")
         raise
 
     if getattr(args, "probe_only", False):

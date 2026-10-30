@@ -96,6 +96,7 @@ def test_launch_capacity_hook_reports_before_sleep_without_provider_data(
         assert captured.out == ""
         assert captured.err == ""
         assert os.read(read_fd, 4096).decode() == (
+            'RUNPOD_PLACEMENT_ATTEMPT {"placement_attempt":1}\n'
             'RUNPOD_CAPACITY_WAIT {"placement_attempt":1,"retry_interval":10,"wait_seconds":120}\n'
         )
         raise StopAtSleep
@@ -141,14 +142,16 @@ def test_capacity_progress_strictly_filters_hook_fields(tmp_path) -> None:
 @pytest.mark.parametrize("wait", [0, 15])
 @pytest.mark.parametrize("failure,expected", [
     (cli._CapacityLaunchFailure("private provider details"), "RUNPOD_CAPACITY_EXHAUSTED\n"),
-    (LaunchFailure("no free gpu: unresolved candidate"), ""),
-    (AllocationUnknown("name", "gpu", 64, None, None), ""),
-    (RuntimeError("no free gpu: malformed"), ""),
+    (LaunchFailure("no free gpu: unresolved candidate"), "non_capacity_failure"),
+    (AllocationUnknown("name", "gpu", 64, None, None), "allocation_unknown"),
+    (RuntimeError("no free gpu: malformed"), "non_capacity_failure"),
 ])
 def test_terminal_capacity_signal_requires_explicit_classification(monkeypatch, base_config, tmp_path, wait, failure, expected) -> None:
     output = tmp_path / "progress"
     fd = os.open(output, os.O_WRONLY | os.O_CREAT, 0o600)
     async def fail(*args, **kwargs):
+        if "on_attempt" in kwargs:
+            kwargs["on_attempt"](1)
         raise failure
     monkeypatch.setattr(cli, "_resolve_config", lambda _: base_config)
     monkeypatch.setattr(cli, "_launch", fail)
@@ -159,7 +162,18 @@ def test_terminal_capacity_signal_requires_explicit_classification(monkeypatch, 
             asyncio.run(cli._cmd_launch(args))
     finally:
         os.close(fd)
-    assert output.read_text() == expected
+    lines = output.read_text().splitlines()
+    assert lines[0] == 'RUNPOD_PLACEMENT_ATTEMPT {"placement_attempt":1}'
+    if expected.startswith("RUNPOD_"):
+        assert lines[1:] == [expected.strip()]
+    else:
+        assert lines[1:] == [
+            'RUNPOD_TERMINAL_FAILURE ' + json.dumps(
+                {"classification": expected, "placement_attempt": 1}, separators=(",", ":")
+            )
+        ]
+    assert "private" not in output.read_text()
+    assert "name" not in output.read_text()
 
 
 @pytest.mark.parametrize("wait", [0, 1])
@@ -188,9 +202,49 @@ def test_terminal_capacity_signal_through_real_launch(monkeypatch, base_config, 
         os.close(fd)
     lines = output.read_text().splitlines()
     assert lines[-1] == "RUNPOD_CAPACITY_EXHAUSTED"
-    assert len(lines) == (2 if wait else 1)
+    assert len(lines) == (4 if wait else 2)
+    assert lines[0] == 'RUNPOD_PLACEMENT_ATTEMPT {"placement_attempt":1}'
     if wait:
-        assert lines[0] == 'RUNPOD_CAPACITY_WAIT {"placement_attempt":1,"retry_interval":1.0,"wait_seconds":1}'
+        assert lines[1] == 'RUNPOD_CAPACITY_WAIT {"placement_attempt":1,"retry_interval":1.0,"wait_seconds":1}'
+        assert lines[2] == 'RUNPOD_PLACEMENT_ATTEMPT {"placement_attempt":2}'
+
+
+def test_capacity_retries_then_ambiguous_create_report_exact_attempt_without_secrets(monkeypatch, base_config, tmp_path) -> None:
+    from runpod_lifecycle import lifecycle
+    from runpod_lifecycle.errors import ProviderRequestRejected
+
+    output = tmp_path / "progress"
+    fd = os.open(output, os.O_WRONLY | os.O_CREAT, 0o600)
+    calls = []
+    def create(**kwargs):
+        calls.append(kwargs)
+        if len(calls) < 3:
+            raise ProviderCapacityUnavailable(200, "capacity secret=hidden")
+        raise ProviderRequestRejected(400, "token=secret private-provider-id")
+    async def sleep(_seconds):
+        pass
+    monkeypatch.setattr(cli, "_resolve_config", lambda _: base_config.merge(ram_tiers=(64,), storage_volumes=()))
+    monkeypatch.setattr(lifecycle, "find_gpu_type", lambda *_: {"id": "private-gpu-id"})
+    monkeypatch.setattr(lifecycle, "get_storage_volume_id", lambda *_: "private-volume-id")
+    monkeypatch.setattr(lifecycle, "check_and_expand_storage", lambda *a, **k: None)
+    monkeypatch.setattr(lifecycle, "create_pod", create)
+    monkeypatch.setattr(lifecycle.asyncio, "sleep", sleep)
+    args = cli.build_parser().parse_args(["launch", "--name", "private-name", "--wait-capacity", "120", "--retry-interval", "10", "--capacity-progress-fd", str(fd)])
+    try:
+        with pytest.raises(AllocationUnknown):
+            asyncio.run(cli._cmd_launch(args))
+    finally:
+        os.close(fd)
+    assert len(calls) == 3
+    assert output.read_text().splitlines() == [
+        'RUNPOD_PLACEMENT_ATTEMPT {"placement_attempt":1}',
+        'RUNPOD_CAPACITY_WAIT {"placement_attempt":1,"retry_interval":10,"wait_seconds":120}',
+        'RUNPOD_PLACEMENT_ATTEMPT {"placement_attempt":2}',
+        'RUNPOD_CAPACITY_WAIT {"placement_attempt":2,"retry_interval":10,"wait_seconds":120}',
+        'RUNPOD_PLACEMENT_ATTEMPT {"placement_attempt":3}',
+        'RUNPOD_TERMINAL_FAILURE {"classification":"allocation_unknown","placement_attempt":3}',
+    ]
+    assert all(value not in output.read_text() for value in ("secret", "private", "400", "name"))
 
 
 def test_prebuilt_help_lists_validation_subcommands(capsys: pytest.CaptureFixture[str]) -> None:

@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, Callable
 
 from . import api
 from .api import create_pod, find_gpu_type, get_network_volumes, start_pod
@@ -359,6 +359,7 @@ async def launch_when_available(
     hooks: EventHooks | None = None,
     max_wait_sec: int = 900,
     retry_interval_sec: int = 30,
+    on_attempt: Callable[[int], None] | None = None,
 ) -> Pod:
     """Keep trying to claim the requested launch matrix until capacity appears.
 
@@ -368,6 +369,8 @@ async def launch_when_available(
     succeeds or the bounded wait expires.
     """
     if max_wait_sec <= 0:
+        if on_attempt is not None:
+            on_attempt(1)
         return await launch(config, name=name, hooks=hooks)
     if retry_interval_sec <= 0:
         raise ValueError("retry_interval_sec must be positive")
@@ -377,6 +380,8 @@ async def launch_when_available(
     attempt = 0
     while True:
         attempt += 1
+        if on_attempt is not None:
+            on_attempt(attempt)
         try:
             return await launch(config, name=name, hooks=hooks)
         except AllocationUnknown:
