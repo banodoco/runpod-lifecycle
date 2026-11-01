@@ -162,6 +162,13 @@ def test_session_websocket_frames_ping_close_and_header_filtering(tmp_path, comf
 
 
 def test_session_upload_image_is_bounded_and_relayed_without_client_secrets(tmp_path, comfy, monkeypatch):
+    from astrid.core.generation.backends.comfy_target import (
+        HTTP_TRANSFER_SECONDS, MAX_ENGINE_BODY_BYTES,
+    )
+    from runpod_lifecycle import pod_agent
+
+    assert MAX_ENGINE_BODY_BYTES == pod_agent.ENGINE_BODY_LIMIT
+    assert HTTP_TRANSFER_SECONDS == pod_agent.ENGINE_TRANSFER_SECONDS == 15
     with running_agent(tmp_path) as (_, transport):
         transport.enable_engine_proxy('comfy', comfy['port'])
         url = str(transport.http.base_url) + '/engines/comfy'
@@ -200,8 +207,6 @@ def test_session_upload_image_is_bounded_and_relayed_without_client_secrets(tmp_
             connection.close()
         assert comfy['uploads'][0] == (payload, 'multipart/form-data; boundary=upload')
         import time
-        from runpod_lifecycle import pod_agent
-        assert pod_agent.ENGINE_TRANSFER_SECONDS == 15
         monkeypatch.setattr(pod_agent, 'ENGINE_TRANSFER_SECONDS', 0.15)
         comfy['upload_delay'] = 0.5
         started = time.monotonic()
