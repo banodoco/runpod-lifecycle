@@ -151,3 +151,6 @@ __all__ = [
 ]
 
 from .https import HttpsPodTransport
+from .engine_bridge import EngineBridge
+
+__all__.append("EngineBridge")
