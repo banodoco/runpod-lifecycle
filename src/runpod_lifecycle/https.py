@@ -8,6 +8,8 @@ import json
 import logging
 import re
 import shlex
+import socket
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -65,12 +67,14 @@ def agent_bootstrap(token: str, port: int = PORT, *, observation_policy=None, en
     engine_proxy is a trusted-startup {endpoint_id, port} slot, enabled only
     after the original installation/session readiness handoff. Its upstream
     is always 127.0.0.1; the provider exposes only this agent's port. It cannot
-    be configured by an HTTP call. With an observation policy it preserves
+    be configured by an observation claim's HTTP call. With an observation policy it preserves
     curated reads and denies ordinary commands. Optional input_files grants
     only exact absolute destinations to the existing chunk upload; optional
     output_roots grants JSON-chunk reads beneath configured directories.
     Both are installed-session startup configuration, never request inputs.
-    Omitting the slot stays observation-only. Engine calls are HTTP-only.
+    Omitting the slot stays observation-only. Startup slots remain HTTP-only
+    by default. A full command-authority session may separately opt into the
+    session bridge's view/WebSocket surface using enable_engine_proxy().
 
     state_dir selects the agent's private ASTRID_POD_STATE directory (absolute,
     canonical, mode 0700 on the pod); it is accepted only with engine_proxy so
@@ -201,6 +205,132 @@ class HttpsPodTransport:
         if remaining <= 0:
             raise PodTransportError("pod HTTPS caller deadline exceeded")
         return remaining
+
+    def enable_engine_proxy(self, endpoint_id, port):
+        """Idempotently bind a full-authority session's in-memory loopback slot."""
+        pod_agent.EngineProxy(endpoint_id, port)
+        response = self._request("POST", "/engine-proxy", json={"endpoint_id": endpoint_id, "port": port},
+                                 _absent=(400, 403, 404, 409))
+        reasons = {400: "invalid engine proxy request", 403: "engine proxy requires command authority",
+                   404: "agent does not support session engine proxy enablement",
+                   409: "the engine slot is already bound"}
+        if response.status_code in reasons:
+            raise PodTransportError(reasons[response.status_code])
+
+    def relay_engine(self, handler, endpoint_id):
+        """Stream once through this transport's validated, authenticated origin.
+
+        Prompts and upgrade attempts are never retried after an ambiguous reply.
+        Caller headers never override the transport bearer. HTTPX retains the
+        existing controller proxy/CA policy and verifies TLS as usual.
+        """
+        pod_agent.EngineProxy(endpoint_id, 1)
+        target = handler.path
+        if not pod_agent.engine_operation(handler.command, target, session_bridge=True):
+            return handler.reply(403, {"error": "engine operation denied"})
+        websocket = target.split("?", 1)[0] in {"/ws", "/api/ws"}
+        if websocket:
+            if not pod_agent.websocket_request(handler):
+                return handler.reply(400, {"error": "invalid engine websocket handshake"})
+        elif (handler.headers.get("Upgrade") is not None or handler.headers.get("Range") is not None
+                or "upgrade" in {v.strip().lower() for v in handler.headers.get("Connection", "").split(",")}):
+            return handler.reply(403, {"error": "HTTP-only engine surface"})
+        response = None
+        sent = False
+        timer = None
+        handler.close_connection = True
+        try:
+            if handler.headers.get("Transfer-Encoding") or len(handler.headers.get_all("Content-Length", [])) > 1:
+                raise ValueError()
+            length = int(handler.headers.get("Content-Length", "0"))
+            if not 0 <= length <= pod_agent.ENGINE_BODY_LIMIT:
+                raise ValueError()
+            headers = {name: handler.headers[name] for name in ("Content-Type", "Accept") if name in handler.headers}
+            headers.update({"Accept-Encoding": "identity", "Connection": "close", "Content-Length": str(length)})
+            if websocket:
+                headers.update({"Connection": "Upgrade", "Upgrade": "websocket",
+                                "Sec-WebSocket-Key": handler.headers["Sec-WebSocket-Key"],
+                                "Sec-WebSocket-Version": "13"})
+            def body():
+                remaining = length
+                while remaining:
+                    block = handler.rfile.read(min(pod_agent.CHUNK, remaining))
+                    if not block:
+                        raise ValueError()
+                    remaining -= len(block)
+                    yield block
+            def expire():
+                try:
+                    handler.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                if response is not None:
+                    response.close()
+            timer = threading.Timer(pod_agent.ENGINE_TRANSFER_SECONDS, expire)
+            timer.daemon = True
+            timer.start()
+            request = self.http.build_request(handler.command, "/engines/" + endpoint_id + target,
+                                             headers=headers, content=body(),
+                                             timeout=pod_agent.ENGINE_TRANSFER_SECONDS)
+            response = self.http.send(request, stream=True, follow_redirects=False)
+            if websocket:
+                stream = response.extensions.get("network_stream")
+                if (response.status_code != 101 or stream is None
+                        or response.headers.get("upgrade", "").lower() != "websocket"
+                        or "upgrade" not in {v.strip().lower() for v in response.headers.get("connection", "").split(",")}
+                        or response.headers.get("sec-websocket-accept") != pod_agent.websocket_accept(headers["Sec-WebSocket-Key"])):
+                    return handler.reply(502, {"error": "engine websocket upgrade refused"})
+                timer.cancel()
+                handler.send_response(101)
+                for name in ("Upgrade", "Connection", "Sec-WebSocket-Accept"):
+                    handler.send_header(name, response.headers[name])
+                handler.end_headers()
+                handler.wfile.flush()
+                sent = True
+                def close_stream():
+                    sock = stream.get_extra_info("socket")
+                    if sock is not None:
+                        try:
+                            sock.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                    stream.close()
+                return pod_agent.tunnel_websocket(handler,
+                    lambda n: stream.read(n, timeout=pod_agent.ENGINE_WEBSOCKET_SECONDS),
+                    lambda block: stream.write(block, timeout=pod_agent.ENGINE_TRANSFER_SECONDS), close_stream)
+            if 300 <= response.status_code < 400 or response.status_code == 101:
+                return handler.reply(502, {"error": "engine redirect or upgrade refused"})
+            declared = response.headers.get("Content-Length")
+            size = None if declared is None else int(declared)
+            if size is not None and not 0 <= size <= pod_agent.ENGINE_BODY_LIMIT:
+                raise ValueError()
+            handler.send_response(response.status_code)
+            handler.send_header("Connection", "close")
+            handler.send_header("Cache-Control", "no-store")
+            for name in ("Content-Type", "Content-Encoding", "ETag", "Content-Length"):
+                if name in response.headers:
+                    handler.send_header(name, response.headers[name])
+            handler.end_headers()
+            sent = True
+            total = 0
+            for block in response.iter_raw():
+                total += len(block)
+                if total > pod_agent.ENGINE_BODY_LIMIT:
+                    raise ValueError()
+                handler.wfile.write(block)
+            if size is not None and total != size:
+                raise ValueError()
+        except (httpx.HTTPError, OSError):
+            if not sent:
+                handler.reply(502, {"error": "engine HTTPS transport unavailable"})
+        except (ValueError, TypeError):
+            if not sent:
+                handler.reply(400 if response is None else 502, {"error": "invalid engine exchange"})
+        finally:
+            if timer is not None:
+                timer.cancel()
+            if response is not None:
+                response.close()
 
     def _pause(self, seconds):
         remaining = self._remaining()

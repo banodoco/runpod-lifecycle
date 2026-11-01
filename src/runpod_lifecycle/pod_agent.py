@@ -39,16 +39,20 @@ ENGINE_B64_ENV = "ASTRID_POD_ENGINE_B64"
 ENGINE_B64_LIMIT = 16384
 ENGINE_BODY_LIMIT = 1024 * 1024 * 1024
 ENGINE_TRANSFER_SECONDS = 15
+ENGINE_WEBSOCKET_SECONDS = 6 * 60 * 60
 
 
 class EngineProxy:
-    """One trusted startup slot. The upstream host is deliberately not an input."""
+    """One loopback slot, selected at startup or by a full-authority session."""
 
-    def __init__(self, endpoint_id, port, *, input_files=(), output_roots=()):
+    def __init__(self, endpoint_id, port, *, input_files=(), output_roots=(), session_bridge=False):
         if (not isinstance(endpoint_id, str) or not re.fullmatch(r"[a-z][a-z0-9-]*", endpoint_id)
                 or type(port) is not int or not 1 <= port <= 65535):
             raise ValueError("invalid engine proxy slot")
         self.endpoint_id, self.port = endpoint_id, port
+        if type(session_bridge) is not bool:
+            raise ValueError("invalid session bridge selection")
+        self.session_bridge = session_bridge
         self.prefix = "/engines/" + endpoint_id
         if (not isinstance(input_files, (list, tuple)) or len(input_files) > 32
                 or not isinstance(output_roots, (list, tuple)) or len(output_roots) > 8):
@@ -64,6 +68,8 @@ class EngineProxy:
 
     def configuration(self):
         data = {"endpoint_id": self.endpoint_id, "port": self.port}
+        if self.session_bridge:
+            data["session_bridge"] = True
         if self.input_files:
             data["input_files"] = list(self.input_files)
         if self.output_roots:
@@ -99,7 +105,7 @@ class EngineProxy:
             os.close(directory)
 
 
-def engine_operation(method, target):
+def engine_operation(method, target, *, session_bridge=False):
     """Closed ComfyUI surface, also used by the single-slot client adapter."""
     if (not isinstance(target, str) or not target.startswith("/")
             or any(ord(c) <= 32 or ord(c) >= 127 for c in target)
@@ -112,10 +118,120 @@ def engine_operation(method, target):
     if path.startswith("/api/"):
         path = path[4:]
     if method == "GET":
-        return (path in {"/object_info", "/system_stats", "/queue", "/history"}
+        return ((session_bridge and path in {"/view", "/ws"})
+                or path in {"/object_info", "/system_stats", "/queue", "/history"}
                 or re.fullmatch(r"/(?:history|object_info)/[A-Za-z0-9_-]+", path) is not None)
     return method == "POST" and path in {
         "/prompt", "/queue", "/interrupt", "/free"}
+
+
+def websocket_request(handler):
+    """Only RFC 6455 version 13, with unambiguous body-free framing."""
+    try:
+        key = handler.headers.get("Sec-WebSocket-Key", "")
+        return (handler.command == "GET"
+                and handler.headers.get("Upgrade", "").lower() == "websocket"
+                and "upgrade" in {v.strip().lower() for v in handler.headers.get("Connection", "").split(",")}
+                and handler.headers.get("Sec-WebSocket-Version") == "13"
+                and len(handler.headers.get_all("Sec-WebSocket-Key", [])) == 1
+                and len(base64.b64decode(key, validate=True)) == 16
+                and not handler.headers.get("Transfer-Encoding")
+                and handler.headers.get("Content-Length", "0") == "0"
+                and len(handler.headers.get_all("Content-Length", [])) <= 1
+                and handler.headers.get("Range") is None)
+    except (ValueError, TypeError):
+        return False
+
+
+def websocket_accept(key):
+    return base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+
+
+def tunnel_websocket(handler, read, write, close):
+    """Opaque duplex bytes, including any frames buffered during the upgrade.
+
+    No frame rewriting, retries, headers, credentials or diagnostics. Either
+    EOF closes both directions; the hard lifetime bounds abandoned clients.
+    """
+    ended = threading.Event()
+    def copy_up():
+        try:
+            while not ended.is_set():
+                block = getattr(handler.rfile, "read1", handler.rfile.read)(65536)
+                if not block:
+                    break
+                write(block)
+        except Exception:
+            pass
+        finally:
+            ended.set()
+    def copy_down():
+        try:
+            while not ended.is_set():
+                block = read(65536)
+                if not block:
+                    break
+                handler.wfile.write(block)
+                handler.wfile.flush()
+        except Exception:
+            pass
+        finally:
+            ended.set()
+    threads = [threading.Thread(target=operation, daemon=True) for operation in (copy_up, copy_down)]
+    handler.connection.settimeout(ENGINE_WEBSOCKET_SECONDS)
+    for thread in threads:
+        thread.start()
+    try:
+        ended.wait(ENGINE_WEBSOCKET_SECONDS)
+    finally:
+        ended.set()
+        try:
+            handler.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        close()
+        for thread in threads:
+            thread.join(2)
+
+
+def relay_websocket(handler, connection, target):
+    handler.close_connection = True
+    if not websocket_request(handler):
+        connection.close()
+        return handler.reply(400, {"error": "invalid engine websocket handshake"})
+    response = None
+    upgraded = False
+    try:
+        key = handler.headers["Sec-WebSocket-Key"]
+        connection.request("GET", target, headers={"Connection": "Upgrade", "Upgrade": "websocket",
+                           "Sec-WebSocket-Key": key, "Sec-WebSocket-Version": "13"})
+        response = connection.getresponse()
+        if (response.status != 101 or response.getheader("Upgrade", "").lower() != "websocket"
+                or "upgrade" not in {v.strip().lower() for v in response.getheader("Connection", "").split(",")}
+                or response.getheader("Sec-WebSocket-Accept") != websocket_accept(key)):
+            return handler.reply(502, {"error": "engine websocket upgrade refused"})
+        handler.send_response(101)
+        for name in ("Upgrade", "Connection", "Sec-WebSocket-Accept"):
+            handler.send_header(name, response.getheader(name))
+        handler.end_headers()
+        handler.wfile.flush()
+        upgraded = True
+        sock = connection.sock
+        sock.settimeout(ENGINE_WEBSOCKET_SECONDS)
+        def close():
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            connection.close()
+        tunnel_websocket(handler, response.fp.read1, sock.sendall, close)
+    except (OSError, http.client.HTTPException):
+        if not upgraded:
+            handler.reply(502, {"error": "engine websocket transport unavailable"})
+    finally:
+        if response is not None:
+            response.close()
+        connection.close()
 
 
 def relay_engine(handler, connection, target, *, bearer=None, timeout=None):
@@ -439,7 +555,7 @@ class AgentServer(ThreadingHTTPServer):
         if len(token) < 32 or not token.isascii():
             raise ValueError("a random token of at least 32 ASCII characters is required")
         self.token = token
-        # This configuration comes only from trusted startup, never a route.
+        # Observation claims can select a slot only through trusted startup.
         self.engine_proxy = None if engine_proxy is None else EngineProxy(**engine_proxy)
         self.observation_policy = (None if observation_policy is None
                                    else ObservationPolicy(observation_policy))
@@ -478,20 +594,24 @@ class AgentServer(ThreadingHTTPServer):
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise ValueError("engine upload state must be a private owned directory")
 
-    def enable_engine(self, endpoint_id, port, *, input_files=(), output_roots=()):
-        """Trusted installed-session handoff. No HTTP configuration endpoint.
+    def enable_engine(self, endpoint_id, port, *, input_files=(), output_roots=(),
+                      session_bridge=False, persist_bearer=True):
+        """Bind one slot; installed handoffs retain their original bearer file.
 
         Observation reads stay curated; only exact configured input writes and
-        output reads are added. Job/command authority is never granted.
+        output reads are added. The full-authority session route uses memory
+        only. Job/command authority is never granted by enabling a slot.
         """
-        selected = EngineProxy(endpoint_id, port, input_files=input_files, output_roots=output_roots)
+        selected = EngineProxy(endpoint_id, port, input_files=input_files, output_roots=output_roots,
+                               session_bridge=session_bridge)
         with self.lock:
             current = self.engine_proxy
             if current is not None and current.configuration() != selected.configuration():
                 raise ValueError("the engine slot is already bound")
             if current is None and self.observation_policy is not None and selected.input_files:
                 self._enable_uploads()
-            _write_engine_bearer_file(self._engine_state_dir, self.token)
+            if persist_bearer:
+                _write_engine_bearer_file(self._engine_state_dir, self.token)
             self.engine_proxy = selected
 
     @contextmanager
@@ -663,14 +783,16 @@ class Handler(BaseHTTPRequestHandler):
                 or not hmac.compare_digest(authorization.encode(), ("Bearer " + self.server.token).encode())):
             self.close_connection = True
             return self.reply(401, {"error": "unauthorized"})
-        if self.server.engine_proxy is not None and (
-                self.headers.get("Upgrade") is not None or self.headers.get("Range") is not None
-                or "upgrade" in {v.strip().lower() for v in self.headers.get("Connection", "").split(",")}):
-            return self.reply(403, {"error": "HTTP-only engine surface"})
         parsed = urlsplit(self.path)
         query = parse_qs(parsed.query)
         path = parsed.path
         slot = self.server.engine_proxy
+        websocket = (slot is not None and slot.session_bridge and self.command == "GET"
+                     and path in {slot.prefix + "/ws", slot.prefix + "/api/ws"})
+        if slot is not None and (self.headers.get("Range") is not None or (not websocket and (
+                self.headers.get("Upgrade") is not None
+                or "upgrade" in {v.strip().lower() for v in self.headers.get("Connection", "").split(",")}))):
+            return self.reply(403, {"error": "HTTP-only engine surface"})
         engine_allowed = slot is not None and (
             path.startswith(slot.prefix + "/") or
             (slot.input_files and (path == "/uploads" or path.startswith("/uploads/"))))
@@ -680,14 +802,32 @@ class Handler(BaseHTTPRequestHandler):
                 and not engine_allowed):
             self.close_connection = True
             return self.reply(403, {"error": "forbidden"})
+        if self.command == "POST" and self.path == "/engine-proxy":
+            # The unrestricted bearer already grants arbitrary pod-user exec.
+            # Observation claims cannot configure destinations or expand access.
+            data = self.json_body()
+            if set(data) != {"endpoint_id", "port"}:
+                return self.reply(400, {"error": "invalid engine proxy fields"})
+            try:
+                EngineProxy(**data)
+            except (ValueError, TypeError):
+                return self.reply(400, {"error": "invalid engine proxy slot"})
+            try:
+                self.server.enable_engine(**data, session_bridge=True, persist_bearer=False)
+            except ValueError:
+                return self.reply(409, {"error": "the engine slot is already bound"})
+            return self.reply(200, {"endpoint_id": data["endpoint_id"], "port": data["port"]})
         if path.startswith("/engines/"):
             slot = self.server.engine_proxy
             if slot is None or not path.startswith(slot.prefix + "/"):
                 return self.reply(404, {"error": "unknown engine slot"})
             target = self.path[len(slot.prefix):]
-            if not engine_operation(self.command, target):
+            if not engine_operation(self.command, target, session_bridge=slot.session_bridge):
                 return self.reply(403, {"error": "engine operation denied"})
             try:
+                if websocket:
+                    return relay_websocket(self, http.client.HTTPConnection("127.0.0.1", slot.port,
+                                           timeout=ENGINE_TRANSFER_SECONDS), target)
                 return relay_engine(self, http.client.HTTPConnection("127.0.0.1", slot.port, timeout=ENGINE_TRANSFER_SECONDS), target)
             except (OSError, http.client.HTTPException):
                 # No response body, headers, token or upstream exception text.
