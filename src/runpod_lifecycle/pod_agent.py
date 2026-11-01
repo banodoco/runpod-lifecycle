@@ -121,6 +121,8 @@ def engine_operation(method, target, *, session_bridge=False):
         return ((session_bridge and path in {"/view", "/ws"})
                 or path in {"/object_info", "/system_stats", "/queue", "/history"}
                 or re.fullmatch(r"/(?:history|object_info)/[A-Za-z0-9_-]+", path) is not None)
+    if method == "POST" and session_bridge and parsed.path == "/upload/image":
+        return True
     return method == "POST" and path in {
         "/prompt", "/queue", "/interrupt", "/free"}
 

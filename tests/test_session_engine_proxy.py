@@ -52,6 +52,11 @@ def comfy():
         if request.path == '/prompt':
             facts['prompts'].append(await request.read())
             return web.json_response({'prompt_id': 'p1'})
+        if request.path == '/upload/image':
+            facts.setdefault('uploads', []).append((await request.read(), request.headers.get('Content-Type')))
+            if facts.get('upload_delay'):
+                await asyncio.sleep(facts['upload_delay'])
+            return web.json_response({'name': 'input.png', 'subfolder': '', 'type': 'input'})
         if request.path == '/view':
             response = web.StreamResponse(headers={'Content-Type': 'image/png'})
             await response.prepare(request)
@@ -128,7 +133,7 @@ def test_session_enable_rejects_invalid_conflicting_and_observation_claims(tmp_p
         transport.enable_engine_proxy('comfy', comfy['port'])
         with pytest.raises(PodTransportError, match='already bound'):
             transport.enable_engine_proxy('other', comfy['port'])
-        for path in ('/jobs', '/upload/image', '/%2fview', '/http://foreign/view'):
+        for path in ('/jobs', '/upload/mask', '/api/upload/image', '/%2fview', '/http://foreign/view'):
             assert transport.http.get('/engines/comfy' + path).status_code == 403
         assert transport.http.get('/engines/comfy/view', headers={'Range': 'bytes=0-4'}).status_code == 403
     policy = {'schema': OBSERVATION_SCHEMA, 'files': [str(tmp_path / 'public.json')], 'roots': []}
@@ -154,6 +159,59 @@ def test_session_websocket_frames_ping_close_and_header_filtering(tmp_path, comf
             assert ws.ping(b'ping').wait(3)
         assert all('Authorization' not in h and 'Cookie' not in h and 'X-Secret' not in h
                    for _, h in comfy['requests'])
+
+
+def test_session_upload_image_is_bounded_and_relayed_without_client_secrets(tmp_path, comfy, monkeypatch):
+    with running_agent(tmp_path) as (_, transport):
+        transport.enable_engine_proxy('comfy', comfy['port'])
+        url = str(transport.http.base_url) + '/engines/comfy'
+        payload = b'--upload\r\nContent-Disposition: form-data; name="image"; filename="input.png"\r\nContent-Type: image/png\r\n\r\nPNG\x00bytes\r\n--upload--\r\n'
+        with httpx.Client(trust_env=False) as client:
+            response = client.post(url + '/upload/image?overwrite=true', content=payload, headers={
+                'Authorization': 'Bearer ' + TOKEN,
+                'Content-Type': 'multipart/form-data; boundary=upload',
+                'Cookie': 'private', 'X-Secret': TOKEN})
+            assert response.status_code == 200
+            assert response.json() == {'name': 'input.png', 'subfolder': '', 'type': 'input'}
+            assert client.post(url + '/upload/mask', content=payload,
+                               headers={'Authorization': 'Bearer ' + TOKEN}).status_code == 403
+            assert client.post(url + '/api/upload/image', content=payload,
+                               headers={'Authorization': 'Bearer ' + TOKEN}).status_code == 403
+            assert client.get(url + '/upload/image', headers={
+                'Authorization': 'Bearer ' + TOKEN}).status_code == 403
+            unauthenticated = client.post(url + '/upload/image', content=payload,
+                                          headers={'Content-Type': 'multipart/form-data; boundary=upload'})
+            assert unauthenticated.status_code == 401
+        import http.client
+        for framing in ('oversized', 'chunked'):
+            connection = http.client.HTTPConnection(transport.http.base_url.host,
+                                                     transport.http.base_url.port, timeout=3)
+            connection.putrequest('POST', '/engines/comfy/upload/image')
+            connection.putheader('Authorization', 'Bearer ' + TOKEN)
+            connection.putheader('Content-Type', 'multipart/form-data; boundary=upload')
+            if framing == 'oversized':
+                connection.putheader('Content-Length', str(1024 * 1024 * 1024 + 1))
+            else:
+                connection.putheader('Transfer-Encoding', 'chunked')
+            connection.endheaders()
+            response = connection.getresponse()
+            assert response.status == 400
+            response.read()
+            connection.close()
+        assert comfy['uploads'][0] == (payload, 'multipart/form-data; boundary=upload')
+        import time
+        from runpod_lifecycle import pod_agent
+        assert pod_agent.ENGINE_TRANSFER_SECONDS == 15
+        monkeypatch.setattr(pod_agent, 'ENGINE_TRANSFER_SECONDS', 0.15)
+        comfy['upload_delay'] = 0.5
+        started = time.monotonic()
+        timed_out = httpx.post(url + '/upload/image', content=payload, headers={
+            'Authorization': 'Bearer ' + TOKEN,
+            'Content-Type': 'multipart/form-data; boundary=upload'}, trust_env=False, timeout=3)
+        assert timed_out.status_code == 502 and time.monotonic() - started < 1
+        assert len(comfy['requests']) == 2
+        assert all('Authorization' not in headers and 'Cookie' not in headers and 'X-Secret' not in headers
+                   for _, headers in comfy['requests'])
 
 
 @pytest.mark.parametrize('status,reason', [
