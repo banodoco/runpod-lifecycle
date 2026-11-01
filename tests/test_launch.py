@@ -11,6 +11,28 @@ from runpod_lifecycle.lifecycle import launch, launch_when_available, resume_whe
 from runpod_lifecycle.pod import Pod
 
 
+@pytest.mark.parametrize("volume_id", [None, "volume-accepted"])
+def test_exact_accepted_placement_reaches_create_without_name_resolution_or_expansion(
+    volumeless_config, monkeypatch, volume_id,
+):
+    def forbidden(*args, **kwargs):
+        pytest.fail("exact placement attempted a fallback resolver or volume mutation")
+    for method in ("find_gpu_type", "get_storage_volume_id", "get_network_volumes", "check_and_expand_storage"):
+        monkeypatch.setattr("runpod_lifecycle.lifecycle." + method, forbidden)
+    create = MagicMock(return_value={"id": "pod-exact"})
+    monkeypatch.setattr("runpod_lifecycle.lifecycle.create_pod", create)
+    config = volumeless_config.merge(
+        network_volume_id=volume_id, data_center_id="DC-exact", gpu_type_id="gpu-exact",
+        ram_tiers_enabled=False, attach_only=volume_id is not None,
+    )
+    pod = asyncio.run(launch_when_available(config, name="exact", max_wait_sec=1))
+    assert pod.id == "pod-exact"
+    assert create.call_count == 1
+    assert create.call_args.kwargs["gpu_type_id"] == "gpu-exact"
+    assert create.call_args.kwargs["network_volume_id"] == volume_id
+    assert create.call_args.kwargs["data_center_id"] == "DC-exact"
+
+
 def test_launch_happy_path_returns_pod_and_emits_provisioning(
     base_config,
     monkeypatch: pytest.MonkeyPatch,

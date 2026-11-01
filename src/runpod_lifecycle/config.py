@@ -205,8 +205,18 @@ class RunPodConfig:
     min_cuda_version: str | None = None
     # Trusted startup selection (non-secret); see engine_startup.py.
     engine_startup: dict[str, Any] | None = None
+    # Exact accepted placement. ID mode never resolves names or grows storage.
+    network_volume_id: str | None = None
+    data_center_id: str | None = None
+    gpu_type_id: str | None = None
 
     def __post_init__(self) -> None:
+        for name in ("network_volume_id", "data_center_id", "gpu_type_id"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip() or value != value.strip()):
+                raise ValueError(f"{name} must be a nonempty exact identifier")
+        if self.network_volume_id is not None and (self.storage_name or self.storage_volumes):
+            raise ValueError("exact network volume ID cannot be combined with storage names")
         if self.transport not in {"ssh", "https"}:
             raise ValueError("transport must be ssh or https")
         if self.transport == "https" and self.template_id == DEFAULT_TEMPLATE_ID:
@@ -227,6 +237,8 @@ class RunPodConfig:
             # Re-normalize tuples to strip empties / whitespace consistently.
             object.__setattr__(self, "gpu_type", _normalize_gpu_type(self.gpu_type))
         object.__setattr__(self, "allowed_cuda_versions", _normalize_cuda_versions(self.allowed_cuda_versions))
+        if self.gpu_type_id is not None and len(self.gpu_type_candidates) != 1:
+            raise ValueError("exact GPU ID requires one GPU candidate")
         if self.min_cuda_version is not None:
             object.__setattr__(self, "min_cuda_version", _normalize_cuda_versions((self.min_cuda_version,))[0])
             if self.allowed_cuda_versions:

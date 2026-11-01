@@ -1,5 +1,23 @@
 from __future__ import annotations
 
+
+def test_exact_placement_merge_and_conflicting_storage_names():
+    from runpod_lifecycle.config import RunPodConfig
+    import pytest
+
+    config = RunPodConfig(api_key="fake", network_volume_id="exact", data_center_id="DC", gpu_type_id="gpu")
+    assert config.merge(data_center_id="other").network_volume_id == "exact"
+    assert config.merge(data_center_id="other").data_center_id == "other"
+    with pytest.raises(ValueError, match="storage names"):
+        config.merge(storage_name="storage")
+    with pytest.raises(ValueError, match="storage names"):
+        config.merge(storage_volumes=("storage",))
+    with pytest.raises(ValueError, match="one GPU"):
+        config.merge(gpu_type=("gpu-a", "gpu-b"))
+    for field in ("network_volume_id", "data_center_id", "gpu_type_id"):
+        with pytest.raises(ValueError, match="identifier"):
+            config.merge(**{field: " "})
+
 import pytest
 
 from runpod_lifecycle.config import RunPodConfig, load_runpod_env

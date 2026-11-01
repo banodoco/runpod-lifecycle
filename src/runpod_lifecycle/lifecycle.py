@@ -68,6 +68,8 @@ def _build_ram_tiers(config: RunPodConfig) -> list[int]:
 
 
 async def _resolve_storage_targets(config: RunPodConfig) -> list[tuple[str | None, str | None]]:
+    if config.network_volume_id is not None:
+        return [(None, config.network_volume_id)]
     raw_targets: list[str] = []
     for storage_name in [config.storage_name, *config.storage_volumes]:
         if storage_name and storage_name not in raw_targets:
@@ -126,7 +128,8 @@ async def _try_launch_one_gpu(
     Returns a launched Pod on success, otherwise raises ``_GpuCandidateFailure``
     summarising the per-pair errors for this candidate.
     """
-    gpu_info = await asyncio.to_thread(find_gpu_type, gpu_type, config.api_key)
+    gpu_info = ({"id": config.gpu_type_id} if config.gpu_type_id is not None
+                else await asyncio.to_thread(find_gpu_type, gpu_type, config.api_key))
     if not gpu_info:
         raise _GpuCandidateFailure(
             gpu_type=gpu_type,
@@ -149,7 +152,8 @@ async def _try_launch_one_gpu(
                 }
             )
 
-            if storage_volume_id and not config.attach_only and storage_volume_id not in expanded_storage_ids:
+            if (storage_volume_id and config.network_volume_id is None
+                    and not config.attach_only and storage_volume_id not in expanded_storage_ids):
                 await asyncio.to_thread(
                     check_and_expand_storage,
                     config.api_key,
@@ -168,6 +172,7 @@ async def _try_launch_one_gpu(
                     image_name=config.worker_image,
                     name=pod_name,
                     network_volume_id=storage_volume_id,
+                    data_center_id=config.data_center_id,
                     volume_mount_path=config.volume_mount_path,
                     disk_in_gb=config.disk_size_gb,
                     container_disk_in_gb=config.container_disk_gb,
@@ -270,7 +275,9 @@ async def launch(
     for value in [config.storage_name, *config.storage_volumes]:
         if value and value not in input_storages:
             input_storages.append(value)
-    if (input_storages and not storage_targets) or (config.attach_only and not input_storages):
+    if (input_storages and not storage_targets) or (
+        config.attach_only and not input_storages and config.network_volume_id is None
+    ):
         error = LaunchFailure(
             f"Attach-only requires a resolved existing storage volume: {', '.join(input_storages)}"
             if config.attach_only else
