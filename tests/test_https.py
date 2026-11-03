@@ -75,6 +75,61 @@ def test_job_offsets_idempotency_and_binary_logs(agent):
     assert client.execute_command("printf hello; printf error >&2; exit 3") == (3, "hello", "error")
 
 
+def test_completed_jobs_are_evicted_after_both_streams_reach_eof(agent):
+    server, client = agent
+    command = "printf before; printf err-before >&2; sleep 1; printf after; printf err-after >&2"
+    job = client.start(command)
+    directory = server.jobs[job]["directory"]
+    out, err, offsets = b"", b"", (0, 0)
+    first = client.poll(job, *offsets)
+    out += base64.b64decode(first["stdout"])
+    err += base64.b64decode(first["stderr"])
+    offsets = first["stdout_offset"], first["stderr_offset"]
+    assert first["status"] == "running"
+    assert first["stdout_eof"] and first["stderr_eof"]
+    assert job in server.jobs and directory.is_dir()
+
+    while True:
+        result = client.poll(job, *offsets)
+        out += base64.b64decode(result["stdout"])
+        err += base64.b64decode(result["stderr"])
+        offsets = result["stdout_offset"], result["stderr_offset"]
+        if result["status"] == "exited" and result["stdout_eof"] and result["stderr_eof"]:
+            break
+    assert out == b"beforeafter" and err == b"err-beforeerr-after"
+    # Keep the final response record for a retry of the just-drained GET.
+    assert job in server.jobs and directory.is_dir()
+    assert client.start(command, job_id=job) == job
+    client.start("true")
+    assert job not in server.jobs and not directory.exists()
+
+
+def test_sequential_commands_reuse_the_claim_job_capacity(agent):
+    server, client = agent
+    for index in range(130):
+        assert client.execute_command(f"printf {index}") == (0, str(index), "")
+    assert len(server.jobs) <= 1
+    assert len(list(server.state_dir.iterdir())) <= 1
+
+
+def test_delete_cleans_output_after_exit_and_retires_record_on_next_start(agent):
+    server, client = agent
+    job_id = client.start("sleep 30")
+    directory = server.jobs[job_id]["directory"]
+    assert client.cancel(job_id) is None
+    for _ in range(200):
+        if not directory.exists():
+            break
+        time.sleep(0.01)
+    assert job_id in server.jobs
+    assert not directory.exists()
+    assert client.cancel(job_id) is None
+    next_job = client.start("true")
+    assert job_id not in server.jobs
+    result = client.poll(next_job)
+    assert result["status"] == "exited" and result["stdout_eof"] and result["stderr_eof"]
+
+
 def test_cancel_and_command_timeout(agent):
     server, client = agent
     code, _, stderr = client.execute_command("sleep 30", timeout=0.1)
@@ -583,18 +638,17 @@ def test_detached_poll_rejects_bad_job_id_before_any_request(agent, tmp_path, jo
     assert seen == []
 
 
-def test_rate_limit_error_names_status_and_body_without_retrying(agent):
+def test_rate_limit_error_names_status_and_body_without_retrying(agent, monkeypatch):
     server, client = agent
+    monkeypatch.setattr(server, "cancel", lambda _job: None)
 
-    class Finished:
-        pid = 0
-
+    class Running:
         def poll(self):
-            return 0
+            return None
 
-    # Stand-in records fill the 128-record cap, so the agent's own 429 is real.
+    # Stand-in processes fill the 128 active-job cap, so the agent's own 429 is real.
     for index in range(128):
-        server.jobs[f"{index:032x}"] = {"process": Finished(), "directory": None, "command": "true"}
+        server.jobs[f"{index:032x}"] = {"process": Running(), "directory": None, "command": "true"}
     seen = _record_requests(client)
     with pytest.raises(PodTransportError, match=r"HTTP 429; body: .*job limit reached; rotate claim") as caught:
         client.start("echo hi")

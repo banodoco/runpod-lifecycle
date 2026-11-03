@@ -14,6 +14,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import socket
 import signal
 import stat
@@ -656,6 +657,30 @@ class AgentServer(ThreadingHTTPServer):
                 process.wait()
             threading.Thread(target=reap, daemon=True).start()
 
+    def cleanup_job_directory(self, job):
+        """Remove completed output files while holding ``lock``."""
+        if job["process"].poll() is None:
+            return False
+        directory = job.get("directory")
+        if directory is not None:
+            try:
+                shutil.rmtree(directory)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
+            job["directory"] = None
+        return True
+
+    def evict_drained_jobs(self):
+        """Drop replay records from prior jobs after a new ID is admitted."""
+        for job_id, job in list(self.jobs.items()):
+            complete = job["process"].poll() is not None
+            drained = job.get("stdout_eof") and job.get("stderr_eof")
+            if complete and (drained or job.get("delete_requested")):
+                if self.cleanup_job_directory(job):
+                    del self.jobs[job_id]
+
     def finish_upload(self, meta, state):
         try:
             with self.upload_stream(state, "rb") as stream:
@@ -846,7 +871,8 @@ class Handler(BaseHTTPRequestHandler):
                 old = self.server.jobs.get(job_id)
                 if old:
                     return self.reply(200 if old["command"] == command else 409, {"id": job_id})
-                if len(self.server.jobs) >= 128:
+                self.server.evict_drained_jobs()
+                if sum(job["process"].poll() is None for job in self.server.jobs.values()) >= 128:
                     return self.reply(429, {"error": "job limit reached; rotate claim"})
                 directory = self.server.state_dir / job_id
                 directory.mkdir(mode=0o700)
@@ -855,30 +881,50 @@ class Handler(BaseHTTPRequestHandler):
                 with (directory / "stdout").open("wb") as stdout, (directory / "stderr").open("wb") as stderr:
                     process = subprocess.Popen(command, shell=True, executable="/bin/bash", stdin=subprocess.DEVNULL,
                                                stdout=stdout, stderr=stderr, env=environment, start_new_session=True)
-                self.server.jobs[job_id] = {"process": process, "directory": directory, "command": command}
+                self.server.jobs[job_id] = {"process": process, "directory": directory, "command": command,
+                                            "stdout_eof": False, "stderr_eof": False,
+                                            "delete_requested": False}
             return self.reply(202, {"id": job_id})
         if path.startswith("/jobs/"):
             job_id = path.removeprefix("/jobs/")
-            job = self.server.jobs.get(job_id)
-            if not job:
-                return self.reply(404, {"error": "unknown job"})
-            if self.command == "DELETE":
-                self.server.cancel(job)
-                return self.reply(202, {"id": job_id})
-            if self.command == "GET":
-                code = job["process"].poll()
-                result = {"id": job_id, "status": "running" if code is None else "exited", "exit_code": code}
-                for name in ("stdout", "stderr"):
-                    offset = int(query.get(name, ["0"])[0])
-                    if offset < 0:
-                        raise ValueError("negative offset")
-                    with (job["directory"] / name).open("rb") as stream:
-                        stream.seek(offset)
-                        chunk = stream.read(OUTPUT_CHUNK)
-                        result[name] = base64.b64encode(chunk).decode()
-                        result[name + "_offset"] = offset + len(chunk)
-                        result[name + "_eof"] = stream.tell() == os.fstat(stream.fileno()).st_size
-                return self.reply(200, result)
+            with self.server.lock:
+                job = self.server.jobs.get(job_id)
+                if not job:
+                    return self.reply(404, {"error": "unknown job"})
+                if self.command == "DELETE":
+                    job["delete_requested"] = True
+                    self.server.cancel(job)
+                    if job["process"].poll() is not None:
+                        self.server.cleanup_job_directory(job)
+                    else:
+                        def reap_deleted():
+                            job["process"].wait()
+                            with self.server.lock:
+                                if job.get("delete_requested"):
+                                    self.server.cleanup_job_directory(job)
+                        threading.Thread(target=reap_deleted, daemon=True).start()
+                    return self.reply(202, {"id": job_id})
+                if self.command == "GET":
+                    if job.get("directory") is None:
+                        return self.reply(404, {"error": "unknown job"})
+                    code = job["process"].poll()
+                    result = {"id": job_id, "status": "running" if code is None else "exited", "exit_code": code}
+                    for name in ("stdout", "stderr"):
+                        offset = int(query.get(name, ["0"])[0])
+                        if offset < 0:
+                            raise ValueError("negative offset")
+                        with (job["directory"] / name).open("rb") as stream:
+                            stream.seek(offset)
+                            chunk = stream.read(OUTPUT_CHUNK)
+                            result[name] = base64.b64encode(chunk).decode()
+                            result[name + "_offset"] = offset + len(chunk)
+                            eof = stream.tell() == os.fstat(stream.fileno()).st_size
+                            result[name + "_eof"] = eof
+                            if code is not None and eof:
+                                job[name + "_eof"] = True
+                    # Keep this terminal response available if the final GET
+                    # reply is lost; a later distinct POST retires it.
+                    return self.reply(200, result)
         if path == "/uploads" and self.command == "POST":
             data = self.json_body()
             if self.server.observation_policy is not None:
