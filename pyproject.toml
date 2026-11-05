@@ -9,7 +9,7 @@ description = "Reusable async RunPod lifecycle management package."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "runpod>=1.6.0",
+  "runpod @ git+https://github.com/peteromallet/runpod-python.git@4f6c831ff804d21aa75ad5817533f00751320142",
   "paramiko>=3.0.0",
   "requests>=2.31.0",
   "httpx>=0.25.0",
@@ -31,3 +31,6 @@ packages = ["src/runpod_lifecycle"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+[tool.hatch.metadata]
+allow-direct-references = true
