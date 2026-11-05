@@ -1,0 +1,123 @@
+{
+  "observed_at": "2026-10-27T15:02:26.679800+00:00",
+  "source": "https://api.runpod.io/graphql",
+  "constraints": {
+    "gpuCount": 1,
+    "secureCloud": true,
+    "minDisk": 100,
+    "allowedCudaVersions": [
+      "13.0"
+    ]
+  },
+  "catalogue": {
+    "data": {
+      "gpuTypes": [
+        {
+          "id": "NVIDIA GeForce RTX 5090",
+          "displayName": "RTX 5090",
+          "memoryInGb": 32
+        }
+      ]
+    }
+  },
+  "datacenters": {
+    "data": {
+      "dataCenters": [
+        {
+          "id": "EU-CZ-1",
+          "name": "EU-CZ-1",
+          "location": "Europe",
+          "storageSupport": true,
+          "gpuAvailability": [
+            {
+              "gpuTypeId": "NVIDIA GeForce RTX 5090",
+              "available": false,
+              "stockStatus": null
+            }
+          ]
+        },
+        {
+          "id": "EU-RO-1",
+          "name": "EU-RO-1",
+          "location": "Europe",
+          "storageSupport": true,
+          "gpuAvailability": [
+            {
+              "gpuTypeId": "NVIDIA GeForce RTX 5090",
+              "available": false,
+              "stockStatus": null
+            }
+          ]
+        },
+        {
+          "id": "EUR-IS-1",
+          "name": "EUR-IS-1",
+          "location": "Europe",
+          "storageSupport": true,
+          "gpuAvailability": [
+            {
+              "gpuTypeId": "NVIDIA GeForce RTX 5090",
+              "available": false,
+              "stockStatus": null
+            }
+          ]
+        },
+        {
+          "id": "EUR-IS-2",
+          "name": "EUR-IS-2",
+          "location": "Europe",
+          "storageSupport": true,
+          "gpuAvailability": [
+            {
+              "gpuTypeId": "NVIDIA GeForce RTX 5090",
+              "available": false,
+              "stockStatus": null
+            }
+          ]
+        },
+        {
+          "id": "EUR-NO-1",
+          "name": "EUR-NO-1",
+          "location": "Europe",
+          "storageSupport": true,
+          "gpuAvailability": [
+            {
+              "gpuTypeId": "NVIDIA GeForce RTX 5090",
+              "available": false,
+              "stockStatus": null
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "prices": {
+    "data": {
+      "gpuTypes": [
+        {
+          "id": "NVIDIA GeForce RTX 5090",
+          "dc0": {
+            "stockStatus": null,
+            "uninterruptablePrice": null
+          },
+          "dc1": {
+            "stockStatus": null,
+            "uninterruptablePrice": null
+          },
+          "dc2": {
+            "stockStatus": null,
+            "uninterruptablePrice": null
+          },
+          "dc3": {
+            "stockStatus": null,
+            "uninterruptablePrice": null
+          },
+          "dc4": {
+            "stockStatus": null,
+            "uninterruptablePrice": null
+          }
+        }
+      ]
+    }
+  }
+}

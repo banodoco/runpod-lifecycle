@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 from dataclasses import asdict, is_dataclass
 import json
+import math
 import os
 import re
 import shlex
@@ -18,14 +19,18 @@ from typing import Any
 
 from . import api, config as cfg, discovery
 from .config import RunPodConfig, load_runpod_env
+from .events import EventHooks, PodEvent, PodState
+from .errors import AllocationUnknown
 from .guard import PodGuard, install_signal_handlers
 from .lifecycle import (
+    _CapacityLaunchFailure,
     find_gpu_type,
     get_network_volumes,
     launch as _launch,
     launch_when_available as _launch_when_available,
     resume_when_available as _resume_when_available,
 )
+from .https import DETACHED_ROOT, _detached_directory
 from .pod import Pod
 from .prebuilt import (
     PrebuiltEnvContract,
@@ -45,6 +50,7 @@ from .prebuilt import (
     write_manifest,
 )
 from .probe import probe as _probe
+from .availability import gpu_availability as _gpu_availability
 from .ssh import SSHClient
 
 
@@ -145,6 +151,7 @@ def _resolve_config(args: argparse.Namespace) -> RunPodConfig:
     # These are the CLI's explicit config overrides. ``None`` means the
     # option was not supplied and therefore must be left to from_env().
     option_fields = {
+        "transport": "transport",
         "gpu_type": "gpu_type",
         "worker_image": "image",
         "container_disk_gb": "container_disk_gb",
@@ -178,7 +185,16 @@ def _resolve_config(args: argparse.Namespace) -> RunPodConfig:
             raise ValueError("--allowed-cuda-versions must contain at least one version")
         overrides["allowed_cuda_versions"] = parsed_cuda_versions
 
-    return RunPodConfig.from_env(**overrides)
+    engine_startup_arg = getattr(args, "engine_startup", None)
+    if engine_startup_arg is not None:
+        from .engine_startup import load_engine_startup
+        overrides["engine_startup"] = load_engine_startup(engine_startup_arg)
+
+    config = RunPodConfig.from_env(**overrides)
+    if config.transport == "https":
+        if not os.environ.get("RUNPOD_HTTPS_TOKEN_FILE") and not os.environ.get("RUNPOD_HTTPS_TOKEN"):
+            raise ValueError("HTTPS CLI requires RUNPOD_HTTPS_TOKEN_FILE (owned 0600 file); generate once per claim")
+    return config
 
 
 def _parse_duration(text: str) -> int:
@@ -301,6 +317,12 @@ async def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_mounts(args: argparse.Namespace) -> int:
+    observation = await discovery.observe_pod_mounts(args.pod_id, _resolve_api_key(args), args.nonce)
+    print(json.dumps(observation, separators=(",", ":")))
+    return 0
+
+
 async def _cmd_resume(args: argparse.Namespace) -> int:
     api_key = _resolve_api_key(args)
     pod = Pod(
@@ -384,20 +406,73 @@ async def _cmd_gpu_types(args: argparse.Namespace) -> int:
 # -- Sprint 4 verbs --------------------------------------------------------
 
 
+def _write_capacity_progress(fd: int, line: str) -> None:
+    try:
+        os.write(fd, line.encode("ascii"))
+    except OSError:
+        # A progress consumer must not change allocation or retry behavior.
+        pass
+
+
+def _capacity_wait_progress(event: PodEvent, *, fd: int) -> None:
+    """Publish only the numeric retry fields, never the hook's provider details."""
+    if event.pod_id is not None or event.state != PodState.PROVISIONING:
+        return
+    detail = event.detail
+    attempt = detail.get("attempt")
+    retry = detail.get("retry_in_sec")
+    wait = detail.get("max_wait_sec")
+    if type(attempt) is not int or attempt < 1 or type(wait) is not int or wait < 1:
+        return
+    if type(retry) not in (int, float) or not math.isfinite(retry) or retry <= 0:
+        return
+    payload = {"placement_attempt": attempt, "retry_interval": retry, "wait_seconds": wait}
+    line = "RUNPOD_CAPACITY_WAIT " + json.dumps(payload, separators=(",", ":")) + "\n"
+    _write_capacity_progress(fd, line)
+
+
 async def _cmd_launch(args: argparse.Namespace) -> int:
     """Launch a new RunPod pod. With --detach, prints details and exits 0."""
     config = _resolve_config(args)
     name = getattr(args, "name", None)
     pod: Pod | None = None
-    if getattr(args, "wait_capacity", None):
-        pod = await _launch_when_available(
-            config,
-            name=name,
-            max_wait_sec=args.wait_capacity,
-            retry_interval_sec=args.retry_interval,
-        )
-    else:
-        pod = await _launch(config, name=name)
+    progress_fd = getattr(args, "capacity_progress_fd", None)
+    attempt = 0
+
+    def start_attempt(index: int) -> None:
+        nonlocal attempt
+        attempt = index
+        if progress_fd is not None:
+            payload = {"placement_attempt": index}
+            _write_capacity_progress(progress_fd, "RUNPOD_PLACEMENT_ATTEMPT " + json.dumps(payload, separators=(",", ":")) + "\n")
+
+    try:
+        if getattr(args, "wait_capacity", None):
+            hooks = (EventHooks(on_state_change=lambda event: _capacity_wait_progress(event, fd=progress_fd))
+                     if progress_fd is not None else None)
+            pod = await _launch_when_available(
+                config,
+                name=name,
+                hooks=hooks,
+                max_wait_sec=args.wait_capacity,
+                retry_interval_sec=args.retry_interval,
+                on_attempt=start_attempt,
+            )
+        else:
+            start_attempt(1)
+            pod = await _launch(config, name=name)
+    except _CapacityLaunchFailure:
+        if progress_fd is not None:
+            _write_capacity_progress(progress_fd, "RUNPOD_CAPACITY_EXHAUSTED\n")
+        raise
+    except Exception as exc:
+        if progress_fd is not None and attempt:
+            payload = {
+                "classification": "allocation_unknown" if isinstance(exc, AllocationUnknown) else "non_capacity_failure",
+                "placement_attempt": attempt,
+            }
+            _write_capacity_progress(progress_fd, "RUNPOD_TERMINAL_FAILURE " + json.dumps(payload, separators=(",", ":")) + "\n")
+        raise
 
     if getattr(args, "probe_only", False):
         info = {
@@ -410,6 +485,7 @@ async def _cmd_launch(args: argparse.Namespace) -> int:
             "gpu_type_candidates": list(config.gpu_type_candidates),
             "storage_candidates": _unique_values([config.storage_name, *config.storage_volumes]),
             "terminated": False,
+            **_claim_record(pod),
         }
         try:
             await pod.terminate()
@@ -423,13 +499,13 @@ async def _cmd_launch(args: argparse.Namespace) -> int:
 
     await pod.wait_ready(timeout=getattr(args, "timeout", 600))
 
-    ssh_details = await pod._ensure_ssh_details()
-    info = {
-        "pod_id": pod.id,
-        "name": pod.name,
-        "ssh": f"root@{ssh_details['ip']} -p {ssh_details['port']}",
-        "gpu_type": config.gpu_type,
-    }
+    if config.transport == "https":
+        from .https import pod_url
+        route = {"https": pod_url(pod.id), "transport": "https"}
+    else:
+        ssh_details = await pod._ensure_ssh_details()
+        route = {"ssh": f"root@{ssh_details['ip']} -p {ssh_details['port']}"}
+    info = {"pod_id": pod.id, "name": pod.name, "gpu_type": config.gpu_type, **route, **_claim_record(pod)}
     print(json.dumps(info, indent=2))
 
     if not getattr(args, "detach", False):
@@ -442,6 +518,12 @@ async def _cmd_launch(args: argparse.Namespace) -> int:
             await pod.terminate()
             print(f"terminated {pod.id}")
     return 0
+
+
+def _claim_record(pod: Pod) -> dict[str, str]:
+    """Per-claim private state, for the claim handle (engine startup only)."""
+    state = getattr(pod, "_engine_state_dir", None)
+    return {"claim_id": pod.claim_id, "state_dir": state} if state and pod.claim_id else {}
 
 
 async def _cmd_exec(args: argparse.Namespace) -> int:
@@ -486,6 +568,35 @@ async def _cmd_fetch(args: argparse.Namespace) -> int:
     else:
         print("no artifacts found", file=sys.stderr)
         return 1
+    return 0
+
+
+async def _cmd_job(args: argparse.Namespace) -> int:
+    """Detached job start/poll/cancel over HTTPS. Jobs outlive client timeouts."""
+    if args.job_cmd != "start":
+        try:
+            # Reject a malformed job ID or root before any pod discovery or request.
+            _detached_directory(args.root, args.job_id)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    config = _resolve_config(args)
+    if config.transport != "https":
+        print("error: job verbs require --transport https", file=sys.stderr)
+        return 2
+    pod = await discovery.get_pod(args.pod_id, config)
+    await pod.wait_ready(timeout=60)
+    client = pod.https_transport()
+    try:
+        if args.job_cmd == "start":
+            result = await asyncio.to_thread(client.detached_start, args.command, root=args.root)
+        elif args.job_cmd == "poll":
+            result = await asyncio.to_thread(client.detached_poll, args.job_id, root=args.root)
+        else:
+            result = await asyncio.to_thread(client.detached_cancel, args.job_id, root=args.root)
+    finally:
+        client.disconnect()
+    print(json.dumps(result, sort_keys=True))
     return 0
 
 
@@ -589,6 +700,26 @@ async def _cmd_volume_create(args: argparse.Namespace) -> int:
         return 1
 
 
+async def _cmd_availability(args: argparse.Namespace) -> int:
+    """Read-only provider stock discovery; always emit a typed JSON result."""
+    result = await _gpu_availability(
+        api_key=_resolve_api_key(args),
+        gpu=args.gpu,
+        min_cuda_version=args.min_cuda_version,
+        datacenter_ids=(
+            [d.strip() for d in args.datacenter_ids.split(",") if d.strip()]
+            if args.datacenter_ids is not None
+            else None
+        ),
+        require_secure_cloud=not args.allow_community_cloud,
+        require_network_volume=not args.allow_no_network_volume,
+        container_disk_gb=args.container_disk_gb,
+        allowed_cuda_versions=_resolve_cli_cuda_versions(args),
+    )
+    print(json.dumps(result.to_dict(), indent=2))
+    return {"available": 0, "unavailable": 2, "unknown": 3}[result.status]
+
+
 async def _cmd_probe(args: argparse.Namespace) -> int:
     """Query RunPod for currently-launchable GPU configs (no pod created)."""
     api_key = _resolve_api_key(args)
@@ -598,10 +729,10 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
         gpu_types_arg = [g.strip() for g in args.gpu_types.split(",") if g.strip()] or None
 
     datacenter_ids: list[str] | None = None
-    if getattr(args, "datacenter_ids", None):
+    if getattr(args, "datacenter_ids", None) is not None:
         datacenter_ids = [
             d.strip() for d in args.datacenter_ids.split(",") if d.strip()
-        ] or None
+        ]
 
     results = await _probe(
         api_key=api_key,
@@ -610,6 +741,7 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
         max_price_per_hour=args.max_price,
         require_secure_cloud=not args.allow_community_cloud,
         exclude_blackwell=args.exclude_blackwell,
+        min_cuda_version=getattr(args, "min_cuda_version", None),
         allowed_cuda_versions=_resolve_cli_cuda_versions(args),
         container_disk_gb=args.container_disk_gb,
         datacenter_ids=datacenter_ids,
@@ -2057,8 +2189,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="runpod-lifecycle",
         description="RunPod pod lifecycle CLI.",
     )
+    parser.add_argument("--transport", choices=("ssh", "https"), default=None)
     parser.add_argument("--api-key", help="Override RUNPOD_API_KEY env var.")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    from .transport_smoke import register_parser
+    register_parser(sub)
 
     # --- legacy verbs (unchanged from v0.1) ---------------------------------
 
@@ -2068,6 +2204,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="Show normalized status for a pod.")
     p_status.add_argument("pod_id")
+
+    p_mounts = sub.add_parser("mounts", help="Read fresh exact-pod typed mount evidence (JSON).")
+    p_mounts.add_argument("pod_id")
+    p_mounts.add_argument("--nonce", required=True, help="Invocation nonce: 32 lowercase hexadecimal characters.")
+    p_mounts.add_argument("--json", action="store_true", required=True)
 
     p_resume = sub.add_parser(
         "resume",
@@ -2148,6 +2289,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Defaults to RUNPOD_STORAGE_VOLUMES."
         ),
     )
+    p_launch.add_argument(
+        "--engine-startup",
+        metavar="FILE",
+        help=(
+            "Absolute path of a local astrid.engine-startup.v1 JSON file selecting the one trusted "
+            "vibecomfy-h3 engine slot and private agent state directory (HTTPS transport only)."
+        ),
+    )
     p_launch.add_argument("--timeout", type=int, default=600, help="Seconds to wait for pod readiness.")
     p_launch.add_argument("--datacenter-id", help="Datacenter ID (e.g. US-TX-1).")
     p_launch.add_argument(
@@ -2159,7 +2308,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--wait-capacity",
         type=int,
         default=0,
-        help="Seconds to keep retrying the requested GPU/storage matrix before failing.",
+        help=(
+            "Seconds to retry the requested GPU/storage matrix per launch invocation. "
+            "Callers trying separate GPU/datacenter placements can wait this long for each, "
+            "so total time can exceed this value."
+        ),
     )
     p_launch.add_argument(
         "--retry-interval",
@@ -2167,6 +2320,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=30,
         help="Seconds between --wait-capacity launch attempts.",
     )
+    p_launch.add_argument("--capacity-progress-fd", type=int, help=argparse.SUPPRESS)
 
     p_exec = sub.add_parser("exec", help="Execute a command on an existing pod via SSH.")
     p_exec.add_argument("pod_id")
@@ -2185,6 +2339,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_fetch.add_argument("pod_id")
     p_fetch.add_argument("--remote", required=True, help="Remote root path on pod (e.g. /workspace).")
     p_fetch.add_argument("--local", required=True, help="Local destination directory.")
+
+    p_job = sub.add_parser("job", help="Detached pod jobs over HTTPS: start, poll, cancel.")
+    job_sub = p_job.add_subparsers(dest="job_cmd", required=True)
+    p_job_start = job_sub.add_parser("start", help="Run a shell command detached on the pod volume; prints JSON.")
+    p_job_start.add_argument("pod_id")
+    p_job_start.add_argument("--command", required=True, help="Shell command to run detached.")
+    p_job_start.add_argument("--root", default=DETACHED_ROOT, help="Absolute volume directory for job state.")
+    p_job_poll = job_sub.add_parser("poll", help="Print a detached job's state and exit code as JSON.")
+    p_job_poll.add_argument("pod_id")
+    p_job_poll.add_argument("job_id")
+    p_job_poll.add_argument("--root", default=DETACHED_ROOT, help="Absolute volume directory for job state.")
+    p_job_cancel = job_sub.add_parser("cancel", help="Signal a detached job's process group; prints JSON.")
+    p_job_cancel.add_argument("pod_id")
+    p_job_cancel.add_argument("job_id")
+    p_job_cancel.add_argument("--root", default=DETACHED_ROOT, help="Absolute volume directory for job state.")
 
     p_run = sub.add_parser("run", help="Ship a script file and run it on a pod (sync composite).")
     p_run.add_argument("pod_id")
@@ -2212,6 +2381,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_vol_create.add_argument("name")
     p_vol_create.add_argument("size_gb", type=int)
     p_vol_create.add_argument("--datacenter", required=True, help="Datacenter ID (e.g. US-TX-1).")
+
+    p_availability = sub.add_parser(
+        "availability",
+        help="Read-only GPU stock by data center (JSON; Secure Cloud/network storage by default).",
+    )
+    p_availability.add_argument(
+        "--gpu",
+        required=True,
+        help="Exact provider GPU display name or ID, e.g. RTX 5090.",
+    )
+    p_availability.add_argument(
+        "--datacenter-ids", help="Comma-separated data-center ID allow-list."
+    )
+    p_availability.add_argument(
+        "--allowed-cuda-versions",
+        help="Comma-separated allowed host CUDA versions, e.g. 13.0.",
+    )
+    p_availability.add_argument(
+        "--min-cuda-version", help="Minimum provider host CUDA capability, e.g. 13.0."
+    )
+    p_availability.add_argument("--container-disk-gb", type=int, default=100)
+    p_availability.add_argument("--allow-community-cloud", action="store_true")
+    p_availability.add_argument("--allow-no-network-volume", action="store_true")
 
     p_probe = sub.add_parser(
         "probe",
@@ -2250,17 +2442,17 @@ def build_parser() -> argparse.ArgumentParser:
         dest="allowed_cuda_versions",
         help="Comma-separated CUDA host versions for the availability query (e.g. 12.4,12.6).",
     )
+    p_probe.add_argument("--min-cuda-version", help="Minimum compatible host CUDA capability")
     p_probe.add_argument(
         "--container-disk-gb",
         type=int,
         default=100,
-        help="Container disk size used for forward-compatible availability checks.",
+        help="Minimum free container disk for provider availability checks.",
     )
     p_probe.add_argument(
         "--datacenter-ids",
         dest="datacenter_ids",
-        help="Comma-separated datacenter id allow-list (forward-compatible; "
-        "currently informational only).",
+        help="Comma-separated datacenter id allow-list; require confirmed stock in those centers.",
     )
     p_probe.add_argument(
         "--format",
@@ -2477,6 +2669,7 @@ def build_parser() -> argparse.ArgumentParser:
 _HANDLERS: dict[str, Any] = {
     "list": _cmd_list,
     "status": _cmd_status,
+    "mounts": _cmd_mounts,
     "resume": _cmd_resume,
     "terminate": _cmd_terminate,
     "find-orphans": _cmd_find_orphans,
@@ -2486,8 +2679,10 @@ _HANDLERS: dict[str, Any] = {
     "exec": _cmd_exec,
     "ship": _cmd_ship,
     "fetch": _cmd_fetch,
+    "job": _cmd_job,
     "run": _cmd_run,
     "probe": _cmd_probe,
+    "availability": _cmd_availability,
     "volumes": None,  # dispatched via volumes_cmd below
     "prebuilt": _cmd_prebuilt,
 }
@@ -2501,6 +2696,10 @@ _VOLUMES_HANDLERS: dict[str, Any] = {
 def main(argv: list[str] | None = None) -> int:
     load_runpod_env()
     args = build_parser().parse_args(argv)
+
+    if args.cmd == "transport-smoke":
+        from .transport_smoke import command
+        return asyncio.run(command(args))
 
     if args.cmd == "volumes":
         handler = _VOLUMES_HANDLERS[args.volumes_cmd]

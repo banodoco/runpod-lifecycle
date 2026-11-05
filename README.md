@@ -351,3 +351,47 @@ when the bundle contract should be rebuilt from scratch.
 ## Scope Notes
 
 This package does not include `startup_script.py`, `check_worker_startup_status`, or any orchestrator-owned persistence layer. Consumers that need to persist lifecycle state should attach `EventHooks(on_state_change=..., on_error=...)` and write to their own database or control plane there.
+
+### Read-only GPU availability by data center
+
+Before choosing a network-volume location, query the provider catalogue and stock:
+
+```bash
+runpod-lifecycle availability --gpu "RTX 5090"
+runpod-lifecycle availability --gpu "RTX 5090" --min-cuda-version 13.0
+runpod-lifecycle availability --gpu "RTX 5090" --datacenter-ids EU-RO-1,EUR-NO-1
+```
+
+Uses the existing `RUNPOD_API_KEY` credential handling. GPU display names and exact
+provider IDs are resolved case insensitively; ambiguous names are rejected. The
+command always emits JSON, including observation time, constraints and typed
+`available`, `unavailable` or `unknown` status. Exit codes are 0, 2 and 3,
+respectively (configuration/argument errors use the existing CLI error handling).
+Default constraints are one GPU, Secure Cloud, 100 GB minimum container disk and
+network-volume support. `--allow-no-network-volume` removes the storage requirement;
+`--allow-community-cloud` sends `secureCloud: false` to the provider. As elsewhere
+in the CLI, `RUNPOD_ALLOWED_CUDA_VERSIONS` supplies a CUDA filter if the flag is absent.
+
+Each offering includes its data-center ID/name/location, provider stock level,
+DC-specific on-demand USD/GPU-hour price and network-volume support. Missing facts
+remain null; provider failures and conflicting price/stock snapshots are unknown.
+`--min-cuda-version` sets a minimum host capability;
+`--allowed-cuda-versions` restricts to an exact allow-list. CUDA filters constrain
+provider host capability; these resolvers do not return a
+host's CUDA or driver version, so those fields remain null. This is neither a
+reservation nor a runtime qualification. Recheck before allocating resources.
+
+Python callers can use `await runpod_lifecycle.gpu_availability(api_key=key,
+gpu="RTX 5090", allowed_cuda_versions=["13.0"])` and serialize the returned
+`GpuAvailability` dataclass with `.to_dict()`. An explicit empty DC allow-list
+matches nothing. No region is selected automatically and no resource is created.
+The existing `probe` also includes DC evidence and now enforces `--datacenter-ids`
+using confirmed stock; an unrestricted probe may retain catalogue candidates
+with explicit unknown/unavailable status. Use `availability` for typed negative
+results when no matching stock is confirmed.
+
+## HTTPS-only clients
+
+Use `--transport https` or `RunPodConfig(transport="https")` for the pod agent
+transport. See [HTTPS transport](HTTPS.md) for token custody, supported paths,
+limits and the current live-test qualification.

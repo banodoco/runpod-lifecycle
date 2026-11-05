@@ -40,6 +40,28 @@ def test_list_pods_returns_summaries(runpod_sdk_mock) -> None:
     assert summaries[0].gpu_type == "RTX 4090"
 
 
+@pytest.mark.parametrize("evidence, expected", [
+    ({"networkVolume": {"id": "vol-1"}}, "vol-1"),
+    ({"networkVolumeId": "vol-1"}, "vol-1"),
+    ({"networkVolumeId": "vol-1", "networkVolume": {"id": "vol-1"}}, "vol-1"),
+    ({}, None),
+    ({"networkVolume": None}, None),
+    ({"networkVolume": {}}, None),
+    ({"networkVolume": {"id": None}}, None),
+    ({"networkVolume": {"id": ""}}, None),
+    ({"networkVolume": {"id": " vol-1"}}, None),
+    ({"networkVolume": {"id": 1}}, None),
+    ({"networkVolume": {"id": ["vol-1"]}}, None),
+    ({"networkVolume": [{"id": "vol-1"}]}, None),
+    ({"networkVolume": [{"id": "vol-1"}, {"id": "vol-2"}]}, None),
+    ({"networkVolumeId": ["vol-1"]}, None),
+    ({"networkVolumeId": None, "networkVolume": {"id": "vol-1"}}, None),
+    ({"networkVolumeId": "vol-1", "networkVolume": {"id": "vol-2"}}, None),
+])
+def test_attachment_normalization_is_exact(evidence, expected) -> None:
+    assert discovery._to_summary({"id": "p1", **evidence}).network_volume_id == expected
+
+
 def test_list_pods_name_prefix_filter(runpod_sdk_mock) -> None:
     runpod_sdk_mock.get_pods.return_value = [
         _raw_pod("a", name="gpu_1"),

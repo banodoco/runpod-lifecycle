@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import logging
 import os
 import re
@@ -12,7 +13,7 @@ from typing import Any, Callable, Sequence
 
 import httpx
 
-from .errors import CleanupPendingError
+from .errors import CleanupPendingError, ProviderRequestRejected, ProviderCapacityUnavailable
 
 # Keep the provider SDK behind the call sites.  The Astrid executor sandbox
 # permits the declared HTTP/SSH transport but can deny platform probes made by
@@ -22,6 +23,30 @@ from .errors import CleanupPendingError
 runpod = None  # type: ignore[assignment]
 
 logger = logging.getLogger("runpod_lifecycle.api")
+
+
+def _sdk_docker_args(docker_args: str) -> str:
+    """Return ``docker_args`` so the SDK pod mutation carries it as one GraphQL string.
+
+    The HTTPS agent command contains double quotes from nested shell quoting.
+    PyPI runpod (e.g. 1.12.0) interpolates ``dockerArgs`` into the mutation
+    unescaped, which ends the GraphQL string early; the companion SDK fork
+    pinned in pyproject (HTTPS.md) escapes it itself.  Probe the installed mutation
+    generator and escape here only when it does not, so the value is escaped
+    exactly once; refuse before any create call if its quoting is unknown.
+    An SDK without that GraphQL generator (runpod 2.x sends a REST JSON body)
+    gets the value unchanged.
+    """
+    try:
+        from runpod.api.mutations.pods import generate_pod_deployment_mutation
+    except ImportError:
+        return docker_args
+    probe = generate_pod_deployment_mutation(name="probe", image_name="probe", docker_args='"')
+    if 'dockerArgs: "\\""' in probe:
+        return docker_args
+    if 'dockerArgs: """' in probe:
+        return json.dumps(docker_args)[1:-1]
+    raise RuntimeError("cannot determine how the RunPod SDK quotes dockerArgs; refusing to create the pod")
 
 
 def normalize_allowed_cuda_versions(
@@ -129,31 +154,75 @@ def list_pods(api_key: str) -> list[dict[str, Any]]:
     without that key, causing an otherwise harmless empty/list refresh to fail
     with ``KeyError('data')``. The REST collection is the authoritative fallback
     and also gives termination verification a transport independent of the
-    mutation call.
+    mutation call. Successful SDK projections that omit attachment fields are
+    enriched by exact pod ID from REST with includeNetworkVolume=true.
     """
     sdk = _get_runpod()
     if sdk is not None:
         sdk.api_key = api_key
+    pods = None
     try:
         pods = sdk.get_pods() if sdk is not None else None
         if isinstance(pods, list):
-            return pods
-        if pods is not None:
+            # The SDK's QUERY_POD omits attachment evidence. Keep its runtime
+            # metadata, but corroborate omitted attachments with REST below.
+            if all(not isinstance(p, dict) or "networkVolumeId" in p or "networkVolume" in p for p in pods):
+                return pods
+        elif pods is not None:
             logger.warning("RunPod SDK returned unexpected pod collection: %r", type(pods).__name__)
     except Exception as exc:
         logger.warning("RunPod SDK get_pods failed; falling back to REST: %s", exc)
 
-    response = httpx.get(PODS_URL, headers=_auth_headers(api_key), timeout=30)
+    response = httpx.get(
+        PODS_URL, headers=_auth_headers(api_key), timeout=30,
+        params={"includeNetworkVolume": "true"},
+    )
     if response.status_code != 200:
         raise RuntimeError(
             f"RunPod pod listing failed: HTTP {response.status_code}: {response.text[:500]}"
         )
     payload = response.json()
-    if isinstance(payload, list):
-        return payload
     if isinstance(payload, dict) and isinstance(payload.get("pods"), list):
-        return payload["pods"]
-    raise RuntimeError(f"RunPod pod listing returned unexpected {type(payload).__name__} payload")
+        payload = payload["pods"]
+    if not isinstance(payload, list) or any(not isinstance(p, dict) for p in payload):
+        raise RuntimeError("RunPod pod listing returned a malformed collection")
+    if not isinstance(pods, list):
+        return payload
+    enriched = []
+    for pod in pods:
+        if not isinstance(pod, dict) or "networkVolumeId" in pod or "networkVolume" in pod:
+            enriched.append(pod)
+            continue
+        pod_id = pod.get("id")
+        matches = [p for p in payload if isinstance(pod_id, str) and pod_id and p.get("id") == pod_id]
+        # Never infer attachment from the requested volume, a pod name, or an
+        # ambiguous join. Missing/null evidence remains explicit in the CLI.
+        attachment = matches[0].get("networkVolume") if len(matches) == 1 else None
+        enriched.append({**pod, "networkVolume": attachment})
+    return enriched
+
+
+def get_pod_mounts(pod_id: str, api_key: str) -> dict[str, Any]:
+    """Read typed storage evidence afresh for exactly one pod, without fallback.
+
+    Account API support is not inferred from the public schema. In particular,
+    an unavailable typed field must never fall back to legacy attachment facts.
+    SDK/provider errors can contain query or account details, so keep them out
+    of diagnostics on this narrow fail-closed path.
+    """
+    if not isinstance(pod_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", pod_id):
+        raise ValueError("Invalid pod ID for mount observation")
+    try:
+        sdk = _get_runpod()
+        if sdk is None or not callable(getattr(sdk, "get_pod_mounts", None)):
+            raise RuntimeError("Typed provider mount projection is unavailable")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            pod = sdk.get_pod_mounts(pod_id, api_key=api_key)
+    except Exception:
+        raise RuntimeError("Typed provider mount observation failed") from None
+    if not isinstance(pod, dict) or pod.get("id") != pod_id:
+        raise ValueError("Exact-pod mount observation is unavailable")
+    return pod
 
 
 def find_gpu_type(gpu_display_name: str, api_key: str) -> dict[str, Any] | None:
@@ -177,7 +246,7 @@ def find_gpu_type(gpu_display_name: str, api_key: str) -> dict[str, Any] | None:
 
 def create_pod(
     api_key: str,
-    gpu_type_id: str,
+    gpu_type_id: str | None,
     image_name: str,
     name: str = "worker-pod",
     network_volume_id: str | None = None,
@@ -191,8 +260,141 @@ def create_pod(
     template_id: str | None = None,
     ports: str | None = None,
     allowed_cuda_versions: Sequence[str] | None = None,
+    compute_type: str = "GPU",
+    cpu_flavor_ids: Sequence[str] = ("cpu3c", "cpu5c"),
+    cpu_flavor_priority: str = "custom",
+    vcpu_count: int = 2,
+    data_center_id: str | None = None,
+    min_cuda_version: str | None = None,
+    cpu_api: str = "rest",
+    instance_id: str | None = None,
+    transport: str = "ssh",
+    https_token: str | None = None,
+    engine_startup: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create a RunPod pod and return provision metadata immediately."""
+    """Create a RunPod pod and return provision metadata immediately.
+
+    engine_startup is the trusted ``astrid.engine-startup.v1`` selection
+    (see ``engine_startup``). It is validated, and must be paired with the
+    HTTPS transport, before any provider call; the only public port stays
+    the agent's.
+    """
+    from .preflight import preflight_transport
+    preflight_transport(transport)
+    boot = None
+    claim = {}
+    if engine_startup is not None and transport != "https":
+        raise ValueError("engine startup requires the HTTPS transport")
+    if engine_startup is not None:
+        # The SDK interpolates these into GraphQL strings: refuse anything but
+        # plain text before any provider call (same check as the env values).
+        from .engine_startup import require_plain_text, require_safe_public_key
+        for field, value in (("name", name), ("image_name", image_name), ("gpu_type_id", gpu_type_id),
+                             ("network_volume_id", network_volume_id), ("data_center_id", data_center_id)):
+            require_plain_text(field, value)
+        require_safe_public_key(public_key_string)
+    if transport == "https":
+        from .https import agent_bootstrap
+        engine_options = {}
+        if engine_startup is not None:
+            from .engine_startup import claim_state_dir, normalize_engine_startup
+            selected = normalize_engine_startup(engine_startup, volume_mount_path=volume_mount_path)
+            # Each claim gets its own private state directory: a repeat claim
+            # on the same volume must never meet an earlier engine bearer.
+            claim = claim_state_dir(selected["state_dir"])
+            engine_options = {"engine_proxy": selected["engine_proxy"], "state_dir": claim["state_dir"]}
+        boot = agent_bootstrap(https_token or "", **engine_options)
+        if template_id:
+            raise ValueError("HTTPS requires an explicit image without a template override")
+        ports = boot["ports"]
+    pod_env = dict(env_vars or {})
+    if boot:
+        pod_env.update(boot["env"])
+    if engine_startup is not None:
+        # Keep the agent's port the sole public one and every env value plain.
+        if ports != "8000/http" or any(
+                not re.fullmatch(r"[A-Za-z0-9_]+", str(k)) or not re.fullmatch(r"[A-Za-z0-9+/=_.:@-]*", str(v))
+                for k, v in pod_env.items()):
+            raise ValueError("engine startup requires plain-text env values and the single agent port")
+    # The engine path is HTTPS-only: PUBLIC_KEY (SSH access) is never sent
+    # there, so it cannot bypass the plain-text check above.
+    if public_key_string and engine_startup is None:
+        pod_env["PUBLIC_KEY"] = public_key_string
+    if compute_type == "CPU" and cpu_api == "sdk":
+        sdk = _get_runpod()
+        sdk.api_key = api_key
+        sdk_boot = {"docker_args": _sdk_docker_args(boot["docker_args"])} if boot else {}
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                pod = sdk.create_pod(name=name, image_name=image_name, gpu_type_id=None,
+                                     cloud_type="SECURE", data_center_id=data_center_id,
+                                     network_volume_id=network_volume_id, volume_mount_path=volume_mount_path,
+                                     container_disk_in_gb=container_disk_in_gb, ports=ports or "22/tcp",
+                                     env=pod_env, instance_id=instance_id,
+                                     **sdk_boot)
+        except Exception as exc:
+            from runpod.error import QueryError, AuthenticationError
+            if not isinstance(exc, (QueryError, AuthenticationError)):
+                raise
+            message = str(exc)
+            for secret in (api_key, public_key_string, *pod_env.values()):
+                if secret:
+                    message = message.replace(secret, "[redacted]")
+            capacity = (isinstance(exc, QueryError)
+                        and "there are no longer any instances available with the requested specifications" in message.lower()
+                        and not any(x in message.lower() for x in ("invalid", "validation", "unsupported", "expected")))
+            error = ProviderCapacityUnavailable if capacity else ProviderRequestRejected
+            raise error(200 if isinstance(exc, QueryError) else 401, message[:1000]) from None
+        if not isinstance(pod, dict) or not pod.get("id"):
+            raise RuntimeError("CPU SDK create returned no pod ID; reconcile allocation")
+        return {"id": pod["id"], "name": name, "created": True, "compute_type": "CPU", **claim}
+    if compute_type == "CPU":
+        if cpu_flavor_priority not in {"availability", "custom"}:
+            raise ValueError("CPU flavor priority must be availability or custom")
+        payload = {"name": name, "imageName": image_name, "computeType": "CPU",
+                   "cloudType": "SECURE", "vcpuCount": vcpu_count,
+                   "cpuFlavorIds": list(cpu_flavor_ids), "cpuFlavorPriority": cpu_flavor_priority,
+                   "containerDiskInGb": container_disk_in_gb, "volumeInGb": 0,
+                   "volumeMountPath": volume_mount_path, "networkVolumeId": network_volume_id,
+                   "ports": (ports or "22/tcp").split(","), "supportPublicIp": True, "env": pod_env}
+        if network_volume_id is None:
+            payload.pop("networkVolumeId")
+        if boot:
+            payload.update({"dockerEntrypoint": boot["docker_entrypoint"], "dockerStartCmd": boot["docker_start_cmd"]})
+        if data_center_id:
+            payload["dataCenterIds"] = [data_center_id]
+        response = httpx.post(PODS_URL, headers=_auth_headers(api_key), json=payload, timeout=30)
+        if response.status_code not in {200, 201}:
+            try:
+                body = response.json()
+            except ValueError:
+                body = {"message": "non-JSON provider response"}
+            def messages(value):
+                if isinstance(value, str):
+                    return [value]
+                if isinstance(value, list):
+                    return [message for item in value for message in messages(item)]
+                if isinstance(value, dict):
+                    return [message for field in ("message", "error", "errors", "detail", "details", "issues")
+                            if field in value for message in messages(value[field])]
+                return []
+            message = "; ".join(messages(body))
+            for secret in (api_key, public_key_string, *pod_env.values()):
+                if secret:
+                    message = message.replace(secret, "[redacted]")
+            message = message[:1000] or "no provider error detail"
+            lower = message.lower()
+            capacity = (response.status_code in {500, 503}
+                        and "there are no longer any instances available with the requested specifications" in lower
+                        and not any(marker in lower for marker in ("invalid", "validation", "unsupported", "extra input", "expected")))
+            error = ProviderCapacityUnavailable if capacity else ProviderRequestRejected
+            raise error(response.status_code, message)
+        pod = response.json()
+        if not isinstance(pod, dict) or not pod.get("id"):
+            raise RuntimeError("CPU create response has no pod ID; reconcile allocation")
+        return {"id": pod["id"], "name": name, "created": True, "compute_type": "CPU", **claim}
+    if compute_type != "GPU":
+        raise ValueError("compute_type must be CPU or GPU")
     sdk = _get_runpod()
     if sdk is None:
         raise RuntimeError(
@@ -214,8 +416,17 @@ def create_pod(
         "ports": ports or "22/tcp,8888/http",
         "network_volume_id": network_volume_id,
     }
+    if boot:
+        params["docker_args"] = _sdk_docker_args(boot["docker_args"])
+    if data_center_id:
+        params["data_center_id"] = data_center_id
 
     normalized_cuda_versions = normalize_allowed_cuda_versions(allowed_cuda_versions)
+    if min_cuda_version is not None:
+        if normalized_cuda_versions:
+            raise ValueError("minimum and exact CUDA filters cannot be combined")
+        min_cuda_version = normalize_allowed_cuda_versions((min_cuda_version,))[0]
+        params["min_cuda_version"] = min_cuda_version
     if normalized_cuda_versions is not None:
         # The SDK maps this snake_case argument to GraphQL's
         # ``allowedCudaVersions`` input on podFindAndDeployOnDemand.
@@ -230,17 +441,27 @@ def create_pod(
     # ``/workspace`` fall back to the container disk.
     params["volume_mount_path"] = volume_mount_path
 
-    pod_env: dict[str, str] = {}
-    if env_vars:
-        pod_env.update(env_vars)
-    if public_key_string:
-        pod_env["PUBLIC_KEY"] = public_key_string
     if pod_env:
         params["env"] = pod_env
 
     sdk_stdout = io.StringIO()
-    with contextlib.redirect_stdout(sdk_stdout):
-        pod = sdk.create_pod(**params)
+    try:
+        with contextlib.redirect_stdout(sdk_stdout):
+            pod = sdk.create_pod(**params)
+    except Exception as exc:
+        from runpod.error import QueryError, AuthenticationError
+        if not isinstance(exc, (QueryError, AuthenticationError)):
+            raise
+        message = str(exc)
+        for secret in (api_key, public_key_string, *pod_env.values()):
+            if secret:
+                message = message.replace(secret, "[redacted]")
+        lower = message.lower()
+        capacity = (isinstance(exc, QueryError)
+                    and "there are no longer any instances available with the requested specifications" in lower
+                    and not any(x in lower for x in ("invalid", "validation", "unsupported", "expected")))
+        error = ProviderCapacityUnavailable if capacity else ProviderRequestRejected
+        raise error(200 if isinstance(exc, QueryError) else 401, message[:1000]) from None
     leaked_stdout = sdk_stdout.getvalue().strip()
     if leaked_stdout:
         logger.debug("RunPod SDK create_pod wrote %d bytes to stdout; suppressed to avoid leaking pod env", len(leaked_stdout))
@@ -259,7 +480,9 @@ def create_pod(
         "name": name,
         "gpu_type_id": gpu_type_id,
         "created": True,
+        **claim,
         **({"allowed_cuda_versions": list(normalized_cuda_versions)} if normalized_cuda_versions else {}),
+        **({"min_cuda_version": min_cuda_version} if min_cuda_version else {}),
     }
 
 

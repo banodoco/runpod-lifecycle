@@ -1,5 +1,23 @@
 from __future__ import annotations
 
+
+def test_exact_placement_merge_and_conflicting_storage_names():
+    from runpod_lifecycle.config import RunPodConfig
+    import pytest
+
+    config = RunPodConfig(api_key="fake", network_volume_id="exact", data_center_id="DC", gpu_type_id="gpu")
+    assert config.merge(data_center_id="other").network_volume_id == "exact"
+    assert config.merge(data_center_id="other").data_center_id == "other"
+    with pytest.raises(ValueError, match="storage names"):
+        config.merge(storage_name="storage")
+    with pytest.raises(ValueError, match="storage names"):
+        config.merge(storage_volumes=("storage",))
+    with pytest.raises(ValueError, match="one GPU"):
+        config.merge(gpu_type=("gpu-a", "gpu-b"))
+    for field in ("network_volume_id", "data_center_id", "gpu_type_id"):
+        with pytest.raises(ValueError, match="identifier"):
+            config.merge(**{field: " "})
+
 import pytest
 
 from runpod_lifecycle.config import RunPodConfig, load_runpod_env
@@ -235,3 +253,12 @@ def test_merge_returns_new_instance_with_overrides() -> None:
     assert merged.min_memory_gb == 64
     assert original.name_prefix == "pod"
     assert original.min_memory_gb == 32
+
+
+def test_https_config_token_override_ignores_stale_ambient_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("RUNPOD_HTTPS_TOKEN_FILE", str(tmp_path / "missing-token-file"))
+    config = RunPodConfig.from_env(api_key="test", transport="https", https_token=None)
+    other = RunPodConfig.from_env(api_key="test", transport="https", https_token=None)
+    assert config.https_token and config.https_token != other.https_token
+    assert config.https_token not in repr(config)
+    assert config.template_id == ""

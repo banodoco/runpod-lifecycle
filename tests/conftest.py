@@ -43,3 +43,10 @@ def isolate_shared_astrid_env(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None
     """Keep the developer's real per-user credentials out of package tests."""
 
     monkeypatch.setenv("ASTRID_ENV_FILE", str(tmp_path / "isolated-astrid.env"))
+
+
+@pytest.fixture(autouse=True)
+def offline_transport_preflight(request, monkeypatch):
+    # Fake provider payload tests must not depend on the test runner's egress.
+    if not request.module.__name__.endswith("test_https"):
+        monkeypatch.setattr("runpod_lifecycle.preflight.preflight_transport", lambda *_a, **_kw: None)

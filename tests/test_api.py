@@ -36,6 +36,51 @@ def test_list_pods_falls_back_to_rest_when_sdk_graphql_response_is_incomplete(
     assert api.list_pods("test") == [{"id": "p1", "desiredStatus": "RUNNING"}]
 
 
+def test_successful_sdk_projection_is_enriched_by_exact_rest_id(monkeypatch, runpod_sdk_mock):
+    from runpod.api import ctl_commands
+    # runpod-python 836a0d88 QUERY_POD selects runtime but no attachment field.
+    sdk_pod = {"id": "p1", "runtime": {"ports": [{"privatePort": 22}]}}
+    def graphql(query, **kwargs):
+        assert query == ctl_commands.pod_queries.QUERY_POD
+        assert "networkVolume" not in query
+        return {"data": {"myself": {"pods": [sdk_pod]}}}
+    monkeypatch.setattr(ctl_commands, "run_graphql_query", graphql)
+    runpod_sdk_mock.get_pods.side_effect = ctl_commands.get_pods
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse(200, [
+            {"id": "unrelated", "networkVolume": {"id": "wrong"}},
+            {"id": "p1", "networkVolume": {"id": "vol-1"}},
+        ])
+
+    monkeypatch.setattr(api.httpx, "get", get)
+    result = api.list_pods("test")
+    assert result == [{**sdk_pod, "networkVolume": {"id": "vol-1"}}]
+    assert "networkVolume" not in sdk_pod  # do not mutate provider payloads
+    assert calls == [(api.PODS_URL, {"headers": {"Authorization": "Bearer test"},
+                                   "timeout": 30, "params": {"includeNetworkVolume": "true"}})]
+
+
+@pytest.mark.parametrize("payload", [[], [{"id": "other", "networkVolume": {"id": "vol-1"}}],
+    [{"id": "p1", "networkVolume": {"id": "vol-1"}}] * 2])
+def test_rest_enrichment_keeps_unobservable_pod_in_inventory(monkeypatch, runpod_sdk_mock, payload):
+    runpod_sdk_mock.get_pods.return_value = [{"id": "p1"}]
+    monkeypatch.setattr(api.httpx, "get", lambda *a, **kw: FakeResponse(200, payload))
+    assert api.list_pods("test") == [{"id": "p1", "networkVolume": None}]
+
+
+def test_rest_fallback_exposes_documented_attachment(monkeypatch, runpod_sdk_mock):
+    runpod_sdk_mock.get_pods.side_effect = KeyError("data")
+    payload = [{"id": "p1", "networkVolume": {"id": "vol-1"}}]
+    def get(*args, **kwargs):
+        assert kwargs["params"] == {"includeNetworkVolume": "true"}
+        return FakeResponse(200, payload)
+    monkeypatch.setattr(api.httpx, "get", get)
+    assert api.list_pods("test") == payload
+
+
 def test_terminate_pod_waits_for_provider_side_absence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -585,3 +630,33 @@ def test_get_pod_status_normalizes_current_rest_port_shape(
         {"ip": "203.0.113.10", "privatePort": 22, "publicPort": 53603, "type": "tcp"},
         {"ip": "203.0.113.10", "privatePort": 8888, "publicPort": 58123, "type": "http"},
     ]
+
+
+def test_cpu_create_uses_supported_priority_and_public_key(monkeypatch):
+    calls=[]
+    def post(_url, **kwargs):
+        calls.append(kwargs)
+        return FakeResponse(201, {"id":"cpu-pod"})
+    monkeypatch.setattr(api.httpx,"post",post)
+    result=api.create_pod("test",None,"image",compute_type="CPU",public_key_string="public-test",
+                          data_center_id="EUR-NO-1",network_volume_id="vol")
+    body=calls[0]["json"]
+    assert body["cpuFlavorPriority"]=="custom"
+    assert body["cpuFlavorIds"]==["cpu3c","cpu5c"]
+    assert body["env"]["PUBLIC_KEY"]=="public-test"
+    assert result["id"]=="cpu-pod"
+
+
+@pytest.mark.parametrize("status,message,capacity",[
+    (400,"Invalid cpuFlavorPriority; no available value",False),
+    (401,"There are no longer any instances available with the requested specifications.",False),
+    (500,"There are no longer any instances available with the requested specifications.",True),
+    (500,"Invalid input: There are no longer any instances available with the requested specifications.",False),
+])
+def test_cpu_create_never_treats_rejection_as_capacity(monkeypatch,status,message,capacity):
+    from runpod_lifecycle.errors import ProviderCapacityUnavailable,ProviderRequestRejected
+    monkeypatch.setattr(api.httpx,"post",lambda *args,**kwargs: FakeResponse(status,{"error":message}))
+    with pytest.raises(ProviderRequestRejected) as caught:
+        api.create_pod("test",None,"image",compute_type="CPU")
+    assert isinstance(caught.value,ProviderCapacityUnavailable)==capacity
+    assert message in str(caught.value)

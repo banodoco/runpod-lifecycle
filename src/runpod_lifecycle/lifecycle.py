@@ -6,12 +6,15 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, Callable
 
 from . import api
-from .api import _is_capacity_error, create_pod, find_gpu_type, get_network_volumes, start_pod
+from .api import create_pod, find_gpu_type, get_network_volumes, start_pod
 from .config import RunPodConfig
-from .errors import AllocationUnknown, LaunchFailure, PostCreateHookFailure
+from .errors import (
+    AllocationUnknown, LaunchFailure, PostCreateHookFailure,
+    ProviderCapacityUnavailable,
+)
 from .events import EventHooks, PodState, _emit_error, _emit_state
 from .pod import Pod
 from .storage import check_and_expand_storage, get_storage_volume_id
@@ -65,6 +68,8 @@ def _build_ram_tiers(config: RunPodConfig) -> list[int]:
 
 
 async def _resolve_storage_targets(config: RunPodConfig) -> list[tuple[str | None, str | None]]:
+    if config.network_volume_id is not None:
+        return [(None, config.network_volume_id)]
     raw_targets: list[str] = []
     for storage_name in [config.storage_name, *config.storage_volumes]:
         if storage_name and storage_name not in raw_targets:
@@ -101,6 +106,12 @@ class _GpuCandidateFailure(Exception):
         self.last_error = last_error
 
 
+class _CapacityLaunchFailure(LaunchFailure):
+    """Every attempted placement was rejected explicitly for capacity."""
+
+    retryable = True
+
+
 async def _try_launch_one_gpu(
     config: RunPodConfig,
     gpu_type: str,
@@ -117,7 +128,8 @@ async def _try_launch_one_gpu(
     Returns a launched Pod on success, otherwise raises ``_GpuCandidateFailure``
     summarising the per-pair errors for this candidate.
     """
-    gpu_info = await asyncio.to_thread(find_gpu_type, gpu_type, config.api_key)
+    gpu_info = ({"id": config.gpu_type_id} if config.gpu_type_id is not None
+                else await asyncio.to_thread(find_gpu_type, gpu_type, config.api_key))
     if not gpu_info:
         raise _GpuCandidateFailure(
             gpu_type=gpu_type,
@@ -140,7 +152,8 @@ async def _try_launch_one_gpu(
                 }
             )
 
-            if storage_volume_id and not config.attach_only and storage_volume_id not in expanded_storage_ids:
+            if (storage_volume_id and config.network_volume_id is None
+                    and not config.attach_only and storage_volume_id not in expanded_storage_ids):
                 await asyncio.to_thread(
                     check_and_expand_storage,
                     config.api_key,
@@ -159,6 +172,7 @@ async def _try_launch_one_gpu(
                     image_name=config.worker_image,
                     name=pod_name,
                     network_volume_id=storage_volume_id,
+                    data_center_id=config.data_center_id,
                     volume_mount_path=config.volume_mount_path,
                     disk_in_gb=config.disk_size_gb,
                     container_disk_in_gb=config.container_disk_gb,
@@ -168,13 +182,17 @@ async def _try_launch_one_gpu(
                     min_memory_in_gb=ram_tier,
                     template_id=config.template_id,
                     ports=config.ports,
+                    **({"transport": config.transport, "https_token": config.https_token}
+                       if config.transport == "https" else {}),
+                    **({"engine_startup": config.engine_startup} if config.engine_startup is not None else {}),
                     allowed_cuda_versions=config.allowed_cuda_versions or None,
+                    **({"min_cuda_version": config.min_cuda_version} if config.min_cuda_version else {}),
                 )
             except Exception as exc:
                 # Only a definite capacity rejection permits another create.
                 # Timeouts, transport errors, and malformed responses can mean
                 # the provider allocated a pod without returning its ID.
-                if not isinstance(exc, (TimeoutError, ConnectionError, OSError)) and _is_capacity_error(exc):
+                if isinstance(exc, ProviderCapacityUnavailable):
                     last_error = exc
                     logger.warning("Capacity rejected create for gpu=%s storage=%s ram=%sGB: %s", gpu_type, storage_name, ram_tier, exc)
                     continue
@@ -198,6 +216,8 @@ async def _try_launch_one_gpu(
             pod._gpu_type = gpu_type
             pod._allowed_cuda_versions = config.allowed_cuda_versions
             pod._storage_name = storage_name
+            pod.claim_id = pod_details.get("claim_id")
+            pod._engine_state_dir = pod_details.get("state_dir")
             try:
                 await _emit_state(
                     hooks,
@@ -255,7 +275,9 @@ async def launch(
     for value in [config.storage_name, *config.storage_volumes]:
         if value and value not in input_storages:
             input_storages.append(value)
-    if (input_storages and not storage_targets) or (config.attach_only and not input_storages):
+    if (input_storages and not storage_targets) or (
+        config.attach_only and not input_storages and config.network_volume_id is None
+    ):
         error = LaunchFailure(
             f"Attach-only requires a resolved existing storage volume: {', '.join(input_storages)}"
             if config.attach_only else
@@ -311,7 +333,13 @@ async def launch(
         None,
     )
 
-    error = LaunchFailure(
+    only_capacity = (
+        bool(candidate_failures)
+        and all(failure.last_error is not None for failure in candidate_failures)
+        and len(storage_targets) == (len(input_storages) if input_storages else 1)
+    )
+    failure_type = _CapacityLaunchFailure if only_capacity else LaunchFailure
+    error = failure_type(
         f"Failed to launch pod across GPU candidates {list(candidates)}: {reasons}"
     )
     await _emit_error(
@@ -338,6 +366,7 @@ async def launch_when_available(
     hooks: EventHooks | None = None,
     max_wait_sec: int = 900,
     retry_interval_sec: int = 30,
+    on_attempt: Callable[[int], None] | None = None,
 ) -> Pod:
     """Keep trying to claim the requested launch matrix until capacity appears.
 
@@ -347,6 +376,8 @@ async def launch_when_available(
     succeeds or the bounded wait expires.
     """
     if max_wait_sec <= 0:
+        if on_attempt is not None:
+            on_attempt(1)
         return await launch(config, name=name, hooks=hooks)
     if retry_interval_sec <= 0:
         raise ValueError("retry_interval_sec must be positive")
@@ -356,12 +387,14 @@ async def launch_when_available(
     attempt = 0
     while True:
         attempt += 1
+        if on_attempt is not None:
+            on_attempt(attempt)
         try:
             return await launch(config, name=name, hooks=hooks)
         except AllocationUnknown:
             raise
         except LaunchFailure as exc:
-            if not exc.retryable:
+            if not isinstance(exc, _CapacityLaunchFailure):
                 raise
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -375,7 +408,7 @@ async def launch_when_available(
                         "retry_interval_sec": retry_interval_sec,
                     },
                 )
-                raise LaunchFailure(
+                raise _CapacityLaunchFailure(
                     f"Capacity did not become available after {attempt} attempts "
                     f"over {max_wait_sec}s: {exc}"
                 ) from exc
