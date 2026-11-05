@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import logging
 import os
 import re
@@ -22,6 +23,30 @@ from .errors import CleanupPendingError, ProviderRequestRejected, ProviderCapaci
 runpod = None  # type: ignore[assignment]
 
 logger = logging.getLogger("runpod_lifecycle.api")
+
+
+def _sdk_docker_args(docker_args: str) -> str:
+    """Return ``docker_args`` so the SDK pod mutation carries it as one GraphQL string.
+
+    The HTTPS agent command contains double quotes from nested shell quoting.
+    PyPI runpod (e.g. 1.12.0) interpolates ``dockerArgs`` into the mutation
+    unescaped, which ends the GraphQL string early; the companion SDK fork
+    pinned in pyproject (HTTPS.md) escapes it itself.  Probe the installed mutation
+    generator and escape here only when it does not, so the value is escaped
+    exactly once; refuse before any create call if its quoting is unknown.
+    An SDK without that GraphQL generator (runpod 2.x sends a REST JSON body)
+    gets the value unchanged.
+    """
+    try:
+        from runpod.api.mutations.pods import generate_pod_deployment_mutation
+    except ImportError:
+        return docker_args
+    probe = generate_pod_deployment_mutation(name="probe", image_name="probe", docker_args='"')
+    if 'dockerArgs: "\\""' in probe:
+        return docker_args
+    if 'dockerArgs: """' in probe:
+        return json.dumps(docker_args)[1:-1]
+    raise RuntimeError("cannot determine how the RunPod SDK quotes dockerArgs; refusing to create the pod")
 
 
 def normalize_allowed_cuda_versions(
@@ -298,6 +323,7 @@ def create_pod(
     if compute_type == "CPU" and cpu_api == "sdk":
         sdk = _get_runpod()
         sdk.api_key = api_key
+        sdk_boot = {"docker_args": _sdk_docker_args(boot["docker_args"])} if boot else {}
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 pod = sdk.create_pod(name=name, image_name=image_name, gpu_type_id=None,
@@ -305,7 +331,7 @@ def create_pod(
                                      network_volume_id=network_volume_id, volume_mount_path=volume_mount_path,
                                      container_disk_in_gb=container_disk_in_gb, ports=ports or "22/tcp",
                                      env=pod_env, instance_id=instance_id,
-                                     **({"docker_args": boot["docker_args"]} if boot else {}))
+                                     **sdk_boot)
         except Exception as exc:
             from runpod.error import QueryError, AuthenticationError
             if not isinstance(exc, (QueryError, AuthenticationError)):
@@ -391,7 +417,7 @@ def create_pod(
         "network_volume_id": network_volume_id,
     }
     if boot:
-        params["docker_args"] = boot["docker_args"]
+        params["docker_args"] = _sdk_docker_args(boot["docker_args"])
     if data_center_id:
         params["data_center_id"] = data_center_id
 

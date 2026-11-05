@@ -545,9 +545,53 @@ def test_generated_mutation_parses_strictly_and_carries_only_plain_text(provider
     assert set(env) == {"ASTRID_POD_TOKEN", "ASTRID_POD_AGENT_B64", "ASTRID_POD_PORT",
                         pod_agent.ENGINE_B64_ENV, "ASTRID_POD_STATE"}  # no PUBLIC_KEY
     assert all(re.fullmatch(r"[A-Za-z0-9+/=_.:@-]*", v) for v in env.values())
-    # Only dockerArgs is JSON-escaped by the SDK; everything else is raw text.
-    assert json.loads('"' + fields["dockerArgs"] + '"') == provider.sdk.create_pod.call_args.kwargs["docker_args"]
+    # Only dockerArgs is escaped (by the lifecycle or by an SDK that escapes it,
+    # never both); it decodes to exactly the agent command. Everything else is raw text.
+    assert json.loads('"' + fields["dockerArgs"] + '"') == agent_bootstrap(TOKEN)["docker_args"]
     assert all("\\" not in value for key, value in fields.items() if isinstance(value, str) and key != "dockerArgs")
+
+
+# How each supported SDK renders dockerArgs, independent of the installed one:
+# PyPI runpod 1.12.0 pods.py:109 interpolates raw; the pinned companion fork
+# (4f6c831, pods.py:118) emits json.dumps(docker_args) with its own quotes.
+SDK_DOCKER_ARGS = {"raw": lambda value: f'"{value}"', "escaping": json.dumps}
+
+
+@pytest.mark.parametrize("sdk_style", sorted(SDK_DOCKER_ARGS))
+def test_docker_args_reach_graphql_escaped_exactly_once(provider, monkeypatch, sdk_style):
+    from runpod.api.mutations import pods
+    original = pods.generate_pod_deployment_mutation
+
+    def builder(*args, docker_args=None, **kwargs):
+        lines = original(*args, docker_args=None, **kwargs).split("\n")
+        if docker_args is not None:
+            body = [line.strip() for line in lines].index("input: {") + 1
+            lines[body] += ", dockerArgs: " + SDK_DOCKER_ARGS[sdk_style](docker_args)
+        return "\n".join(lines)
+
+    monkeypatch.setattr(pods, "generate_pod_deployment_mutation", builder)
+    api.create_pod("k", "gpu-1", "image:tag", name="claim-1", transport="https", https_token=TOKEN,
+                   engine_startup=selection())
+    command = agent_bootstrap(TOKEN)["docker_args"]
+    sent = provider.sdk.create_pod.call_args.kwargs["docker_args"]
+    assert sent == (command if sdk_style == "escaping" else json.dumps(command)[1:-1])
+    fields = parse_mutation(builder(**provider.sdk.create_pod.call_args.kwargs))
+    assert json.loads('"' + fields["dockerArgs"] + '"') == command
+
+
+def test_docker_args_pass_unchanged_to_an_sdk_without_the_graphql_generator(provider, monkeypatch):
+    monkeypatch.setitem(sys.modules, "runpod.api.mutations.pods", None)  # import raises ImportError
+    api.create_pod("k", "gpu-1", "image:tag", transport="https", https_token=TOKEN, engine_startup=selection())
+    assert provider.sdk.create_pod.call_args.kwargs["docker_args"] == agent_bootstrap(TOKEN)["docker_args"]
+
+
+def test_unknown_sdk_docker_args_quoting_refuses_before_create(provider, monkeypatch):
+    from runpod.api.mutations import pods
+    monkeypatch.setattr(pods, "generate_pod_deployment_mutation", lambda **_: "mutation { }")
+    with pytest.raises(RuntimeError):
+        api.create_pod("k", "gpu-1", "image:tag", transport="https", https_token=TOKEN,
+                       engine_startup=selection())
+    assert not provider.sdk.create_pod.called and not provider.posts
 
 
 def test_strict_parser_rejects_an_injected_quote():
