@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from runpod_lifecycle import graphql as _lifecycle_graphql
 from runpod_lifecycle import api
 from runpod_lifecycle.errors import CleanupPendingError
 
@@ -16,6 +17,9 @@ class FakeResponse:
 
     def json(self) -> dict:
         return self._payload
+
+
+_REAL_GET_PODS = _lifecycle_graphql.get_pods
 
 
 def test_list_pods_falls_back_to_rest_when_sdk_graphql_response_is_incomplete(
@@ -37,15 +41,15 @@ def test_list_pods_falls_back_to_rest_when_sdk_graphql_response_is_incomplete(
 
 
 def test_successful_sdk_projection_is_enriched_by_exact_rest_id(monkeypatch, runpod_sdk_mock):
-    from runpod.api import ctl_commands
-    # runpod-python 836a0d88 QUERY_POD selects runtime but no attachment field.
+    from runpod_lifecycle import graphql as lifecycle_graphql
+    # The pod listing query selects runtime but no attachment field.
     sdk_pod = {"id": "p1", "runtime": {"ports": [{"privatePort": 22}]}}
-    def graphql(query, **kwargs):
-        assert query == ctl_commands.pod_queries.QUERY_POD
+    def graphql(query, api_key):
+        assert query == lifecycle_graphql.QUERY_PODS
         assert "networkVolume" not in query
         return {"data": {"myself": {"pods": [sdk_pod]}}}
-    monkeypatch.setattr(ctl_commands, "run_graphql_query", graphql)
-    runpod_sdk_mock.get_pods.side_effect = ctl_commands.get_pods
+    monkeypatch.setattr(lifecycle_graphql, "_run", graphql)
+    monkeypatch.setattr(lifecycle_graphql, "get_pods", _REAL_GET_PODS)
     calls = []
 
     def get(url, **kwargs):

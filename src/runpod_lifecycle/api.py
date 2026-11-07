@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import io
-import json
 import logging
 import os
 import re
@@ -13,6 +12,7 @@ from typing import Any, Callable, Sequence
 
 import httpx
 
+from . import graphql as _gql
 from .errors import CleanupPendingError, ProviderRequestRejected, ProviderCapacityUnavailable
 
 # Keep the provider SDK behind the call sites.  The Astrid executor sandbox
@@ -23,30 +23,6 @@ from .errors import CleanupPendingError, ProviderRequestRejected, ProviderCapaci
 runpod = None  # type: ignore[assignment]
 
 logger = logging.getLogger("runpod_lifecycle.api")
-
-
-def _sdk_docker_args(docker_args: str) -> str:
-    """Return ``docker_args`` so the SDK pod mutation carries it as one GraphQL string.
-
-    The HTTPS agent command contains double quotes from nested shell quoting.
-    PyPI runpod (e.g. 1.12.0) interpolates ``dockerArgs`` into the mutation
-    unescaped, which ends the GraphQL string early; the companion SDK fork
-    pinned in pyproject (HTTPS.md) escapes it itself.  Probe the installed mutation
-    generator and escape here only when it does not, so the value is escaped
-    exactly once; refuse before any create call if its quoting is unknown.
-    An SDK without that GraphQL generator (runpod 2.x sends a REST JSON body)
-    gets the value unchanged.
-    """
-    try:
-        from runpod.api.mutations.pods import generate_pod_deployment_mutation
-    except ImportError:
-        return docker_args
-    probe = generate_pod_deployment_mutation(name="probe", image_name="probe", docker_args='"')
-    if 'dockerArgs: "\\""' in probe:
-        return docker_args
-    if 'dockerArgs: """' in probe:
-        return json.dumps(docker_args)[1:-1]
-    raise RuntimeError("cannot determine how the RunPod SDK quotes dockerArgs; refusing to create the pod")
 
 
 def normalize_allowed_cuda_versions(
@@ -162,7 +138,7 @@ def list_pods(api_key: str) -> list[dict[str, Any]]:
         sdk.api_key = api_key
     pods = None
     try:
-        pods = sdk.get_pods() if sdk is not None else None
+        pods = _gql.get_pods(api_key) if sdk is not None else None
         if isinstance(pods, list):
             # The SDK's QUERY_POD omits attachment evidence. Keep its runtime
             # metadata, but corroborate omitted attachments with REST below.
@@ -213,11 +189,10 @@ def get_pod_mounts(pod_id: str, api_key: str) -> dict[str, Any]:
     if not isinstance(pod_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", pod_id):
         raise ValueError("Invalid pod ID for mount observation")
     try:
-        sdk = _get_runpod()
-        if sdk is None or not callable(getattr(sdk, "get_pod_mounts", None)):
+        if _get_runpod() is None:
             raise RuntimeError("Typed provider mount projection is unavailable")
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            pod = sdk.get_pod_mounts(pod_id, api_key=api_key)
+            pod = _gql.get_pod_mounts(pod_id, api_key=api_key)
     except Exception:
         raise RuntimeError("Typed provider mount observation failed") from None
     if not isinstance(pod, dict) or pod.get("id") != pod_id:
@@ -323,10 +298,10 @@ def create_pod(
     if compute_type == "CPU" and cpu_api == "sdk":
         sdk = _get_runpod()
         sdk.api_key = api_key
-        sdk_boot = {"docker_args": _sdk_docker_args(boot["docker_args"])} if boot else {}
+        sdk_boot = {"docker_args": boot["docker_args"]} if boot else {}
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                pod = sdk.create_pod(name=name, image_name=image_name, gpu_type_id=None,
+                pod = _gql.create_pod(api_key=api_key, name=name, image_name=image_name, gpu_type_id=None,
                                      cloud_type="SECURE", data_center_id=data_center_id,
                                      network_volume_id=network_volume_id, volume_mount_path=volume_mount_path,
                                      container_disk_in_gb=container_disk_in_gb, ports=ports or "22/tcp",
@@ -417,7 +392,7 @@ def create_pod(
         "network_volume_id": network_volume_id,
     }
     if boot:
-        params["docker_args"] = _sdk_docker_args(boot["docker_args"])
+        params["docker_args"] = boot["docker_args"]
     if data_center_id:
         params["data_center_id"] = data_center_id
 
@@ -447,7 +422,7 @@ def create_pod(
     sdk_stdout = io.StringIO()
     try:
         with contextlib.redirect_stdout(sdk_stdout):
-            pod = sdk.create_pod(**params)
+            pod = _gql.create_pod(api_key=api_key, **params)
     except Exception as exc:
         from runpod.error import QueryError, AuthenticationError
         if not isinstance(exc, (QueryError, AuthenticationError)):
@@ -768,7 +743,7 @@ def get_pod_status(runpod_id: str, api_key: str) -> dict[str, Any] | None:
         sdk = _get_runpod()
         if sdk is not None:
             sdk.api_key = api_key
-            status = sdk.get_pod(runpod_id)
+            status = _gql.get_pod(runpod_id, api_key)
             if isinstance(status, dict) and status:
                 return _normalize_pod_status(runpod_id, status)
             if status:

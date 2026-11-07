@@ -9,7 +9,10 @@ description = "Reusable async RunPod lifecycle management package."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "runpod @ git+https://github.com/peteromallet/runpod-python.git@4f6c831ff804d21aa75ad5817533f00751320142",
+  # Intel macOS has no cryptography>=50 wheels, so it stays on the 1.10.x line
+  # (cryptography>=48.0.1); every other platform takes runpod>=1.12.
+  "runpod>=1.10.1,<1.11; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+  "runpod>=1.12; sys_platform != 'darwin' or platform_machine != 'x86_64'",
   "paramiko>=3.0.0",
   "requests>=2.31.0",
   "httpx>=0.25.0",
@@ -31,6 +34,3 @@ packages = ["src/runpod_lifecycle"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-
-[tool.hatch.metadata]
-allow-direct-references = true

@@ -40,8 +40,10 @@ finally:
 For direct CPU creation, use `api.create_pod(..., compute_type="CPU",
 transport="https", https_token=token)` and `HttpsPodTransport(pod_id, token)`.
 CPU REST creation overrides Docker ENTRYPOINT/CMD; SDK creation uses
-`docker_args` and needs the companion SDK quoting fix. Keep Luna's minimum-CUDA,
-CPU-image and datacenter SDK patches when installing the companion checkout.
+`docker_args`, which lifecycle's own GraphQL builders (`runpod_lifecycle.graphql`)
+escape exactly once. Those builders also carry the minimum-CUDA, explicit
+CPU-image, datacenter-observation and exact-pod mount-query behaviour; the public
+`runpod` SDK supplies only the GraphQL transport.
 
 `HttpsPodTransport` implements `connect`, `wait_ready`, `execute_command`
 (aliases `run` and `exec`), `put`, `get`, and `disconnect`/`close`. For resumable

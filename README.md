@@ -15,6 +15,19 @@ sibling checkout:
 pip install "runpod-lifecycle @ git+https://github.com/banodoco/runpod-lifecycle.git@v0.1.1"
 ```
 
+### Provider SDK dependency
+
+`runpod-lifecycle` depends on the public `runpod` SDK from PyPI, used only as
+the GraphQL transport; query and mutation text lives in
+`runpod_lifecycle.graphql`. Platform markers select the SDK line:
+
+- Every platform except Intel macOS: `runpod>=1.12` (`cryptography>=50`).
+- Intel macOS (`darwin`/`x86_64`): `runpod>=1.10.1,<1.11`.
+
+**Accepted risk:** Intel macOS stays on `cryptography` 48.0.1 (the 1.10.x
+SDK line), which has known CVEs. This is accepted for that platform
+only; all other platforms resolve `cryptography` 50.x.
+
 ## Environment Variables
 
 `RunPodConfig.from_env()` reads these variables:

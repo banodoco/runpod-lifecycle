@@ -16,6 +16,16 @@ def runpod_sdk_mock(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     mock.terminate_pod.return_value = None
     mock.get_network_volumes.return_value = []
     monkeypatch.setattr("runpod_lifecycle.api.runpod", mock)
+    # Lifecycle owns the GraphQL builders; route them to the same mock so tests
+    # assert on the arguments handed to them (api_key is transport-only).
+    for name in ("create_pod", "get_pod"):
+        monkeypatch.setattr(
+            f"runpod_lifecycle.graphql.{name}",
+            (lambda n: lambda *a, api_key=None, **kw: getattr(mock, n)(*a, **kw))(name),
+        )
+    monkeypatch.setattr(
+        "runpod_lifecycle.graphql.get_pods", lambda api_key=None: mock.get_pods()
+    )
     return mock
 
 

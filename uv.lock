@@ -2,10 +2,14 @@ version = 1
 revision = 3
 requires-python = ">=3.10"
 resolution-markers = [
-    "python_full_version >= '3.14'",
-    "python_full_version == '3.13.*'",
-    "python_full_version >= '3.11' and python_full_version < '3.13'",
-    "python_full_version < '3.11'",
+    "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "(python_full_version >= '3.14' and platform_machine != 'x86_64') or (python_full_version >= '3.14' and sys_platform != 'darwin')",
+    "python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "(python_full_version == '3.13.*' and platform_machine != 'x86_64') or (python_full_version == '3.13.*' and sys_platform != 'darwin')",
+    "python_full_version >= '3.11' and python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "(python_full_version >= '3.11' and python_full_version < '3.13' and platform_machine != 'x86_64') or (python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform != 'darwin')",
+    "python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "(python_full_version < '3.11' and platform_machine != 'x86_64') or (python_full_version < '3.11' and sys_platform != 'darwin')",
 ]
 
 [[package]]
@@ -2550,8 +2554,14 @@ wheels = [
 
 [[package]]
 name = "runpod"
-version = "1.12.1.dev6"
-source = { git = "https://github.com/peteromallet/runpod-python.git?rev=4f6c831ff804d21aa75ad5817533f00751320142#4f6c831ff804d21aa75ad5817533f00751320142" }
+version = "1.10.1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.11' and python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+]
 dependencies = [
     { name = "aiohttp", extra = ["speedups"] },
     { name = "aiohttp-retry" },
@@ -2573,6 +2583,46 @@ dependencies = [
     { name = "urllib3" },
     { name = "watchdog" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/69/fd/62538e5497c4bc800bd62b0270de43f1d3d054eb58b9696ca548850da166/runpod-1.10.1.tar.gz", hash = "sha256:6d0ad5cdc36f5b7375968861f6973be82c923eb6e8c20bc658c48f398304c7b8", size = 580786, upload-time = "2026-07-08T06:48:15.126Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cb/87/38f6ad5d15b0d5d843a1a87d89364c07b10c98a3542e604bf5e6259ace8a/runpod-1.10.1-py3-none-any.whl", hash = "sha256:1c12e32107cfd9f38c5d9c3d3f9c7f68fa7969bf99ea35f2fdc1fc03b174b90f", size = 334368, upload-time = "2026-07-08T06:48:13.363Z" },
+]
+
+[[package]]
+name = "runpod"
+version = "1.12.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "(python_full_version >= '3.14' and platform_machine != 'x86_64') or (python_full_version >= '3.14' and sys_platform != 'darwin')",
+    "(python_full_version == '3.13.*' and platform_machine != 'x86_64') or (python_full_version == '3.13.*' and sys_platform != 'darwin')",
+    "(python_full_version >= '3.11' and python_full_version < '3.13' and platform_machine != 'x86_64') or (python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform != 'darwin')",
+    "(python_full_version < '3.11' and platform_machine != 'x86_64') or (python_full_version < '3.11' and sys_platform != 'darwin')",
+]
+dependencies = [
+    { name = "aiohttp", extra = ["speedups"] },
+    { name = "aiohttp-retry" },
+    { name = "backoff" },
+    { name = "boto3" },
+    { name = "click" },
+    { name = "colorama" },
+    { name = "cryptography" },
+    { name = "fastapi", extra = ["all"] },
+    { name = "inquirerpy" },
+    { name = "paramiko" },
+    { name = "prettytable" },
+    { name = "psutil" },
+    { name = "py-cpuinfo" },
+    { name = "requests" },
+    { name = "tomli" },
+    { name = "tomlkit" },
+    { name = "tqdm-loggable" },
+    { name = "urllib3" },
+    { name = "watchdog" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/33/21/63136d292d95532b4fa51a5f8495883e71865b3534634cc28cdfc315df66/runpod-1.12.0.tar.gz", hash = "sha256:511c6b751221a9890450aa2ddedc0c50d4d64aa3a008aab0d7a23a84792dbb85", size = 612620, upload-time = "2026-08-10T11:45:23.84Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2e/7c/a935647b746743c639b5755c27201d7c55f1434d19e0bec190fcb31a6300/runpod-1.12.0-py3-none-any.whl", hash = "sha256:2c52d5ad4268879bd4d8288f84a9861488abc756ffc5195d95f1cffe4c4f3454", size = 346988, upload-time = "2026-08-10T11:45:22.488Z" },
+]
 
 [[package]]
 name = "runpod-lifecycle"
@@ -2583,7 +2633,8 @@ dependencies = [
     { name = "paramiko" },
     { name = "python-dotenv" },
     { name = "requests" },
-    { name = "runpod" },
+    { name = "runpod", version = "1.10.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'" },
+    { name = "runpod", version = "1.12.0", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
 ]
 
 [package.optional-dependencies]
@@ -2602,7 +2653,8 @@ requires-dist = [
     { name = "pytest-mock", marker = "extra == 'dev'", specifier = ">=3" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "requests", specifier = ">=2.31.0" },
-    { name = "runpod", git = "https://github.com/peteromallet/runpod-python.git?rev=4f6c831ff804d21aa75ad5817533f00751320142" },
+    { name = "runpod", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'", specifier = ">=1.12" },
+    { name = "runpod", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'", specifier = ">=1.10.1,<1.11" },
 ]
 provides-extras = ["dev"]
 
@@ -3026,7 +3078,8 @@ name = "websockets"
 version = "16.1.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version < '3.11'",
+    "python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "(python_full_version < '3.11' and platform_machine != 'x86_64') or (python_full_version < '3.11' and sys_platform != 'darwin')",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/21/f7/bc3a25c5ec26ce62ce487690becc2f3710bbc7b33338f005ad390db0b986/websockets-16.1.1.tar.gz", hash = "sha256:db234eda965dcce15df96bb9709f587cd87d4d52aaf0e80e2f34ec04c7670c57", size = 182204, upload-time = "2026-07-17T22:51:05.858Z" }
 wheels = [
@@ -3145,9 +3198,12 @@ name = "websockets"
 version = "17.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.14'",
-    "python_full_version == '3.13.*'",
-    "python_full_version >= '3.11' and python_full_version < '3.13'",
+    "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "(python_full_version >= '3.14' and platform_machine != 'x86_64') or (python_full_version >= '3.14' and sys_platform != 'darwin')",
+    "python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "(python_full_version == '3.13.*' and platform_machine != 'x86_64') or (python_full_version == '3.13.*' and sys_platform != 'darwin')",
+    "python_full_version >= '3.11' and python_full_version < '3.13' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "(python_full_version >= '3.11' and python_full_version < '3.13' and platform_machine != 'x86_64') or (python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform != 'darwin')",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/18/72/fba934cb3dff7a85d811820efffcd141ddd52b5a2a01637f64551373ff4d/websockets-17.1.tar.gz", hash = "sha256:acfea4c20bf54384883ea33b1240fc1db4f52e190823a4e2b334bc3e8bfca96a", size = 187520, upload-time = "2026-08-26T17:25:33.063Z" }
 wheels = [

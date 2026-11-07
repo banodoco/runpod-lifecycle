@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from runpod_lifecycle import api, cli, discovery
+from runpod_lifecycle import api, cli, discovery, graphql
 
 
 NONCE = "1" * 32
@@ -91,6 +91,7 @@ def test_invalid_nonce_refuses_before_provider(monkeypatch, nonce):
 
 def test_missing_typed_sdk_field_has_no_legacy_fallback(monkeypatch, capsys):
     monkeypatch.setattr(api, "runpod", SimpleNamespace(get_pod=lambda *_: raw(networkVolumeId="vol-1")))
+    monkeypatch.setattr(graphql, "get_pod_mounts", lambda *a, **k: (_ for _ in ()).throw(ValueError("typed field unavailable")))
     monkeypatch.setattr(cli, "_resolve_api_key", lambda _: "offline-test")
     assert cli.main(["mounts", "pod-1", "--nonce", NONCE, "--json"]) == 1
     result = capsys.readouterr()
@@ -102,7 +103,8 @@ def test_provider_failures_are_bounded_and_do_not_log_raw_details(monkeypatch, c
     def fail(*args, **kwargs):
         print("secret-stdout")
         raise RuntimeError("raw-provider-secret")
-    monkeypatch.setattr(api, "runpod", SimpleNamespace(get_pod_mounts=fail))
+    monkeypatch.setattr(api, "runpod", SimpleNamespace())
+    monkeypatch.setattr(graphql, "get_pod_mounts", fail)
     monkeypatch.setattr(cli, "_resolve_api_key", lambda _: "offline-test")
     assert cli.main(["mounts", "pod-1", "--nonce", NONCE, "--json"]) == 1
     result = capsys.readouterr()
