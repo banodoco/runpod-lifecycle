@@ -5,7 +5,9 @@ astrid.env
 __pycache__/
 .venv/
 venv/
-.claude/
+.claude/*
+!.claude/settings.json
+!.claude/skills/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
