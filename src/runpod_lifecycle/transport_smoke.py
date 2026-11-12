@@ -28,6 +28,7 @@ import uuid
 import httpx
 
 from . import api
+from .rest import normalize_pod
 from .https import HttpsPodTransport, PodTransportError, write_token_file
 from .preflight import preflight_transport
 
@@ -206,7 +207,10 @@ class Provider:
         data = response.json()
         if not isinstance(data, dict) or data.get("id") != pod_id:
             raise SmokeError("provider exact-ID response is invalid")
-        return 200, data
+        try:
+            return 200, normalize_pod(data)
+        except ValueError:
+            raise SmokeError("provider exact-ID response is invalid") from None
 
     def terminate(self, pod_id):
         with _quiet_provider():

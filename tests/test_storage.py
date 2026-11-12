@@ -49,7 +49,7 @@ def test_expand_network_volume_uses_patch_contract(monkeypatch: pytest.MonkeyPat
     assert _expand_network_volume("api-key", "volume-1", 150) is True
 
     seen = requests_seen[0]
-    assert seen["url"] == "https://rest.runpod.io/v1/networkvolumes/volume-1"
+    assert seen["url"] == "https://api.runpod.io/v2/network-volumes/volume-1"
     assert seen["json"] == {"size": 150}
     assert seen["headers"]["Authorization"] == "Bearer api-key"
 

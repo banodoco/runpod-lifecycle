@@ -47,6 +47,23 @@ echo exited > "$d/status.tmp" && mv "$d/status.tmp" "$d/status"
 logger = logging.getLogger(__name__)
 
 
+class _FileRequestLogFilter(logging.Filter):
+    """Keep HTTP diagnostics without publishing pod observation file paths."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                value.copy_with(query=None)
+                if isinstance(value, httpx.URL) and value.path == "/files"
+                and (_is_loopback(str(value)) or value.host.endswith(".proxy.runpod.net"))
+                else value for value in record.args
+            )
+        return True
+
+
+logging.getLogger("httpx").addFilter(_FileRequestLogFilter())
+
+
 class PodTransportError(RuntimeError):
     """Deliberately contains no request bodies, headers or token material."""
 

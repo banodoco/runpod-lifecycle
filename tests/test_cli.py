@@ -380,9 +380,11 @@ def test_cli_list_serializes_rest_attachment_after_sdk_projection(monkeypatch, r
     monkeypatch.setattr(cli, "_resolve_api_key", lambda _: "test")
     runpod_sdk_mock.get_pods.return_value = [{"id": "p1", "name": "projected"}]
     def get(url, **kwargs):
-        assert url == api.PODS_URL and kwargs["params"] == {"includeNetworkVolume": "true"}
-        return SimpleNamespace(status_code=200, json=lambda: [
-            {"id": "p1", "networkVolume": {"id": "vol-1"}}])
+        assert url == api.PODS_URL and kwargs["params"] == {}
+        return SimpleNamespace(status_code=200, json=lambda: {"pods": [
+            {"id": "p1", "mounts": {"network": [
+                {"volumeId": "vol-1", "path": "/workspace"}]}}],
+            "pagination": {"nextCursor": None, "hasNextPage": False}})
     monkeypatch.setattr(api.httpx, "get", get)
     assert cli.main(["list", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)

@@ -9,6 +9,10 @@ from runpod_lifecycle import api
 from runpod_lifecycle.errors import CleanupPendingError
 
 
+def pod_page(pods):
+    return {"pods": pods, "pagination": {"nextCursor": None, "hasNextPage": False}}
+
+
 class FakeResponse:
     def __init__(self, status_code: int, payload: dict, text: str = ""):
         self.status_code = status_code
@@ -32,12 +36,12 @@ def test_list_pods_falls_back_to_rest_when_sdk_graphql_response_is_incomplete(
         SimpleNamespace(
             get=lambda *args, **kwargs: FakeResponse(
                 200,
-                [{"id": "p1", "desiredStatus": "RUNNING"}],
+                pod_page([{"id": "p1", "status": "RUNNING"}]),
             )
         ),
     )
 
-    assert api.list_pods("test") == [{"id": "p1", "desiredStatus": "RUNNING"}]
+    assert api.list_pods("test") == [{"id": "p1", "status": "RUNNING", "desiredStatus": "RUNNING"}]
 
 
 def test_successful_sdk_projection_is_enriched_by_exact_rest_id(monkeypatch, runpod_sdk_mock):
@@ -54,35 +58,38 @@ def test_successful_sdk_projection_is_enriched_by_exact_rest_id(monkeypatch, run
 
     def get(url, **kwargs):
         calls.append((url, kwargs))
-        return FakeResponse(200, [
-            {"id": "unrelated", "networkVolume": {"id": "wrong"}},
-            {"id": "p1", "networkVolume": {"id": "vol-1"}},
-        ])
+        return FakeResponse(200, pod_page([
+            {"id": "unrelated", "mounts": {"network": [{"volumeId": "wrong", "path": "/workspace"}]}},
+            {"id": "p1", "mounts": {"network": [{"volumeId": "vol-1", "path": "/workspace"}]}},
+        ]))
 
     monkeypatch.setattr(api.httpx, "get", get)
     result = api.list_pods("test")
-    assert result == [{**sdk_pod, "networkVolume": {"id": "vol-1"}}]
+    assert result == [{**sdk_pod,
+        "mounts": {"network": [{"volumeId": "vol-1", "path": "/workspace"}]},
+        "networkVolume": {"id": "vol-1"}, "volumeMountPath": "/workspace"}]
     assert "networkVolume" not in sdk_pod  # do not mutate provider payloads
     assert calls == [(api.PODS_URL, {"headers": {"Authorization": "Bearer test"},
-                                   "timeout": 30, "params": {"includeNetworkVolume": "true"}})]
+                                   "timeout": 30, "params": {}})]
 
 
-@pytest.mark.parametrize("payload", [[], [{"id": "other", "networkVolume": {"id": "vol-1"}}],
-    [{"id": "p1", "networkVolume": {"id": "vol-1"}}] * 2])
+@pytest.mark.parametrize("payload", [[], [{"id": "other", "mounts": {"network": [{"volumeId": "vol-1", "path": "/workspace"}]}}],
+    [{"id": "p1", "mounts": {"network": [{"volumeId": "vol-1", "path": "/workspace"}]}}] * 2])
 def test_rest_enrichment_keeps_unobservable_pod_in_inventory(monkeypatch, runpod_sdk_mock, payload):
     runpod_sdk_mock.get_pods.return_value = [{"id": "p1"}]
-    monkeypatch.setattr(api.httpx, "get", lambda *a, **kw: FakeResponse(200, payload))
+    monkeypatch.setattr(api.httpx, "get", lambda *a, **kw: FakeResponse(200, pod_page(payload)))
     assert api.list_pods("test") == [{"id": "p1", "networkVolume": None}]
 
 
 def test_rest_fallback_exposes_documented_attachment(monkeypatch, runpod_sdk_mock):
     runpod_sdk_mock.get_pods.side_effect = KeyError("data")
-    payload = [{"id": "p1", "networkVolume": {"id": "vol-1"}}]
+    payload = [{"id": "p1", "mounts": {"network": [{"volumeId": "vol-1", "path": "/workspace"}]}}]
     def get(*args, **kwargs):
-        assert kwargs["params"] == {"includeNetworkVolume": "true"}
-        return FakeResponse(200, payload)
+        assert kwargs["params"] == {}
+        return FakeResponse(200, pod_page(payload))
     monkeypatch.setattr(api.httpx, "get", get)
-    assert api.list_pods("test") == payload
+    assert api.list_pods("test") == [{**payload[0],
+        "networkVolume": {"id": "vol-1"}, "volumeMountPath": "/workspace"}]
 
 
 def test_terminate_pod_waits_for_provider_side_absence(
@@ -150,15 +157,16 @@ def test_start_pod_posts_to_provider_start_endpoint(monkeypatch: pytest.MonkeyPa
 
     def fake_post(url, **kwargs):  # type: ignore[no-untyped-def]
         calls.append({"url": url, **kwargs})
-        return FakeResponse(202, {"id": "p1", "desiredStatus": "RUNNING"})
+        return FakeResponse(200, {"id": "p1", "status": "RUNNING"})
 
     monkeypatch.setattr("runpod_lifecycle.api.httpx", SimpleNamespace(post=fake_post))
 
     result = api.start_pod("p1", "test")
 
     assert result["id"] == "p1"
-    assert calls[0]["url"] == "https://rest.runpod.io/v1/pods/p1/start"
+    assert calls[0]["url"] == "https://api.runpod.io/v2/pods/p1/action"
     assert calls[0]["headers"] == {"Authorization": "Bearer test"}
+    assert calls[0]["json"] == {"action": "start"}
 
 
 def test_start_pod_surfaces_capacity_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -508,7 +516,7 @@ def test_create_network_volume_posts_correct_shape(monkeypatch: pytest.MonkeyPat
             "id": "vol-created-1",
             "name": "my-volume",
             "size": 100,
-            "dataCenterId": "dc-test",
+            "dataCenter": "dc-test",
         })
 
     monkeypatch.setattr("runpod_lifecycle.api.httpx", SimpleNamespace(post=fake_post))
@@ -521,9 +529,9 @@ def test_create_network_volume_posts_correct_shape(monkeypatch: pytest.MonkeyPat
     assert post_calls[0]["json"] == {
         "name": "my-volume",
         "size": 100,
-        "dataCenterId": "dc-test",
+        "dataCenter": "dc-test",
     }
-    assert "rest.runpod.io/v1/networkvolumes" in post_calls[0]["url"]
+    assert "api.runpod.io/v2/network-volumes" in post_calls[0]["url"]
 
 
 def test_create_network_volume_raises_on_non_200_201(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -617,10 +625,12 @@ def test_get_pod_status_normalizes_current_rest_port_shape(
                 200,
                 {
                     "id": "pod-123",
-                    "desiredStatus": "RUNNING",
-                    "publicIp": "203.0.113.10",
-                    "ports": ["22/tcp", "8888/http"],
-                    "portMappings": {"22": 53603, "8888": 58123},
+                    "status": "RUNNING",
+                    "cost": 0.4,
+                    "runtime": {"ports": [
+                        {"private": 22, "public": 53603, "ip": "203.0.113.10", "type": "tcp"},
+                        {"private": 8888, "public": 58123, "ip": "203.0.113.10", "type": "http"},
+                    ]},
                 },
             ),
             post=pytest.fail,
@@ -645,8 +655,10 @@ def test_cpu_create_uses_supported_priority_and_public_key(monkeypatch):
     result=api.create_pod("test",None,"image",compute_type="CPU",public_key_string="public-test",
                           data_center_id="EUR-NO-1",network_volume_id="vol")
     body=calls[0]["json"]
-    assert body["cpuFlavorPriority"]=="custom"
-    assert body["cpuFlavorIds"]==["cpu3c","cpu5c"]
+    assert "cpuFlavorPriority" not in body and body["cpu"]["vcpuCount"] == 2
+    assert "cpuFlavorIds" not in body and body["cpu"]["id"] == "cpu3c"
+    assert body["image"] == "image" and body["cloud"] == "SECURE"
+    assert body["mounts"]["network"] == [{"volumeId": "vol", "path": "/workspace"}]
     assert body["env"]["PUBLIC_KEY"]=="public-test"
     assert result["id"]=="cpu-pod"
 

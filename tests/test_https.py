@@ -319,10 +319,10 @@ def test_cpu_rest_no_volume_bootstrap_and_error_redaction(monkeypatch):
     result = api.create_pod("test", None, "runpod/base:latest", compute_type="CPU", transport="https", https_token=TOKEN)
     assert result["id"] == "cpu1"
     payload = calls[-1]
-    assert "networkVolumeId" not in payload
+    assert "networkVolumeId" not in payload and not payload.get("mounts", {}).get("network")
     assert payload["ports"] == ["8000/http"]
-    assert payload["dockerEntrypoint"] == ["/bin/bash", "-lc"]
-    assert TOKEN not in payload["dockerStartCmd"][0]
+    assert payload["entrypoint"] == ["/bin/bash", "-lc"]
+    assert TOKEN not in payload["cmd"][0]
     def reject(url, **kwargs):
         return httpx.Response(400, json={"error": "bad " + TOKEN})
     monkeypatch.setattr(api.httpx, "post", reject)
@@ -693,3 +693,14 @@ def test_job_verbs_parse_under_https_transport():
     assert (args.cmd, args.job_cmd, args.pod_id, args.command) == ("job", "start", "pod1", "echo hi")
     args = build_parser().parse_args(["job", "cancel", "pod1", "a" * 32])
     assert (args.job_cmd, args.job_id) == ("cancel", "a" * 32)
+
+
+def test_file_request_logging_retains_status_without_private_query(agent, caplog):
+    import logging
+    _, client = agent
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        response = client.http.get("/files", params={"path": "/private/" + TOKEN},
+                                   headers={"Range": "bytes=0-1"})
+    assert response.status_code == 400
+    assert "HTTP Request: GET" in caplog.text and "/files" in caplog.text
+    assert TOKEN not in caplog.text and "/private/" not in caplog.text

@@ -478,7 +478,7 @@ def test_product_provider_exact_get_404_only(monkeypatch):
     responses = iter([httpx.Response(404), httpx.Response(403),
                       httpx.Response(200, json={"id": "other"})])
     def handler(request):
-        assert request.method == "GET" and request.url.path == "/v1/pods/fakepod1"
+        assert request.method == "GET" and request.url.path == "/v2/pods/fakepod1"
         assert request.headers["Authorization"] == "Bearer " + KEY
         return next(responses)
     provider.http = httpx.Client(transport=httpx.MockTransport(handler),

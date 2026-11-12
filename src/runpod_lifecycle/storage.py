@@ -7,7 +7,7 @@ from typing import Any
 
 import requests
 
-from .api import get_network_volumes
+from .api import NETWORK_VOLUMES_URL, get_network_volumes
 
 logger = logging.getLogger("runpod_lifecycle.storage")
 
@@ -27,7 +27,7 @@ def _expand_network_volume(api_key: str, volume_id: str, size_gb: int) -> bool:
     """Expand a network volume to the requested size in GiB."""
     try:
         response = requests.patch(
-            f"https://rest.runpod.io/v1/networkvolumes/{volume_id}",
+            f"{NETWORK_VOLUMES_URL}/{volume_id}",
             json={"size": size_gb},
             headers={
                 "Authorization": f"Bearer {api_key}",

@@ -270,8 +270,8 @@ def test_cpu_rest_create_payload_with_selection(provider):
     assert_agent_only(payload["env"], payload["ports"])
     assert payload["env"]["ASTRID_POD_STATE"].startswith(STATE + "/")
     assert decoded_engine({"env": payload["env"]}) == selection()["engine_proxy"]
-    assert payload["dockerEntrypoint"] == ["/bin/bash", "-lc"] and TOKEN not in payload["dockerStartCmd"][0]
-    assert payload["networkVolumeId"] == "vol" and payload["volumeMountPath"] == "/workspace"
+    assert payload["entrypoint"] == ["/bin/bash", "-lc"] and TOKEN not in payload["cmd"][0]
+    assert payload["mounts"]["network"] == [{"volumeId": "vol", "path": "/workspace"}]
 
 
 def test_cpu_sdk_create_payload_with_selection(provider):

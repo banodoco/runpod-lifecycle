@@ -195,7 +195,7 @@ def _network_volume_evidence(raw: dict[str, Any]) -> dict[str, bool]:
 def _network_volume_id(raw: dict[str, Any]) -> str | None:
     """Normalize observed SDK/REST identities, rejecting malformed/conflicting evidence.
 
-    REST GET /v1/pods?includeNetworkVolume=true returns networkVolume.id.
+    REST v2 mounts.network references are normalized to networkVolume.id.
     It is an attached-volume object, not the similarly named request filter.
     """
     identities = []
@@ -210,6 +210,7 @@ def _network_volume_id(raw: dict[str, Any]) -> str | None:
 
 
 def _to_summary(raw: dict[str, Any]) -> PodSummary:
+    raw = api.normalize_pod(raw)
     runtime = raw.get("runtime") if isinstance(raw.get("runtime"), dict) else {}
     machine = raw.get("machine") if isinstance(raw.get("machine"), dict) else {}
     cost = raw.get("costPerHr")
