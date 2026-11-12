@@ -7,7 +7,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Sequence
 
 from .config import RunPodConfig
 from .guard import PodGuard
@@ -78,6 +78,12 @@ class ShipAndRunResult:
     breach_log: list[dict] = field(default_factory=list)
     terminated: bool = False
     upload_info: dict[str, Any] = field(default_factory=dict)
+    error: BaseException | None = None
+
+    def raise_if_error(self) -> None:
+        """Re-raise the captured exception, if any (opt back into raising)."""
+        if self.error is not None:
+            raise self.error
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +211,13 @@ async def ship_and_run(
         _clear_current_task_cancellation()
         result.returncode = 130
         logger.info("ship_and_run cancelled, returning 130")
+        return result
+
+    except Exception as exc:
+        logger.warning(
+            "ship_and_run failed pod=%s error=%s", getattr(pod, "id", None), exc
+        )
+        result.error = exc
         return result
 
     finally:
@@ -398,6 +411,15 @@ async def ship_and_run_detached(
         result.returncode = 130
         return result
 
+    except Exception as exc:
+        logger.warning(
+            "ship_and_run_detached failed pod=%s error=%s",
+            getattr(active_pod, "id", None),
+            exc,
+        )
+        result.error = exc
+        return result
+
     finally:
         if terminate_after_exec and active_pod is not None:
             if guard is not None:
@@ -409,3 +431,61 @@ async def ship_and_run_detached(
             result.pod = active_pod
         if guard is not None:
             result.breach_log = list(guard.breach_log)
+
+
+async def ship_and_run_many(
+    config: RunPodConfig,
+    remote_scripts: Sequence[str],
+    *,
+    local_roots: Sequence[Path],
+    remote_root: str = "/workspace",
+    exclude: set[str] | None = None,
+    name_prefix: str = "pod",
+    **shared_kwargs: Any,
+) -> list[ShipAndRunResult]:
+    """Launch ``len(remote_scripts)`` pods concurrently, one script per pod.
+
+    Each pod's full lifecycle is independent via `ship_and_run`'s own
+    guarantees (see its docstring) — a failure or exception in one pod's
+    run never prevents another pod from completing normally or being torn
+    down, and never prevents this function from returning a result for
+    every pod. Results are returned in the same order as `remote_scripts`;
+    check `.error` on each (or call `.raise_if_error()`) to see whether
+    that pod's run failed.
+
+    *local_roots* is required and must be the same length as
+    *remote_scripts* — one local directory to upload per pod (repeat the
+    same path across entries if every pod should get the same payload).
+    It's required rather than defaulting to "no upload" because
+    `ship_and_run` itself has no such default: its own *local_root* is a
+    required, non-optional `Path` that it unconditionally uploads from, so
+    a `None` here would only surface as an `AttributeError` captured deep
+    in every job's `.error` instead of failing loudly at the call site.
+
+    Does not support coordination *between* jobs (e.g. one pod needing to
+    wait on and consume another's output) — that's caller-specific; write
+    a custom per-pod coroutine closing over a shared `asyncio.Future` (or
+    similar) for that instead of using this helper.
+    """
+    if len(local_roots) != len(remote_scripts):
+        raise ValueError("local_roots must be the same length as remote_scripts")
+
+    results = await asyncio.gather(
+        *(
+            ship_and_run(
+                config,
+                script,
+                local_root=root,
+                remote_root=remote_root,
+                exclude=exclude or set(),
+                name_prefix=f"{name_prefix}-{i}",
+                **shared_kwargs,
+            )
+            for i, (script, root) in enumerate(zip(remote_scripts, local_roots))
+        ),
+        return_exceptions=True,
+    )
+    return [
+        r if isinstance(r, ShipAndRunResult) else ShipAndRunResult(returncode=-1, error=r)
+        for r in results
+    ]

@@ -23,6 +23,7 @@ from runpod_lifecycle.runner import (
     ShipAndRunResult,
     ship_and_run,
     ship_and_run_detached,
+    ship_and_run_many,
     _parse_detached_exit,
 )
 
@@ -227,6 +228,156 @@ async def test_ship_and_run_cancelled_error_returns_130(tmp_path: Path) -> None:
         result = await task
 
     assert result.returncode == 130
+
+
+# ---------------------------------------------------------------------------
+# ship_and_run — generic exception is captured, not raised
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_ship_and_run_captures_exception_instead_of_raising(tmp_path: Path) -> None:
+    """A generic Exception during exec_ssh is captured on result.error, not raised."""
+    config = RunPodConfig(api_key="***")
+    mock_pod = _make_mock_pod("pod-sar-err")
+    local_root = tmp_path / "local_err"
+    local_root.mkdir()
+
+    boom = RuntimeError("ssh exec blew up")
+    mock_pod.exec_ssh = AsyncMock(side_effect=boom)
+
+    with patch("runpod_lifecycle.runner._launch_pod", new_callable=AsyncMock) as mock_launch:
+        mock_launch.return_value = mock_pod
+
+        result = await ship_and_run(
+            config,
+            "echo ok",
+            local_root=local_root,
+            remote_root="/tmp/remote",
+            exclude=set(),
+            timeout=30,
+        )
+
+    assert result.error is boom
+    assert result.terminated is True
+    mock_pod.terminate.assert_called()
+    with pytest.raises(RuntimeError, match="ssh exec blew up"):
+        result.raise_if_error()
+
+
+@pytest.mark.asyncio
+async def test_ship_and_run_detached_captures_exception_instead_of_raising(tmp_path: Path) -> None:
+    """A generic Exception in ship_and_run_detached is captured, not raised."""
+    config = RunPodConfig(api_key="***")
+    mock_pod = _make_mock_pod("pod-det-err")
+    local_root = tmp_path / "local_det_err"
+    local_root.mkdir()
+
+    boom = RuntimeError("detached exec blew up")
+    mock_pod.exec_ssh = AsyncMock(side_effect=boom)
+
+    with patch("runpod_lifecycle.runner._launch_pod", new_callable=AsyncMock) as mock_launch:
+        mock_launch.return_value = mock_pod
+
+        result = await ship_and_run_detached(
+            config,
+            "echo ok",
+            local_root=local_root,
+            remote_root="/tmp/remote",
+            exclude=set(),
+            timeout=30,
+            terminate_after_exec=True,
+            poll_interval=1,
+        )
+
+    assert result.error is boom
+    assert result.terminated is True
+    mock_pod.terminate.assert_called()
+    with pytest.raises(RuntimeError, match="detached exec blew up"):
+        result.raise_if_error()
+
+
+# ---------------------------------------------------------------------------
+# ship_and_run_many
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_ship_and_run_many_all_succeed(tmp_path: Path) -> None:
+    """All jobs succeed: N results returned in order, none with .error set."""
+    config = RunPodConfig(api_key="***")
+
+    async def fake_ship_and_run(config, script, **kwargs):
+        return ShipAndRunResult(returncode=0, stdout=script)
+
+    with patch("runpod_lifecycle.runner.ship_and_run", side_effect=fake_ship_and_run):
+        results = await ship_and_run_many(
+            config,
+            ["script-a", "script-b", "script-c"],
+            local_roots=[tmp_path, tmp_path, tmp_path],
+        )
+
+    assert len(results) == 3
+    assert [r.stdout for r in results] == ["script-a", "script-b", "script-c"]
+    assert all(r.error is None for r in results)
+
+
+@pytest.mark.asyncio
+async def test_ship_and_run_many_one_job_fails(tmp_path: Path) -> None:
+    """One job's ship_and_run raises; others still succeed and are captured in order."""
+    config = RunPodConfig(api_key="***")
+    boom = RuntimeError("job b blew up")
+
+    async def fake_ship_and_run(config, script, **kwargs):
+        if script == "script-b":
+            raise boom
+        return ShipAndRunResult(returncode=0, stdout=script)
+
+    with patch("runpod_lifecycle.runner.ship_and_run", side_effect=fake_ship_and_run):
+        results = await ship_and_run_many(
+            config,
+            ["script-a", "script-b", "script-c"],
+            local_roots=[tmp_path, tmp_path, tmp_path],
+        )
+
+    assert len(results) == 3
+    assert results[0].stdout == "script-a"
+    assert results[0].error is None
+    assert results[1].error is boom
+    assert results[2].stdout == "script-c"
+    assert results[2].error is None
+
+
+@pytest.mark.asyncio
+async def test_ship_and_run_many_local_roots_length_mismatch() -> None:
+    """A local_roots length mismatch raises ValueError."""
+    config = RunPodConfig(api_key="***")
+
+    with pytest.raises(ValueError, match="local_roots must be the same length"):
+        await ship_and_run_many(
+            config,
+            ["script-a", "script-b"],
+            local_roots=[None],
+        )
+
+
+@pytest.mark.asyncio
+async def test_ship_and_run_many_requires_local_roots() -> None:
+    """Regression test: local_roots must be required, not default to None-per-job.
+
+    ship_and_run's own local_root is a required, non-optional Path that it
+    unconditionally uploads from (no "skip upload" branch, unlike
+    ship_and_run_detached) — a None default here would silently make every
+    job fail with an AttributeError deep inside the upload step, captured
+    into .error rather than failing loudly at the call site. Omitting
+    local_roots must raise immediately instead.
+    """
+    config = RunPodConfig(api_key="***")
+
+    async def fake_ship_and_run(config, script, **kwargs):
+        return ShipAndRunResult(returncode=0, stdout=script)
+
+    with patch("runpod_lifecycle.runner.ship_and_run", side_effect=fake_ship_and_run):
+        with pytest.raises(TypeError, match="local_roots"):
+            await ship_and_run_many(config, ["script-a", "script-b"])  # type: ignore[call-arg]
 
 
 # ---------------------------------------------------------------------------
