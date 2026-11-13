@@ -10,8 +10,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   # Intel macOS has no cryptography>=50 wheels, so it stays on the 1.10.x line
-  # (cryptography>=48.0.1); every other platform takes runpod>=1.12.
-  "runpod>=1.10.1,<1.11; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+  # (cryptography>=48.0.1); every other platform takes runpod>=1.12. 1.10.0 is
+  # allowed because 1.10.1 raises requests to >=2.34.2, which conflicts with
+  # hosts that pin requests<2.34; the two differ only in runpod.serverless,
+  # which lifecycle doesn't use (runpod.api is identical).
+  "runpod>=1.10.0,<1.11; sys_platform == 'darwin' and platform_machine == 'x86_64'",
   "runpod>=1.12; sys_platform != 'darwin' or platform_machine != 'x86_64'",
   "paramiko>=3.0.0",
   "requests>=2.31.0",

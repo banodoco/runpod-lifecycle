@@ -2654,7 +2654,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "requests", specifier = ">=2.31.0" },
     { name = "runpod", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'", specifier = ">=1.12" },
-    { name = "runpod", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'", specifier = ">=1.10.1,<1.11" },
+    { name = "runpod", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'", specifier = ">=1.10.0,<1.11" },
 ]
 provides-extras = ["dev"]
 

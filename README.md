@@ -22,7 +22,9 @@ the GraphQL transport; query and mutation text lives in
 `runpod_lifecycle.graphql`. Platform markers select the SDK line:
 
 - Every platform except Intel macOS: `runpod>=1.12` (`cryptography>=50`).
-- Intel macOS (`darwin`/`x86_64`): `runpod>=1.10.1,<1.11`.
+- Intel macOS (`darwin`/`x86_64`): `runpod>=1.10.0,<1.11`. 1.10.0 is allowed
+  because 1.10.1 requires `requests>=2.34.2`; the two differ only in
+  `runpod.serverless`, which this package doesn't use.
 
 **Accepted risk:** Intel macOS stays on `cryptography` 48.0.1 (the 1.10.x
 SDK line), which has known CVEs. This is accepted for that platform
