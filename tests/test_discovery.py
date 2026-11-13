@@ -108,6 +108,35 @@ def test_find_orphans_skips_inactive_status(runpod_sdk_mock) -> None:
     assert sorted(s.id for s in orphans) == ["provisioning", "running"]
 
 
+def test_find_orphans_includes_starting_from_rest_v2(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from runpod_lifecycle import api
+
+    monkeypatch.setattr(api, "_get_runpod", lambda: None)
+    calls = []
+    body = {
+        "pods": [
+            {"id": "starting", "name": "gpu_starting", "status": "STARTING"},
+            {"id": "exited", "name": "gpu_exited", "status": "EXITED"},
+        ],
+        "pagination": {"hasNextPage": False, "nextCursor": None},
+    }
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        return SimpleNamespace(status_code=200, json=lambda: body)
+
+    monkeypatch.setattr(api.httpx, "get", get)
+    orphans = asyncio.run(discovery.find_orphans("fake", known_pod_ids=[]))
+
+    assert [pod.id for pod in orphans] == ["starting"]
+    assert orphans[0].desired_status == "STARTING"
+    assert len(calls) == 1
+    assert calls[0][0] == api.PODS_URL
+    assert calls[0][1]["params"] == {}
+
+
 def test_get_pod_attaches_to_existing(runpod_sdk_mock, base_config) -> None:
     runpod_sdk_mock.get_pod.return_value = {
         "id": "abc",

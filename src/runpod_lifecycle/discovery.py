@@ -261,7 +261,7 @@ async def find_pods(
     return [s for s in summaries if predicate(s)]
 
 
-_ACTIVE_STATUSES = {"RUNNING", "PROVISIONING"}
+_ACTIVE_STATUSES = {"RUNNING", "PROVISIONING", "STARTING"}
 
 
 async def find_orphans(
