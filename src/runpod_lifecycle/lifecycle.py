@@ -460,7 +460,7 @@ async def resume_when_available(
     while True:
         status = await pod.status()
         desired_status = status.get("desired_status") if status else None
-        if desired_status == "RUNNING":
+        if desired_status in {"RUNNING", "PROVISIONING", "STARTING"}:
             return pod
         if desired_status in {"FAILED", "TERMINATED"}:
             error = LaunchFailure(

@@ -108,7 +108,7 @@ async def main() -> int:
                 _log(f"terminated {pod.id}")
                 await asyncio.sleep(3)
                 all_pods = await list_pods(config.api_key)
-                still_there = [p for p in all_pods if p.id == pod.id and p.desired_status in {"RUNNING", "PROVISIONING"}]
+                still_there = [p for p in all_pods if p.id == pod.id and p.desired_status in {"RUNNING", "PROVISIONING", "STARTING"}]
                 _log(f"post-terminate active match: {len(still_there)} (0 expected)")
             except Exception as exc:
                 _log(f"!!! TERMINATE FAILED — pod {pod.id} may still be running and costing money: {exc}")

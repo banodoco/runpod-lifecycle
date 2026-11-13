@@ -650,6 +650,8 @@ def test_cpu_create_uses_supported_priority_and_public_key(monkeypatch):
     calls=[]
     def post(_url, **kwargs):
         calls.append(kwargs)
+        if len(calls) == 1:
+            return FakeResponse(503, {"error": "There are no longer any instances available with the requested specifications."})
         return FakeResponse(201, {"id":"cpu-pod"})
     monkeypatch.setattr(api.httpx,"post",post)
     result=api.create_pod("test",None,"image",compute_type="CPU",public_key_string="public-test",
@@ -661,6 +663,8 @@ def test_cpu_create_uses_supported_priority_and_public_key(monkeypatch):
     assert body["mounts"]["network"] == [{"volumeId": "vol", "path": "/workspace"}]
     assert body["env"]["PUBLIC_KEY"]=="public-test"
     assert result["id"]=="cpu-pod"
+    assert [call["json"]["cpu"]["id"] for call in calls] == ["cpu3c", "cpu5c"]
+    assert calls[1]["json"] == {**body, "cpu": {"id": "cpu5c", "vcpuCount": 2}}
 
 
 @pytest.mark.parametrize("status,message,capacity",[

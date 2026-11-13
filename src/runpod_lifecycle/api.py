@@ -330,48 +330,52 @@ def create_pod(
             raise ValueError("CPU flavor priority must be availability or custom")
         if not cpu_flavor_ids:
             raise ValueError("CPU provisioning requires at least one flavor")
-        # V2 accepts one CPU flavor per request. Capacity fallback remains with
-        # the caller; never retry an ambiguous allocation here.
-        payload = {"name": name, "image": image_name,
-                   "cloud": "SECURE", "cpu": {"id": cpu_flavor_ids[0], "vcpuCount": vcpu_count},
-                   "disk": container_disk_in_gb,
-                   "ports": (ports or "22/tcp").split(","), "env": pod_env}
-        if network_volume_id is not None:
-            payload["mounts"] = {"network": [{"volumeId": network_volume_id, "path": volume_mount_path}]}
-        if boot:
-            payload.update({"entrypoint": boot["docker_entrypoint"], "cmd": boot["docker_start_cmd"]})
-        if data_center_id:
-            payload["dataCenterIds"] = [data_center_id]
-        response = httpx.post(PODS_URL, headers=_auth_headers(api_key), json=payload, timeout=30)
-        if response.status_code not in {200, 201}:
-            try:
-                body = response.json()
-            except ValueError:
-                body = {"message": "non-JSON provider response"}
-            def messages(value):
-                if isinstance(value, str):
-                    return [value]
-                if isinstance(value, list):
-                    return [message for item in value for message in messages(item)]
-                if isinstance(value, dict):
-                    return [message for field in ("message", "error", "errors", "detail", "details", "issues")
-                            if field in value for message in messages(value[field])]
-                return []
-            message = "; ".join(messages(body))
-            for secret in (api_key, public_key_string, *pod_env.values()):
-                if secret:
-                    message = message.replace(secret, "[redacted]")
-            message = message[:1000] or "no provider error detail"
-            lower = message.lower()
-            capacity = (response.status_code in {500, 503}
-                        and "there are no longer any instances available with the requested specifications" in lower
-                        and not any(marker in lower for marker in ("invalid", "validation", "unsupported", "extra input", "expected")))
-            error = ProviderCapacityUnavailable if capacity else ProviderRequestRejected
-            raise error(response.status_code, message)
-        pod = response.json()
-        if not isinstance(pod, dict) or not pod.get("id"):
-            raise RuntimeError("CPU create response has no pod ID; reconcile allocation")
-        return {"id": pod["id"], "name": name, "created": True, "compute_type": "CPU", **claim}
+        # V2 accepts one CPU flavor per request. Advance only after a definite
+        # capacity rejection; an ambiguous allocation must be reconciled.
+        for flavor_index, cpu_flavor_id in enumerate(cpu_flavor_ids):
+            payload = {"name": name, "image": image_name,
+                       "cloud": "SECURE", "cpu": {"id": cpu_flavor_id, "vcpuCount": vcpu_count},
+                       "disk": container_disk_in_gb,
+                       "ports": (ports or "22/tcp").split(","), "env": pod_env}
+            if network_volume_id is not None:
+                payload["mounts"] = {"network": [{"volumeId": network_volume_id, "path": volume_mount_path}]}
+            if boot:
+                payload.update({"entrypoint": boot["docker_entrypoint"], "cmd": boot["docker_start_cmd"]})
+            if data_center_id:
+                payload["dataCenterIds"] = [data_center_id]
+            response = httpx.post(PODS_URL, headers=_auth_headers(api_key), json=payload, timeout=30)
+            if response.status_code not in {200, 201}:
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = {"message": "non-JSON provider response"}
+                def messages(value):
+                    if isinstance(value, str):
+                        return [value]
+                    if isinstance(value, list):
+                        return [message for item in value for message in messages(item)]
+                    if isinstance(value, dict):
+                        return [message for field in ("message", "error", "errors", "detail", "details", "issues")
+                                if field in value for message in messages(value[field])]
+                    return []
+                message = "; ".join(messages(body))
+                for secret in (api_key, public_key_string, *pod_env.values()):
+                    if secret:
+                        message = message.replace(secret, "[redacted]")
+                message = message[:1000] or "no provider error detail"
+                lower = message.lower()
+                capacity = (response.status_code in {500, 503}
+                            and not (isinstance(body, dict) and "id" in body)
+                            and "there are no longer any instances available with the requested specifications" in lower
+                            and not any(marker in lower for marker in ("invalid", "validation", "unsupported", "extra input", "expected")))
+                if capacity and flavor_index + 1 < len(cpu_flavor_ids):
+                    continue
+                error = ProviderCapacityUnavailable if capacity else ProviderRequestRejected
+                raise error(response.status_code, message)
+            pod = response.json()
+            if not isinstance(pod, dict) or not pod.get("id"):
+                raise RuntimeError("CPU create response has no pod ID; reconcile allocation")
+            return {"id": pod["id"], "name": name, "created": True, "compute_type": "CPU", **claim}
     if compute_type != "GPU":
         raise ValueError("compute_type must be CPU or GPU")
     sdk = _get_runpod()

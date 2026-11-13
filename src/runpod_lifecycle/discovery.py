@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable
+from urllib.parse import quote
+
+import httpx
 
 from . import api
 from .config import RunPodConfig
@@ -264,6 +267,29 @@ async def find_pods(
 _ACTIVE_STATUSES = {"RUNNING", "PROVISIONING", "STARTING"}
 
 
+def _exact_pod_uptime(pod_id: str, api_key: str) -> int:
+    """List responses omit runtime; unknown age must not mean no old pods."""
+    try:
+        if not pod_id:
+            raise ValueError("missing pod identity")
+        response = httpx.get(
+            f"{api.PODS_URL}/{quote(pod_id, safe='')}",
+            headers=api._auth_headers(api_key), timeout=30,
+        )
+        if response.status_code != 200:
+            raise ValueError(f"exact pod HTTP {response.status_code}")
+        raw = response.json()
+        if not isinstance(raw, dict) or raw.get("id") != pod_id:
+            raise ValueError("exact pod identity unavailable")
+        runtime = api.normalize_pod(raw).get("runtime")
+        uptime = runtime.get("uptimeInSeconds") if isinstance(runtime, dict) else None
+        if type(uptime) is not int or uptime < 0:
+            raise ValueError("exact pod runtime unavailable")
+    except (httpx.HTTPError, ValueError) as exc:
+        raise RuntimeError(f"Pod age evidence unavailable for {pod_id!r}") from exc
+    return uptime
+
+
 async def find_orphans(
     api_key: str,
     known_pod_ids: Iterable[str],
@@ -277,14 +303,22 @@ async def find_orphans(
     reigh-worker-orchestrator/scripts/debug/commands/runpod.py:46-70.
     `known_pod_ids` is supplied by the caller (e.g. orchestrator's DB query);
     this package never touches Supabase.
+    Age filtering reads the exact pod when list runtime is missing and raises
+    if that evidence is unavailable, rather than returning an incomplete list.
     """
     known = {str(pid) for pid in known_pod_ids if pid}
     summaries = await list_pods(api_key, name_prefix=name_prefix)
     orphans = [s for s in summaries if s.desired_status in _ACTIVE_STATUSES and s.id not in known]
     if older_than_seconds is not None:
-        orphans = [
-            s for s in orphans if s.uptime_seconds is not None and s.uptime_seconds >= older_than_seconds
-        ]
+        aged = []
+        for summary in orphans:
+            uptime = summary.uptime_seconds
+            if type(uptime) is not int or uptime < 0:
+                uptime = await asyncio.to_thread(_exact_pod_uptime, summary.id, api_key)
+                summary = replace(summary, uptime_seconds=uptime)
+            if uptime >= older_than_seconds:
+                aged.append(summary)
+        orphans = aged
     return orphans
 
 
