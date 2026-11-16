@@ -248,6 +248,7 @@ def create_pod(
     transport: str = "ssh",
     https_token: str | None = None,
     engine_startup: dict[str, Any] | None = None,
+    terminate_after: str | None = None,
 ) -> dict[str, Any]:
     """Create a RunPod pod and return provision metadata immediately.
 
@@ -256,6 +257,10 @@ def create_pod(
     HTTPS transport, before any provider call; the only public port stays
     the agent's.
     """
+    from .deadline import validate_terminate_after
+    terminate_after = validate_terminate_after(terminate_after)
+    if terminate_after is not None and compute_type != "GPU":
+        raise ValueError("terminate_after is supported only for GPU creation")
     from .preflight import preflight_transport
     preflight_transport(transport)
     boot = None
@@ -399,6 +404,8 @@ def create_pod(
         "ports": ports or "22/tcp,8888/http",
         "network_volume_id": network_volume_id,
     }
+    if terminate_after is not None:
+        params["terminate_after"] = terminate_after
     if boot:
         params["docker_args"] = boot["docker_args"]
     if data_center_id:

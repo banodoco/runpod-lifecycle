@@ -143,6 +143,8 @@ async def _try_launch_one_gpu(
 
     for ram_tier in ram_tiers:
         for storage_name, storage_volume_id in storage_targets:
+            from .deadline import validate_terminate_after
+            validate_terminate_after(config.terminate_after)
             attempted_pairs.append(
                 {
                     "gpu_type": gpu_type,
@@ -187,6 +189,7 @@ async def _try_launch_one_gpu(
                     **({"engine_startup": config.engine_startup} if config.engine_startup is not None else {}),
                     allowed_cuda_versions=config.allowed_cuda_versions or None,
                     **({"min_cuda_version": config.min_cuda_version} if config.min_cuda_version else {}),
+                    **({"terminate_after": config.terminate_after} if config.terminate_after is not None else {}),
                 )
             except Exception as exc:
                 # Only a definite capacity rejection permits another create.
@@ -256,6 +259,8 @@ async def launch(
     name: str | None = None,
     hooks: EventHooks | None = None,
 ) -> Pod:
+    from .deadline import validate_terminate_after
+    validate_terminate_after(config.terminate_after)
     hooks = hooks or EventHooks()
     pod_name = name or f"{config.name_prefix}-{int(time.time())}"
 
@@ -375,6 +380,8 @@ async def launch_when_available(
     expensive candidate. It retries the exact same ``launch`` request until it
     succeeds or the bounded wait expires.
     """
+    from .deadline import validate_terminate_after
+    validate_terminate_after(config.terminate_after)
     if max_wait_sec <= 0:
         if on_attempt is not None:
             on_attempt(1)
