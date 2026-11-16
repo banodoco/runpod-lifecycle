@@ -209,8 +209,11 @@ class RunPodConfig:
     network_volume_id: str | None = None
     data_center_id: str | None = None
     gpu_type_id: str | None = None
+    terminate_after: str | None = None
 
     def __post_init__(self) -> None:
+        from .deadline import validate_terminate_after
+        self.terminate_after = validate_terminate_after(self.terminate_after)
         for name in ("network_volume_id", "data_center_id", "gpu_type_id"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip() or value != value.strip()):

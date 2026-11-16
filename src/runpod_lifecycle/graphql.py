@@ -156,8 +156,13 @@ def generate_pod_deployment_mutation(
     min_upload: Optional[int] = None,
     instance_id: Optional[str] = None,
     min_cuda_version: Optional[str] = None,
+    terminate_after: Optional[str] = None,
 ) -> str:
     """Build the on-demand pod deployment mutation (GPU or CPU)."""
+    from .deadline import validate_terminate_after
+    terminate_after = validate_terminate_after(terminate_after)
+    if terminate_after is not None and not gpu_type_id:
+        raise ValueError("terminate_after is supported only for GPU creation")
     if min_cuda_version is not None and (
         not _CUDA_VERSION.fullmatch(min_cuda_version) or allowed_cuda_versions
     ):
@@ -169,6 +174,8 @@ def generate_pod_deployment_mutation(
 
     if gpu_type_id is not None:
         input_fields.append(f'gpuTypeId: "{gpu_type_id}"')
+        if terminate_after is not None:
+            input_fields.append(f"terminateAfter: {json.dumps(terminate_after)}")
         input_fields.append(f"supportPublicIp: {str(support_public_ip).lower()}")
         if gpu_count is not None:
             input_fields.append(f"gpuCount: {gpu_count}")
@@ -252,6 +259,10 @@ def create_pod(
     **fields: Any,
 ) -> dict[str, Any]:
     """Deploy a pod through the public SDK's GraphQL runner; return the pod dict."""
+    from .deadline import validate_terminate_after
+    validate_terminate_after(fields.get("terminate_after"))
+    if fields.get("terminate_after") is not None and not gpu_type_id:
+        raise ValueError("terminate_after is supported only for GPU creation")
     if not image_name and not template_id:
         raise ValueError("Either image_name or template_id must be provided")
     if cloud_type not in ("ALL", "COMMUNITY", "SECURE"):

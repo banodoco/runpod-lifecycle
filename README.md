@@ -410,3 +410,12 @@ results when no matching stock is confirmed.
 Use `--transport https` or `RunPodConfig(transport="https")` for the pod agent
 transport. See [HTTPS transport](HTTPS.md) for token custody, supported paths,
 limits and the current live-test qualification.
+
+GPU creation can optionally set `RunPodConfig(terminate_after="2099-01-02T03:04:05Z")`
+to request RunPod's provider-side automatic termination. The value must be a
+future absolute UTC timestamp (`Z` or `+00:00`, with up to six fractional
+second digits). It is checked again when launching and creating the pod, so a
+deadline that expires while waiting for capacity is refused. This option is
+only supported for GPU creation; callers that require a lifetime limit must
+supply it explicitly. RunPod's documented field does not establish exact
+termination latency or billing cutoff timing.
